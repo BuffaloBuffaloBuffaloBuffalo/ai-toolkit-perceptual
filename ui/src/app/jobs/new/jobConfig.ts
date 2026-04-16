@@ -1,0 +1,257 @@
+import { JobConfig, DatasetConfig, SliderConfig, FaceIDConfig, BodyIDConfig } from '@/types';
+
+export const defaultDatasetConfig: DatasetConfig = {
+  folder_path: '/path/to/images/folder',
+  mask_path: null,
+  mask_min_value: 0.1,
+  default_caption: '',
+  caption_ext: 'txt',
+  caption_dropout_rate: 0.05,
+  cache_latents_to_disk: false,
+  is_reg: false,
+  network_weight: 1,
+  resolution: [512, 768, 1024],
+  controls: [],
+  shrink_video_to_frames: true,
+  num_frames: 1,
+  flip_x: false,
+  flip_y: false,
+  num_repeats: 1,
+};
+
+export const defaultFaceIDConfig: FaceIDConfig = {
+  enabled: false,
+  num_tokens: 4,
+  dropout_prob: 0.1,
+  face_model: 'buffalo_l',
+  scale_lr_multiplier: 10,
+  init_scale: 0.01,
+  vision_enabled: false,
+  vision_model: 'openai/clip-vit-large-patch14',
+  vision_num_tokens: 4,
+  vision_crop_padding: 0.3,
+  identity_loss_weight: 0.0,
+  identity_loss_min_t: 0.0,
+  identity_loss_max_t: 1.0,
+  identity_loss_min_cos: 0.2,
+  identity_loss_use_average: true,
+  identity_loss_average_blend: 0.0,
+  identity_loss_use_random: false,
+  identity_loss_num_refs: 0,
+  identity_metrics: false,
+  landmark_loss_weight: 0.0,
+  body_proportion_loss_weight: 0.0,
+  body_proportion_loss_min_t: 0.0,
+  body_proportion_loss_max_t: 1.0,
+  body_proportion_include_head: false,
+  body_shape_loss_weight: 0.0,
+  body_shape_loss_min_t: 0.4,
+  body_shape_loss_max_t: 0.8,
+  normal_loss_weight: 0.0,
+  normal_loss_min_t: 0.4,
+  normal_loss_max_t: 0.8,
+  vae_anchor_loss_weight: 0,
+  vae_anchor_loss_min_t: 0,
+  vae_anchor_loss_max_t: 0.5,
+  vae_anchor_model_path: '',
+};
+
+export const defaultBodyIDConfig: BodyIDConfig = {
+  enabled: false,
+  num_tokens: 4,
+  dropout_prob: 0.1,
+  detection_threshold: 0.5,
+  scale_lr_multiplier: 10,
+  init_scale: 0.01,
+};
+
+export const defaultSliderConfig: SliderConfig = {
+  guidance_strength: 3.0,
+  anchor_strength: 1.0,
+  positive_prompt: 'person who is happy',
+  negative_prompt: 'person who is sad',
+  target_class: 'person',
+  anchor_class: '',
+};
+
+export const defaultJobConfig: JobConfig = {
+  job: 'extension',
+  config: {
+    name: 'my_first_lora_v1',
+    process: [
+      {
+        type: 'diffusion_trainer',
+        training_folder: 'output',
+        sqlite_db_path: './aitk_db.db',
+        device: 'cuda',
+        trigger_word: null,
+        performance_log_every: 10,
+        network: {
+          type: 'lora',
+          linear: 32,
+          linear_alpha: 32,
+          conv: 16,
+          conv_alpha: 16,
+          lokr_full_rank: true,
+          lokr_factor: -1,
+          network_kwargs: {
+            ignore_if_contains: [],
+          },
+        },
+        face_id: { ...defaultFaceIDConfig },
+        body_id: { ...defaultBodyIDConfig },
+        save: {
+          dtype: 'bf16',
+          save_every: 250,
+          max_step_saves_to_keep: 4,
+          save_format: 'diffusers',
+          push_to_hub: false,
+        },
+        datasets: [defaultDatasetConfig],
+        train: {
+          batch_size: 1,
+          bypass_guidance_embedding: true,
+          steps: 3000,
+          gradient_accumulation: 1,
+          train_unet: true,
+          train_text_encoder: false,
+          gradient_checkpointing: true,
+          noise_scheduler: 'flowmatch',
+          optimizer: 'adamw8bit',
+          timestep_type: 'sigmoid',
+          content_or_style: 'balanced',
+          optimizer_params: {
+            weight_decay: 1e-4,
+          },
+          unload_text_encoder: false,
+          cache_text_embeddings: false,
+          lr: 0.0001,
+          ema_config: {
+            use_ema: false,
+            ema_decay: 0.99,
+          },
+          skip_first_sample: false,
+          force_first_sample: false,
+          disable_sampling: false,
+          dtype: 'bf16',
+          diff_output_preservation: false,
+          diff_output_preservation_multiplier: 1.0,
+          diff_output_preservation_class: 'person',
+          switch_boundary_every: 1,
+          loss_type: 'mse',
+          diffusion_loss_weight: 1.0,
+          diffusion_loss_min_t: 0.0,
+          diffusion_loss_max_t: 1.0,
+          latent_perceptual_loss_weight: 0.0,
+          latent_perceptual_loss_min_t: 0.0,
+          latent_perceptual_loss_max_t: 0.5,
+        },
+        logging: {
+          log_every: 1,
+          use_ui_logger: true,
+        },
+        model: {
+          name_or_path: 'ostris/Flex.1-alpha',
+          quantize: true,
+          qtype: 'qfloat8',
+          quantize_te: true,
+          qtype_te: 'qfloat8',
+          arch: 'flex1',
+          low_vram: false,
+          model_kwargs: {},
+        },
+        sample: {
+          sampler: 'flowmatch',
+          sample_every: 250,
+          width: 1024,
+          height: 1024,
+          samples: [
+            {
+              prompt: 'woman with red hair, playing chess at the park, bomb going off in the background',
+            },
+            {
+              prompt: 'a woman holding a coffee cup, in a beanie, sitting at a cafe',
+            },
+            {
+              prompt: 'a horse is a DJ at a night club, fish eye lens, smoke machine, lazer lights, holding a martini',
+            },
+            {
+              prompt:
+                'a man showing off his cool new t shirt at the beach, a shark is jumping out of the water in the background',
+            },
+            {
+              prompt: 'a bear building a log cabin in the snow covered mountains',
+            },
+            {
+              prompt: 'woman playing the guitar, on stage, singing a song, laser lights, punk rocker',
+            },
+            {
+              prompt: 'hipster man with a beard, building a chair, in a wood shop',
+            },
+            {
+              prompt:
+                'photo of a man, white background, medium shot, modeling clothing, studio lighting, white backdrop',
+            },
+            {
+              prompt: "a man holding a sign that says, 'this is a sign'",
+            },
+            {
+              prompt:
+                'a bulldog, in a post apocalyptic world, with a shotgun, in a leather jacket, in a desert, with a motorcycle',
+            },
+          ],
+          neg: '',
+          seed: 42,
+          walk_seed: true,
+          guidance_scale: 4,
+          sample_steps: 25,
+          num_frames: 1,
+          fps: 1,
+        },
+      },
+    ],
+  },
+  meta: {
+    name: '[name]',
+    version: '1.0',
+  },
+};
+
+export const migrateJobConfig = (jobConfig: JobConfig): JobConfig => {
+  // upgrade prompt strings to samples
+  if (
+    jobConfig?.config?.process &&
+    jobConfig.config.process[0]?.sample &&
+    Array.isArray(jobConfig.config.process[0].sample.prompts) &&
+    jobConfig.config.process[0].sample.prompts.length > 0
+  ) {
+    let newSamples = [];
+    for (const prompt of jobConfig.config.process[0].sample.prompts) {
+      newSamples.push({
+        prompt: prompt,
+      });
+    }
+    jobConfig.config.process[0].sample.samples = newSamples;
+    delete jobConfig.config.process[0].sample.prompts;
+  }
+
+  // upgrade job from ui_trainer to diffusion_trainer
+  if (jobConfig?.config?.process && jobConfig.config.process[0]?.type === 'ui_trainer') {
+    jobConfig.config.process[0].type = 'diffusion_trainer';
+  }
+
+  if ('auto_memory' in jobConfig.config.process[0].model) {
+    jobConfig.config.process[0].model.layer_offloading = (jobConfig.config.process[0].model.auto_memory ||
+      false) as boolean;
+    delete jobConfig.config.process[0].model.auto_memory;
+  }
+
+  if (!('logging' in jobConfig.config.process[0])) {
+    //@ts-ignore
+    jobConfig.config.process[0].logging = {
+      log_every: 1,
+      use_ui_logger: true,
+    };
+  }
+  return jobConfig;
+};

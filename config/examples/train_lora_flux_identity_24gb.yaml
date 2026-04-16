@@ -1,0 +1,137 @@
+---
+job: extension
+config:
+  name: "my_identity_lora_v1"
+  process:
+    - type: 'sd_trainer'
+      training_folder: "output"
+      device: cuda:0
+      # trigger_word: "p3r5on"
+      network:
+        type: "lora"
+        linear: 16
+        linear_alpha: 16
+      save:
+        dtype: float16
+        save_every: 250
+        max_step_saves_to_keep: 4
+        push_to_hub: false
+
+      # ── Perceptual Anchoring & Identity Conditioning ───────────────────
+      # Perceptual anchoring uses frozen perception models (ArcFace, ViTPose)
+      # to compare the model's predictions against reference images, anchoring
+      # the output to preserve identity and body proportions.
+      # Face ID conditioning injects identity tokens so the LoRA embeds identity.
+      # Models download automatically on first run (~250MB ArcFace, ~350MB ViTPose).
+      face_id:
+        # --- Conditioning (injects face tokens into the model) ---
+        enabled: true
+        num_tokens: 4              # number of face embedding tokens
+        init_scale: 0.01           # initial output scale (ramps up during training)
+        scale_lr_multiplier: 10.0  # LR multiplier for the output scale parameter
+        dropout_prob: 0.1          # probability of dropping identity tokens per step (regularization)
+
+        # Vision encoder for fine-grained face detail (optional, increases VRAM)
+        # vision_enabled: false
+        # vision_model: "openai/clip-vit-large-patch14"
+        # vision_num_tokens: 4
+
+        # --- Identity anchor (ArcFace cosine similarity on decoded x0) ---
+        # Compares face embeddings between predicted output and reference image.
+        identity_loss_weight: 0.1    # 0 = disabled. Start with 0.01-0.1.
+        identity_loss_min_t: 0.0     # 0 = apply at all timesteps
+        identity_loss_max_t: 1.0
+        identity_loss_min_cos: 0.2   # skip samples below this similarity (face not yet visible)
+        identity_metrics: true       # log identity similarity even outside the loss timestep window
+
+        # --- Body proportion anchor (ViTPose bone-length ratios) ---
+        # Compares pose-invariant body proportions (limb lengths, torso ratio)
+        # between predicted and reference images to anchor body shape.
+        body_proportion_loss_weight: 0.0  # 0 = disabled. Try 0.1-0.2 for full-body datasets.
+        body_proportion_loss_min_t: 0.0   # 0 = apply at all timesteps
+        body_proportion_loss_max_t: 1.0
+
+        # --- Face suppression (dampen/eliminate face learning) ---
+        # Downweights diffusion loss inside face bounding boxes. Use standalone to
+        # train without memorizing faces (e.g. style or clothing LoRAs).
+        # face_suppression_weight: 0.5   # 0=normal, 0.5=half face learning, 1=full suppression. Omit for no suppression.
+
+      # ── Datasets ──────────────────────────────────────────────────────
+      # Each dataset can override global loss settings. Omit a value or set
+      # null to inherit the global default from face_id above.
+      #
+      # Per-dataset overrides available:
+      #   identity_loss_weight, identity_loss_min_t, identity_loss_max_t, identity_loss_min_cos
+      #   body_proportion_loss_weight, body_proportion_loss_min_t, body_proportion_loss_max_t
+      #   diffusion_loss_weight, face_suppression_weight (0=normal, 0.5=half, 1=full suppression)
+      datasets:
+        # Close-up portraits — emphasize face identity
+        - folder_path: "/path/to/portraits"
+          caption_ext: "txt"
+          caption_dropout_rate: 0.05
+          cache_latents_to_disk: true
+          resolution: [ 512, 768, 1024 ]
+          identity_loss_weight: 0.5       # stronger face loss for portrait crops
+          identity_loss_min_t: 0.5        # wider timestep window for close-ups
+
+        # Full-body shots — add body proportions, relax face weight
+        - folder_path: "/path/to/fullbody"
+          caption_ext: "txt"
+          caption_dropout_rate: 0.05
+          cache_latents_to_disk: true
+          resolution: [ 512, 768, 1024 ]
+          identity_loss_weight: 0.1
+          body_proportion_loss_weight: 0.1
+          # face_suppression_weight: 1.0  # uncomment to suppress face learning (learn body/style only)
+
+        # Regularization images — no identity loss, stabilizes training
+#       - folder_path: "/path/to/regularization"
+#         is_reg: true
+#         caption_ext: "txt"
+#         cache_latents_to_disk: true
+#         resolution: [ 512, 768, 1024 ]
+#         network_weight: 0.5
+#         identity_loss_weight: 0.0       # no identity loss on reg images
+
+      train:
+        batch_size: 1
+        steps: 4000
+        gradient_accumulation_steps: 1
+        train_unet: true
+        train_text_encoder: false
+        gradient_checkpointing: true
+        noise_scheduler: "flowmatch"
+        optimizer: "adamw8bit"
+        lr: 1e-4
+        # skip_first_sample: true
+        # disable_sampling: true
+
+        ema_config:
+          use_ema: true
+          ema_decay: 0.99
+
+        dtype: bf16
+      model:
+        name_or_path: "black-forest-labs/FLUX.1-dev"
+        is_flux: true
+        quantize: true
+        # low_vram: true  # if GPU is connected to monitors
+      sample:
+        sampler: "flowmatch"
+        sample_every: 250
+        width: 1024
+        height: 1024
+        prompts:
+          # use [trigger] to insert the trigger word
+          - "a woman smiling in a coffee shop, natural lighting"
+          - "a man in a suit, professional headshot, studio lighting"
+          - "a person hiking in the mountains, golden hour"
+          - "close-up portrait, dramatic lighting, dark background"
+        neg: ""
+        seed: 42
+        walk_seed: true
+        guidance_scale: 4
+        sample_steps: 20
+meta:
+  name: "[name]"
+  version: '1.0'

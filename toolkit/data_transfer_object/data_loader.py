@@ -163,6 +163,8 @@ class FileItemDTO(
         self.vae_anchor_loss_max_t: Union[float, None] = self.dataset_config.vae_anchor_loss_max_t
         self.diffusion_loss_weight: Union[float, None] = self.dataset_config.diffusion_loss_weight
         self.face_suppression_weight: Union[float, None] = self.dataset_config.face_suppression_weight
+        self.face_suppression_expand: Union[float, None] = self.dataset_config.face_suppression_expand
+        self.face_suppression_soft: Union[bool, None] = self.dataset_config.face_suppression_soft
         self.latent_perceptual_loss_weight: Union[float, None] = self.dataset_config.latent_perceptual_loss_weight
         self.latent_perceptual_loss_min_t: Union[float, None] = self.dataset_config.latent_perceptual_loss_min_t
         self.latent_perceptual_loss_max_t: Union[float, None] = self.dataset_config.latent_perceptual_loss_max_t
@@ -388,6 +390,12 @@ class DataLoaderBatchDTO:
             ]
             self.face_suppression_weight_list: List[Union[float, None]] = [
                 x.face_suppression_weight for x in self.file_items
+            ]
+            self.face_suppression_expand_list: List[Union[float, None]] = [
+                x.face_suppression_expand for x in self.file_items
+            ]
+            self.face_suppression_soft_list: List[Union[bool, None]] = [
+                x.face_suppression_soft for x in self.file_items
             ]
             self.vae_anchor_loss_weight_list: List[Union[float, None]] = [
                 x.vae_anchor_loss_weight for x in self.file_items

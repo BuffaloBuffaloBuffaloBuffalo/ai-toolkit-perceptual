@@ -129,6 +129,8 @@ export interface DatasetConfig {
   vae_anchor_loss_max_t?: number;
   diffusion_loss_weight?: number;
   face_suppression_weight?: number;
+  face_suppression_expand?: number;
+  face_suppression_soft?: boolean;
   latent_perceptual_loss_weight?: number;
   latent_perceptual_loss_min_t?: number;
   latent_perceptual_loss_max_t?: number;
@@ -286,6 +288,8 @@ export interface FaceIDConfig {
   vae_anchor_loss_max_t?: number;
   vae_anchor_model_path?: string;
   face_suppression_weight?: number;
+  face_suppression_expand?: number;
+  face_suppression_soft?: boolean;
 }
 
 export interface BodyIDConfig {

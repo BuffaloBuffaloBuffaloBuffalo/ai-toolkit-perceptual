@@ -102,6 +102,17 @@ export default function TrainingForm() {
 
   const saveJob = async () => {
     if (status === 'saving') return;
+
+    // Validate dataset paths before saving
+    const defaultPath = defaultDatasetConfig.folder_path;
+    const datasets_list = jobConfig.config.process[0].datasets;
+    for (let i = 0; i < datasets_list.length; i++) {
+      if (!datasets_list[i].folder_path || datasets_list[i].folder_path === defaultPath) {
+        alert(`Dataset ${i + 1} has no folder selected. Please select a dataset folder.`);
+        return;
+      }
+    }
+
     setStatus('saving');
 
     apiClient

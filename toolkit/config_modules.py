@@ -897,6 +897,10 @@ class FaceIDConfig:
         # Face suppression: downweight diffusion loss in detected face bounding boxes
         # None = no suppression, 0.0 = zero face loss, 0.5 = half, 1.0 = normal
         self.face_suppression_weight: Union[float, None] = kwargs.get('face_suppression_weight', None)
+        # Bbox expansion multiplier for face suppression (1.0 = tight face box, 1.8 = full head coverage)
+        self.face_suppression_expand: float = kwargs.get('face_suppression_expand', 1.0)
+        # Use Gaussian falloff instead of hard rectangle for face suppression mask
+        self.face_suppression_soft: bool = kwargs.get('face_suppression_soft', True)
         # VAE perceptual anchor loss — compare x0_pred VAE encoder features vs reference
         self.vae_anchor_loss_weight: float = kwargs.get('vae_anchor_loss_weight', 0.0)  # 0 = disabled
         self.vae_anchor_loss_min_t: float = kwargs.get('vae_anchor_loss_min_t', 0.0)
@@ -1056,6 +1060,8 @@ class DatasetConfig:
         self.vae_anchor_loss_max_t: Union[float, None] = kwargs.get('vae_anchor_loss_max_t', None)
         self.diffusion_loss_weight: Union[float, None] = kwargs.get('diffusion_loss_weight', None)
         self.face_suppression_weight: Union[float, None] = kwargs.get('face_suppression_weight', None)
+        self.face_suppression_expand: Union[float, None] = kwargs.get('face_suppression_expand', None)
+        self.face_suppression_soft: Union[bool, None] = kwargs.get('face_suppression_soft', None)
         self.latent_perceptual_loss_weight: Union[float, None] = kwargs.get('latent_perceptual_loss_weight', None)
         self.latent_perceptual_loss_min_t: Union[float, None] = kwargs.get('latent_perceptual_loss_min_t', None)
         self.latent_perceptual_loss_max_t: Union[float, None] = kwargs.get('latent_perceptual_loss_max_t', None)

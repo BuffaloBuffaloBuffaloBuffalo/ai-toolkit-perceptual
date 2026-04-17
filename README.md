@@ -58,6 +58,31 @@ datasets:
     face_suppression_weight: 1.0       # full suppression — don't learn faces
 ```
 
+## Training Metrics
+
+All active losses log both raw and weighted (`_applied`) values. Metrics are visible in the UI loss chart and written to the SQLite database.
+
+| Metric | Description |
+|---|---|
+| `diffusion_loss` | Main diffusion training loss |
+| `identity_loss` | ArcFace cosine distance (1 - similarity) |
+| `id_sim` | Mean face cosine similarity (higher = better) |
+| `id_sim_tXX` | Face similarity binned by timestep (10% bands: `t00`, `t10`, ... `t90`) |
+| `body_proportion_loss` | ViTPose bone-length ratio error |
+| `bp_sim_tXX` | Body proportion similarity by timestep |
+| `latent_perceptual_loss` | E-LatentLPIPS distance in latent space |
+
+Set `face_id.identity_metrics: true` to log identity similarity metrics without applying the loss.
+
+## Training Previews
+
+Preview images are saved to subdirectories of the training output folder, giving visual feedback on what the perception models see during training.
+
+| Directory | Content | Saved |
+|---|---|---|
+| `id_previews/` | Side-by-side: noisy input, x0 prediction, ArcFace crop, face bounding box. Annotated with cosine similarity and timestep. | Every step with a face detection |
+| `body_previews/` | Reference and predicted skeleton overlays (17-keypoint ViTPose). Shows keypoint confidence. | Every step with a body detection |
+
 ---
 
 ## Upstream: AI Toolkit by Ostris

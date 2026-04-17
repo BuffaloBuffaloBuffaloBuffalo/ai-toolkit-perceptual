@@ -1046,6 +1046,29 @@ export default function SimpleJob({
                   min={0}
                   max={1}
                 />
+                {(jobConfig.config.process[0].face_id?.face_suppression_weight ?? 0) > 0 && (
+                  <>
+                    <NumberInput
+                      label="Suppression Expand"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].face_id?.face_suppression_expand ?? 1.0}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].face_id.face_suppression_expand')
+                      }
+                      placeholder="1.0 = face only, 1.8 = full head"
+                      min={1.0}
+                      max={3.0}
+                    />
+                    <Checkbox
+                      label="Soft Gaussian Falloff"
+                      className="pt-2"
+                      checked={jobConfig.config.process[0].face_id?.face_suppression_soft ?? true}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].face_id.face_suppression_soft')
+                      }
+                    />
+                  </>
+                )}
                 {/* Body shape, normal map, VAE anchor, body conditioning — experimental, hidden for now
                 <NumberInput
                   label="Body Shape Loss Weight (HybrIK)"
@@ -1512,6 +1535,7 @@ export default function SimpleJob({
                           <div className="grid grid-cols-3 gap-2">
                             <NumberInput label="Weight" value={dataset.diffusion_loss_weight ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].diffusion_loss_weight`)} placeholder="inherit" min={0} />
                             <NumberInput label="Face Suppression" value={dataset.face_suppression_weight ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].face_suppression_weight`)} placeholder="inherit" min={0} max={1} />
+                            <NumberInput label="Supp. Expand" value={dataset.face_suppression_expand ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].face_suppression_expand`)} placeholder="inherit" min={1.0} max={3.0} />
                           </div>
                         </div>
                         {/* Latent Perceptual — experimental, hidden for now

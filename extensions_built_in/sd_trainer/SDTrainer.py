@@ -3112,8 +3112,16 @@ class SDTrainer(BaseSDTrainProcess):
             # Face suppression mask: downweight loss in detected face bounding boxes
             # Resolve per-sample None → global face_id_config fallback
             _global_fsw = getattr(self.face_id_config, 'face_suppression_weight', None) if self.face_id_config else None
+            _global_fse = getattr(self.face_id_config, 'face_suppression_expand', 1.0) if self.face_id_config else 1.0
+            _global_fss = getattr(self.face_id_config, 'face_suppression_soft', True) if self.face_id_config else True
             _resolved_fsw_list = [
                 (w if w is not None else _global_fsw) for w in batch.face_suppression_weight_list
+            ]
+            _resolved_fse_list = [
+                (e if e is not None else _global_fse) for e in batch.face_suppression_expand_list
+            ]
+            _resolved_fss_list = [
+                (s if s is not None else _global_fss) for s in batch.face_suppression_soft_list
             ]
             if any(w is not None and w > 0.0 for w in _resolved_fsw_list):
                 if batch.face_bboxes is not None:
@@ -3126,12 +3134,14 @@ class SDTrainer(BaseSDTrainProcess):
                         device=self.device_torch, dtype=dtype,
                     )
                     for idx in range(noisy_latents.shape[0]):
-                        w = _resolved_fsw_list[idx]
-                        if w is None or w <= 0.0:
+                        fsw = _resolved_fsw_list[idx]
+                        if fsw is None or fsw <= 0.0:
                             continue
                         # Invert: user-facing 0=no suppression, 1=full suppression
                         # Internal mask needs 0=zero loss, 1=normal
-                        w = 1.0 - w
+                        supp_val = 1.0 - fsw
+                        expand = _resolved_fse_list[idx]
+                        soft = _resolved_fss_list[idx]
                         raw_bbox = batch.face_bboxes[idx] if idx < len(batch.face_bboxes) else None
                         if raw_bbox is None:
                             continue
@@ -3153,14 +3163,80 @@ class SDTrainer(BaseSDTrainProcess):
                         # skip if face is outside crop
                         if bx2 <= 0 or by2 <= 0 or bx1 >= cw or by1 >= ch:
                             continue
-                        # to latent coords
-                        bx1 = bx1 * lat_w / cw; bx2 = bx2 * lat_w / cw
-                        by1 = by1 * lat_h / ch; by2 = by2 * lat_h / ch
-                        # clamp and convert to int
-                        x1 = max(0, int(bx1)); y1 = max(0, int(by1))
-                        x2 = min(lat_w, int(bx2) + 1); y2 = min(lat_h, int(by2) + 1)
-                        if x2 > x1 and y2 > y1:
-                            face_supp_mask[idx, :, y1:y2, x1:x2] = w
+
+                        # Asymmetric bbox expansion for head coverage
+                        face_w = bx2 - bx1
+                        face_h = by2 - by1
+                        if expand > 1.0:
+                            # Up: full expansion (crown/hair extend far above face box)
+                            exp_up = (expand - 1.0) * face_h * 1.0
+                            # Sides: moderate (hair volume)
+                            exp_side = (expand - 1.0) * face_w * 0.5
+                            # Down: less (chin to neck)
+                            exp_down = (expand - 1.0) * face_h * 0.3
+                            ebx1 = bx1 - exp_side
+                            eby1 = by1 - exp_up
+                            ebx2 = bx2 + exp_side
+                            eby2 = by2 + exp_down
+                            # clamp to crop bounds
+                            ebx1 = max(0.0, ebx1); eby1 = max(0.0, eby1)
+                            ebx2 = min(cw, ebx2);   eby2 = min(ch, eby2)
+                        else:
+                            ebx1, eby1, ebx2, eby2 = bx1, by1, bx2, by2
+
+                        # to latent coords (expanded bbox)
+                        lbx1 = ebx1 * lat_w / cw; lbx2 = ebx2 * lat_w / cw
+                        lby1 = eby1 * lat_h / ch; lby2 = eby2 * lat_h / ch
+
+                        if soft and expand > 1.0:
+                            # Gaussian falloff mask centered on original face bbox center
+                            center_x = (bx1 + bx2) * 0.5 * lat_w / cw
+                            center_y = (by1 + by2) * 0.5 * lat_h / ch
+                            expanded_w_lat = lbx2 - lbx1
+                            expanded_h_lat = lby2 - lby1
+                            sigma_x = max(expanded_w_lat / 4.0, 0.5)
+                            sigma_y = max(expanded_h_lat / 4.0, 0.5)
+                            # Build 2D Gaussian on the latent grid
+                            yy = torch.arange(lat_h, device=self.device_torch, dtype=dtype) + 0.5
+                            xx = torch.arange(lat_w, device=self.device_torch, dtype=dtype) + 0.5
+                            gy = torch.exp(-0.5 * ((yy - center_y) / sigma_y) ** 2)
+                            gx = torch.exp(-0.5 * ((xx - center_x) / sigma_x) ** 2)
+                            gaussian_2d = gy.unsqueeze(1) * gx.unsqueeze(0)  # (lat_h, lat_w)
+                            # gaussian_2d is 1.0 at center, falls off to ~0
+                            # mask_value = 1.0 - fsw * gaussian_value
+                            face_supp_mask[idx, 0] = 1.0 - fsw * gaussian_2d
+                        else:
+                            # Hard rectangle (original behavior or expanded hard rect)
+                            x1 = max(0, int(lbx1)); y1 = max(0, int(lby1))
+                            x2 = min(lat_w, int(lbx2) + 1); y2 = min(lat_h, int(lby2) + 1)
+                            if x2 > x1 and y2 > y1:
+                                face_supp_mask[idx, :, y1:y2, x1:x2] = supp_val
+                    # Save suppression mask preview every 50 steps
+                    if self.step_num % 50 == 0:
+                        try:
+                            import torchvision.transforms.functional as TF
+                            supp_preview_dir = os.path.join(self.save_root, 'suppression_previews')
+                            os.makedirs(supp_preview_dir, exist_ok=True)
+                            for idx in range(face_supp_mask.shape[0]):
+                                # face_supp_mask is (B, 1, lat_h, lat_w), values: 1.0=normal, low=suppressed
+                                mask_img = face_supp_mask[idx, 0]  # (lat_h, lat_w)
+                                # Upsample to a visible size
+                                mask_up = torch.nn.functional.interpolate(
+                                    mask_img.unsqueeze(0).unsqueeze(0), scale_factor=8, mode='nearest'
+                                ).squeeze()  # (H, W)
+                                # Colorize: red = suppressed, white = normal
+                                r = torch.ones_like(mask_up)
+                                g = mask_up
+                                b = mask_up
+                                heatmap = torch.stack([r, g, b], dim=0).clamp(0, 1)
+                                fi = batch.file_items[idx]
+                                src_name = os.path.splitext(os.path.basename(fi.path))[0]
+                                TF.to_pil_image(heatmap).save(
+                                    os.path.join(supp_preview_dir, f'{src_name}_step{self.step_num:06d}.jpg')
+                                )
+                        except Exception:
+                            pass
+
                     # expand to match latent channels for multiplication
                     face_supp_mask = face_supp_mask.expand(-1, noisy_latents.shape[1], -1, -1)
                     # normalize to mean=1 so total loss magnitude is preserved

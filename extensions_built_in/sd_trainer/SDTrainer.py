@@ -3214,28 +3214,30 @@ class SDTrainer(BaseSDTrainProcess):
                     # Save suppression mask preview every 50 steps
                     if self.step_num % 50 == 0:
                         try:
-                            import torchvision.transforms.functional as TF
+                            from PIL import Image
+                            import numpy as np
                             supp_preview_dir = os.path.join(self.save_root, 'suppression_previews')
                             os.makedirs(supp_preview_dir, exist_ok=True)
                             for idx in range(face_supp_mask.shape[0]):
                                 # face_supp_mask is (B, 1, lat_h, lat_w), values: 1.0=normal, low=suppressed
-                                mask_img = face_supp_mask[idx, 0]  # (lat_h, lat_w)
-                                # Upsample to a visible size
-                                mask_up = torch.nn.functional.interpolate(
-                                    mask_img.unsqueeze(0).unsqueeze(0), scale_factor=8, mode='nearest'
-                                ).squeeze()  # (H, W)
+                                mask_np = face_supp_mask[idx, 0].detach().float().cpu().numpy()  # (lat_h, lat_w)
+                                # Upsample to visible size
+                                h, w = mask_np.shape
+                                img_h, img_w = h * 8, w * 8
+                                mask_big = np.repeat(np.repeat(mask_np, 8, axis=0), 8, axis=1)
                                 # Colorize: red = suppressed, white = normal
-                                r = torch.ones_like(mask_up)
-                                g = mask_up
-                                b = mask_up
-                                heatmap = torch.stack([r, g, b], dim=0).clamp(0, 1)
+                                rgb = np.stack([
+                                    np.ones_like(mask_big) * 255,
+                                    (mask_big * 255).clip(0, 255),
+                                    (mask_big * 255).clip(0, 255),
+                                ], axis=-1).astype(np.uint8)
                                 fi = batch.file_items[idx]
                                 src_name = os.path.splitext(os.path.basename(fi.path))[0]
-                                TF.to_pil_image(heatmap).save(
+                                Image.fromarray(rgb).save(
                                     os.path.join(supp_preview_dir, f'{src_name}_step{self.step_num:06d}.jpg')
                                 )
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            print(f"WARNING: suppression preview save failed: {e}")
 
                     # expand to match latent channels for multiplication
                     face_supp_mask = face_supp_mask.expand(-1, noisy_latents.shape[1], -1, -1)

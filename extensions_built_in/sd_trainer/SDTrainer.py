@@ -3211,7 +3211,7 @@ class SDTrainer(BaseSDTrainProcess):
                             x2 = min(lat_w, int(lbx2) + 1); y2 = min(lat_h, int(lby2) + 1)
                             if x2 > x1 and y2 > y1:
                                 face_supp_mask[idx, :, y1:y2, x1:x2] = supp_val
-                    # Save suppression mask preview every 50 steps
+                    # Save suppression mask overlay on reference image every 50 steps
                     if self.step_num % 50 == 0:
                         try:
                             from PIL import Image
@@ -3219,21 +3219,24 @@ class SDTrainer(BaseSDTrainProcess):
                             supp_preview_dir = os.path.join(self.save_root, 'suppression_previews')
                             os.makedirs(supp_preview_dir, exist_ok=True)
                             for idx in range(face_supp_mask.shape[0]):
-                                # face_supp_mask is (B, 1, lat_h, lat_w), values: 1.0=normal, low=suppressed
-                                mask_np = face_supp_mask[idx, 0].detach().float().cpu().numpy()  # (lat_h, lat_w)
-                                # Upsample to visible size
-                                h, w = mask_np.shape
-                                img_h, img_w = h * 8, w * 8
-                                mask_big = np.repeat(np.repeat(mask_np, 8, axis=0), 8, axis=1)
-                                # Colorize: red = suppressed, white = normal
-                                rgb = np.stack([
-                                    np.ones_like(mask_big) * 255,
-                                    (mask_big * 255).clip(0, 255),
-                                    (mask_big * 255).clip(0, 255),
-                                ], axis=-1).astype(np.uint8)
                                 fi = batch.file_items[idx]
+                                ref_img = Image.open(fi.path).convert('RGB')
+                                ref_w, ref_h = ref_img.size
+                                # face_supp_mask is (B, 1, lat_h, lat_w), values: 1.0=normal, low=suppressed
+                                mask_np = face_supp_mask[idx, 0].detach().float().cpu().numpy()
+                                # Resize mask to match reference image
+                                mask_pil = Image.fromarray((mask_np * 255).clip(0, 255).astype(np.uint8))
+                                mask_resized = mask_pil.resize((ref_w, ref_h), Image.NEAREST)
+                                mask_arr = np.array(mask_resized).astype(np.float32) / 255.0
+                                # Overlay: red tint where suppressed (mask < 1)
+                                ref_arr = np.array(ref_img).astype(np.float32)
+                                suppression = 1.0 - mask_arr  # 1.0 = fully suppressed, 0 = normal
+                                # Blend: original * mask + red * (1 - mask)
+                                ref_arr[..., 0] = ref_arr[..., 0] * (1.0 - suppression * 0.6) + 255 * suppression * 0.6
+                                ref_arr[..., 1] = ref_arr[..., 1] * (1.0 - suppression * 0.6)
+                                ref_arr[..., 2] = ref_arr[..., 2] * (1.0 - suppression * 0.6)
                                 src_name = os.path.splitext(os.path.basename(fi.path))[0]
-                                Image.fromarray(rgb).save(
+                                Image.fromarray(ref_arr.clip(0, 255).astype(np.uint8)).save(
                                     os.path.join(supp_preview_dir, f'{src_name}_step{self.step_num:06d}.jpg')
                                 )
                         except Exception as e:

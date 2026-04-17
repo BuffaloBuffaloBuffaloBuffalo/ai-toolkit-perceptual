@@ -3112,8 +3112,8 @@ class SDTrainer(BaseSDTrainProcess):
             # Face suppression mask: downweight loss in detected face bounding boxes
             # Resolve per-sample None → global face_id_config fallback
             _global_fsw = getattr(self.face_id_config, 'face_suppression_weight', None) if self.face_id_config else None
-            _global_fse = getattr(self.face_id_config, 'face_suppression_expand', 1.0) if self.face_id_config else 1.0
-            _global_fss = getattr(self.face_id_config, 'face_suppression_soft', True) if self.face_id_config else True
+            _global_fse = getattr(self.face_id_config, 'face_suppression_expand', 2.0) if self.face_id_config else 2.0
+            _global_fss = getattr(self.face_id_config, 'face_suppression_soft', False) if self.face_id_config else False
             _resolved_fsw_list = [
                 (w if w is not None else _global_fsw) for w in batch.face_suppression_weight_list
             ]

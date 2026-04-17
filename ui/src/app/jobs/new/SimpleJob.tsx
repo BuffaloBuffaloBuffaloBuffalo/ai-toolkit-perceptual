@@ -1051,7 +1051,7 @@ export default function SimpleJob({
                     <NumberInput
                       label="Suppression Expand"
                       className="pt-2"
-                      value={jobConfig.config.process[0].face_id?.face_suppression_expand ?? 1.0}
+                      value={jobConfig.config.process[0].face_id?.face_suppression_expand ?? 2.0}
                       onChange={value =>
                         setJobConfig(value, 'config.process[0].face_id.face_suppression_expand')
                       }
@@ -1062,7 +1062,7 @@ export default function SimpleJob({
                     <Checkbox
                       label="Soft Gaussian Falloff"
                       className="pt-2"
-                      checked={jobConfig.config.process[0].face_id?.face_suppression_soft ?? true}
+                      checked={jobConfig.config.process[0].face_id?.face_suppression_soft ?? false}
                       onChange={value =>
                         setJobConfig(value, 'config.process[0].face_id.face_suppression_soft')
                       }

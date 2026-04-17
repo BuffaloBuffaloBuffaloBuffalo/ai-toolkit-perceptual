@@ -1,0 +1,81 @@
+# Skeleton-motion-ONLY validation — no diffusion loss.
+# Validates that the skeleton motion loss alone can drive weight updates.
+---
+job: extension
+config:
+  name: "skeleton_motion_only_test"
+  process:
+    - type: 'sd_trainer'
+      training_folder: "output"
+      device: cuda:0
+      network:
+        type: "lora"
+        linear: 16
+        linear_alpha: 16
+      save:
+        dtype: float16
+        save_every: 100
+        max_step_saves_to_keep: 2
+      datasets:
+        - folder_path: "test_data/cartwheel_train"
+          caption_ext: "txt"
+          caption_dropout_rate: 0.05
+          cache_latents_to_disk: true
+          resolution: [ 256 ]
+          num_frames: 61
+          shrink_video_to_frames: true
+      train:
+        batch_size: 1
+        steps: 500
+        gradient_accumulation: 1
+        train_unet: true
+        train_text_encoder: false
+        gradient_checkpointing: true
+        noise_scheduler: "flowmatch"
+        timestep_type: 'linear'  # uniform index↔value mapping so min/max_denoising_steps are intuitive
+        optimizer: "adamw8bit"
+        lr: 1e-4
+        optimizer_params:
+          weight_decay: 1e-4
+        skip_first_sample: false  # generate step-0 baseline for comparison
+        dtype: bf16
+        # Zero out diffusion loss — skeleton motion loss is the only signal
+        diffusion_loss_weight: 0.0
+        # Bias toward HIGH-noise timesteps (where overall pose/structure is decided).
+        # With linear timestep_type, timesteps array is descending 1000→1, so:
+        #   index 0 = timestep ~1000 (max noise), index 999 = timestep ~1 (min noise)
+        # min=0, max=300 → t_ratio ∈ [0.7, 1.0] (model already handles 0.5-0.7 well)
+        min_denoising_steps: 0
+        max_denoising_steps: 300
+        # Cache text embeddings once, then unload text encoder entirely
+        cache_text_embeddings: true
+      model:
+        name_or_path: "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
+        arch: 'wan21'
+        quantize_te: true  # quantize during sampling, unloaded afterward via cache_text_embeddings
+      skeleton_motion:
+        loss_weight: 1.0             # pose-normalized position (body-centered)
+        velocity_loss_weight: 0.5    # frame-to-frame motion delta
+        translation_loss_weight: 2.0 # UN-normalized body center position — captures movement across frame
+        min_t: 0.0                   # all timesteps
+        max_t: 1.0
+        preview_every: 5             # every 5 steps (all are high-t now due to min_denoising_steps)
+        preview_min_t: 0.0           # all timesteps pass (min_denoising_steps already filters)
+      sample:
+        sampler: "flowmatch"
+        sample_every: 50
+        # Training is at 256, but sample at 512 — Wan 2.1 1.3B has bad artifacts at 256
+        width: 512
+        height: 512
+        num_frames: 61
+        fps: 16  # Wan 2.1 native training fps (per diffusers pipeline examples)
+        prompts:
+          - "a woman performing a cartwheel in a gymnasium"
+        neg: ""
+        seed: 42
+        walk_seed: true
+        guidance_scale: 5
+        sample_steps: 30
+meta:
+  name: "[name]"
+  version: '1.0'

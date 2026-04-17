@@ -1,0 +1,69 @@
+# Skeleton motion loss prototype — Wan 2.1 1.3B video training
+# Trains on a single cartwheel video at 256px to validate the skeleton motion loss.
+---
+job: extension
+config:
+  name: "skeleton_motion_cartwheel_test"
+  process:
+    - type: 'sd_trainer'
+      training_folder: "output"
+      device: cuda:0
+      network:
+        type: "lora"
+        linear: 16
+        linear_alpha: 16
+      save:
+        dtype: float16
+        save_every: 100
+        max_step_saves_to_keep: 2
+      datasets:
+        - folder_path: "test_data/cartwheel_train"
+          caption_ext: "txt"
+          caption_dropout_rate: 0.05
+          cache_latents_to_disk: true
+          # 256px for skeleton — ViTPose native res, cheap, fits all frames
+          resolution: [ 256 ]
+          num_frames: 41  # video mode (>1). Wan temporal: (41-1)/4+1 = 11 latent frames
+          shrink_video_to_frames: true
+      train:
+        batch_size: 1
+        steps: 500
+        gradient_accumulation: 1
+        train_unet: true
+        train_text_encoder: false
+        gradient_checkpointing: true
+        noise_scheduler: "flowmatch"
+        timestep_type: 'sigmoid'
+        optimizer: "adamw8bit"
+        lr: 1e-4
+        optimizer_params:
+          weight_decay: 1e-4
+        skip_first_sample: true
+        dtype: bf16
+      model:
+        name_or_path: "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
+        arch: 'wan21'
+        quantize_te: true
+      # Skeleton motion loss — per-frame keypoint matching against reference video
+      skeleton_motion:
+        loss_weight: 0.01           # position matching weight
+        velocity_loss_weight: 0.005 # frame-to-frame velocity matching weight
+        min_t: 0.3                  # only apply at moderate-to-high noise
+        max_t: 1.0
+      sample:
+        sampler: "flowmatch"
+        sample_every: 100
+        width: 256
+        height: 256
+        num_frames: 41
+        fps: 15
+        prompts:
+          - "a woman performing a cartwheel in a gymnasium"
+        neg: ""
+        seed: 42
+        walk_seed: true
+        guidance_scale: 5
+        sample_steps: 30
+meta:
+  name: "[name]"
+  version: '1.0'

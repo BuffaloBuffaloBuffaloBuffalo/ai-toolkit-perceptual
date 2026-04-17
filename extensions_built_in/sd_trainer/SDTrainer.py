@@ -141,6 +141,18 @@ class SDTrainer(BaseSDTrainProcess):
         self._last_normal_loss: Optional[float] = None
         self._last_normal_loss_applied: Optional[float] = None
         self._last_normal_cos: Optional[float] = None
+
+        # Skeleton motion loss for video
+        skel_raw = self.get_conf('skeleton_motion', None)
+        self.skeleton_motion_config = skel_raw  # dict or None
+        self.skeleton_motion_model = None       # ViTPoseExtractor, loaded later
+        self.skeleton_motion_taehv = None       # TAEHV tiny decoder for Wan 2.1
+        self._skeleton_motion_ref_kp = None     # (T, 17, 2) cached reference keypoints
+        self._skeleton_motion_ref_vis = None    # (T, 17) cached reference visibility
+        self._last_skeleton_motion_loss: Optional[float] = None
+        self._last_skel_pos_loss: Optional[float] = None
+        self._last_skel_vel_loss: Optional[float] = None
+        self._last_skel_trans_loss: Optional[float] = None
         self._last_vae_anchor_loss: Optional[float] = None
         self._last_vae_anchor_loss_applied: Optional[float] = None
         self._last_vae_anchor_per_level: Optional[dict] = None
@@ -783,6 +795,41 @@ class SDTrainer(BaseSDTrainProcess):
 
                 _decoder.forward = _fine_ckpt_forward
                 print_acc("  VAE decoder: fine-grained gradient checkpointing enabled")
+
+        # Load skeleton motion loss model (ViTPose + TAEHV) for video training
+        if self.skeleton_motion_config is not None:
+            skel_w = self.skeleton_motion_config.get('loss_weight', 0.0)
+            if skel_w > 0:
+                from toolkit.skeleton_motion import (
+                    ViTPoseExtractor, cache_video_skeleton, load_taehv_wan21,
+                )
+                print_acc(f"Skeleton motion: loading ViTPoseExtractor (weight={skel_w})...")
+                self.skeleton_motion_model = ViTPoseExtractor()
+                self.skeleton_motion_model.to(self.device_torch)
+                self.skeleton_motion_model.eval()
+
+                # Load TAEHV tiny decoder for Wan 2.1 — enables full 117-frame
+                # decode with gradients in ~10GB peak vs ~20GB+ for the full VAE.
+                print_acc("Skeleton motion: loading TAEHV (taew2_1) tiny decoder...")
+                self.skeleton_motion_taehv = load_taehv_wan21(
+                    device=self.device_torch,
+                    dtype=get_torch_dtype(self.train_config.dtype),
+                )
+
+                # Cache reference keypoints from dataset videos
+                if self.data_loader is not None:
+                    datasets = get_dataloader_datasets(self.data_loader)
+                    for dataset in datasets:
+                        for file_item in dataset.file_list:
+                            if file_item.is_video:
+                                kp, vis = cache_video_skeleton(
+                                    file_item.path, device=str(self.device_torch))
+                                self._skeleton_motion_ref_kp = kp.to(self.device_torch)
+                                self._skeleton_motion_ref_vis = vis.to(self.device_torch)
+                                print_acc(f"  Cached reference skeleton: {kp.shape[0]} frames from {os.path.basename(file_item.path)}")
+                                break  # single-video prototype
+                        if self._skeleton_motion_ref_kp is not None:
+                            break
 
         # Load lightweight decoder for face losses (identity)
         if _need_face_decoder and self.taesd is None:
@@ -2519,6 +2566,114 @@ class SDTrainer(BaseSDTrainProcess):
                             level_str = ' '.join(f'{k}={v:.4f}' for k, v in va_per_level.items())
                             print(f"  [VAE anchor] step={self.step_num} total={(va_loss_per_sample.sum() / va_active_count).item():.4f} {level_str}")
 
+        # --- Skeleton motion loss (video only) ---
+        # Separate from the image discriminator block above because video x0
+        # needs the Wan 3D VAE (not TAESD) and per-frame ViTPose extraction.
+        _need_skeleton_motion = (
+            self.skeleton_motion_model is not None
+            and self._skeleton_motion_ref_kp is not None
+            and len(noise_pred.shape) == 5  # video: (B, C, T, H, W)
+        )
+        if _need_skeleton_motion:
+            from toolkit.skeleton_motion import (
+                decode_wan_x0_to_frames, skeleton_motion_loss,
+                skeleton_velocity_loss, skeleton_translation_loss,
+                save_skeleton_preview,
+            )
+            skel_cfg = self.skeleton_motion_config
+            skel_loss_w = skel_cfg.get('loss_weight', 0.0)
+            skel_vel_w = skel_cfg.get('velocity_loss_weight', 0.0)
+            skel_trans_w = skel_cfg.get('translation_loss_weight', 0.0)
+            skel_preview_every = skel_cfg.get('preview_every', 0)
+            skel_preview_min_t = skel_cfg.get('preview_min_t', 0.0)
+            skel_min_t = skel_cfg.get('min_t', 0.0)
+            skel_max_t = skel_cfg.get('max_t', 1.0)
+
+            num_train_timesteps = float(self.sd.noise_scheduler.config.num_train_timesteps)
+            t_ratio_skel = timesteps.float() / num_train_timesteps
+            skel_mask = (t_ratio_skel > skel_min_t) & (t_ratio_skel < skel_max_t)
+
+            if skel_mask.any():
+                # Recover x0 (flow matching)
+                sigma = t_ratio_skel.view(-1, 1, 1, 1, 1)
+                x0_pred_video = noisy_latents - sigma * noise_pred  # (B, C, T, H, W)
+
+                # Decode via TAEHV tiny decoder (11M params) — full 117 frames
+                # with gradients fits in ~10GB. No chunking or latents_mean/std needed.
+                x0_frames = decode_wan_x0_to_frames(x0_pred_video, self.skeleton_motion_taehv)
+
+                # Per-frame ViTPose with gradient checkpointing (keeps peak memory bounded)
+                from torch.utils.checkpoint import checkpoint as _ckpt
+                all_frames = x0_frames[0].permute(1, 0, 2, 3)  # (T_out, 3, H, W)
+                all_kp, all_vis_list = [], []
+                for t in range(all_frames.shape[0]):
+                    frame_t = all_frames[t:t+1]
+                    kp_t, vis_t = _ckpt(
+                        self.skeleton_motion_model, frame_t, use_reentrant=False)
+                    all_kp.append(kp_t); all_vis_list.append(vis_t)
+                gen_kp = torch.cat(all_kp, dim=0)
+                gen_vis = torch.cat(all_vis_list, dim=0)
+
+                # Align temporal length with reference
+                ref_kp = self._skeleton_motion_ref_kp
+                ref_vis = self._skeleton_motion_ref_vis
+                T_min = min(gen_kp.shape[0], ref_kp.shape[0])
+                if gen_kp.shape[0] != ref_kp.shape[0]:
+                    if gen_kp.shape[0] > T_min:
+                        ix = torch.linspace(0, gen_kp.shape[0] - 1, T_min).long()
+                        gen_kp, gen_vis = gen_kp[ix], gen_vis[ix]
+                    if ref_kp.shape[0] > T_min:
+                        ix = torch.linspace(0, ref_kp.shape[0] - 1, T_min).long()
+                        ref_kp, ref_vis = ref_kp[ix], ref_vis[ix]
+
+                skel_loss = noise_pred.new_tensor(0.0)
+                pos_v = vel_v = trans_v = 0.0
+                if skel_loss_w > 0:
+                    pos_loss = skeleton_motion_loss(gen_kp, gen_vis, ref_kp, ref_vis)
+                    skel_loss = skel_loss + skel_loss_w * pos_loss
+                    pos_v = pos_loss.detach().item()
+                if skel_vel_w > 0:
+                    vel_loss = skeleton_velocity_loss(gen_kp, gen_vis, ref_kp, ref_vis)
+                    skel_loss = skel_loss + skel_vel_w * vel_loss
+                    vel_v = vel_loss.detach().item()
+                if skel_trans_w > 0:
+                    trans_loss = skeleton_translation_loss(gen_kp, gen_vis, ref_kp, ref_vis)
+                    skel_loss = skel_loss + skel_trans_w * trans_loss
+                    trans_v = trans_loss.detach().item()
+
+                loss = loss + skel_loss
+                self._last_skeleton_motion_loss = skel_loss.detach().item()
+                self._last_skel_pos_loss = pos_v
+                self._last_skel_vel_loss = vel_v
+                self._last_skel_trans_loss = trans_v
+
+                # Save preview (skeleton overlays on generated frames, side-by-side with ref)
+                # Gated by step frequency AND min timestep (to focus on high-t samples)
+                _t_val = t_ratio_skel[0].item()
+                _should_preview = (
+                    skel_preview_every > 0
+                    and self.step_num % skel_preview_every == 0
+                    and _t_val >= skel_preview_min_t
+                )
+                if _should_preview:
+                    try:
+                        preview_dir = os.path.join(self.save_root, 'skeleton_previews')
+                        os.makedirs(preview_dir, exist_ok=True)
+                        preview_path = os.path.join(
+                            preview_dir, f'step{self.step_num:06d}_t{t_ratio_skel[0].item():.2f}.webp')
+                        save_skeleton_preview(
+                            preview_path,
+                            gen_frames=all_frames.detach(),
+                            gen_keypoints=gen_kp.detach(),
+                            gen_visibility=gen_vis.detach(),
+                            ref_keypoints=ref_kp.detach(),
+                            ref_visibility=ref_vis.detach(),
+                            max_frames=0,   # keep all 61 frames
+                            fps=16,          # Wan native — 61/16 ≈ 3.8s playback
+                        )
+                    except Exception as e:
+                        print_acc(f"  skeleton preview failed: {e}")
+
         # E-LatentLPIPS perceptual loss in latent space
         if self.latent_perceptual_model is not None:
             try:
@@ -4225,6 +4380,19 @@ class SDTrainer(BaseSDTrainProcess):
             for level_name, level_val in self._last_vae_anchor_per_level.items():
                 loss_dict[f'va_{level_name}'] = level_val
             self._last_vae_anchor_per_level = None
+        # Skeleton motion loss
+        if self._last_skeleton_motion_loss is not None:
+            loss_dict['skeleton_motion_loss'] = self._last_skeleton_motion_loss
+            self._last_skeleton_motion_loss = None
+        if self._last_skel_pos_loss is not None:
+            loss_dict['skel_pos_loss'] = self._last_skel_pos_loss
+            self._last_skel_pos_loss = None
+        if self._last_skel_vel_loss is not None:
+            loss_dict['skel_vel_loss'] = self._last_skel_vel_loss
+            self._last_skel_vel_loss = None
+        if self._last_skel_trans_loss is not None:
+            loss_dict['skel_trans_loss'] = self._last_skel_trans_loss
+            self._last_skel_trans_loss = None
         if self._last_timestep is not None:
             loss_dict['timestep'] = self._last_timestep
             self._last_timestep = None

@@ -182,3 +182,5 @@ cython_debug/
 aitk_db.db
 /notes.md
 /data
+/test_data
+toolkit/taehv/*.pth

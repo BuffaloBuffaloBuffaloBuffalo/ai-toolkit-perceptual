@@ -182,3 +182,9 @@ cython_debug/
 aitk_db.db
 /notes.md
 /data
+
+# Session-local / scratchpad
+/.claude/
+/config/examples/generate_cartwheel_1024.yaml
+/test_data/
+/toolkit/taehv/

@@ -245,6 +245,32 @@ def skeleton_motion_loss(
     return loss
 
 
+def skeleton_absolute_loss(
+    gen_keypoints: torch.Tensor,
+    gen_visibility: torch.Tensor,
+    ref_keypoints: torch.Tensor,
+    ref_visibility: torch.Tensor,
+    vis_threshold: float = 0.2,
+) -> torch.Tensor:
+    """Unified absolute-position keypoint matching loss.
+
+    Single L1 loss on raw image-space keypoint positions (no body-centering,
+    no normalization). Captures pose + translation + per-frame motion in one
+    signal — avoids the competition between body-normalized pose loss and
+    image-space translation loss.
+    """
+    combined_vis = torch.min(ref_visibility, gen_visibility)
+    vis_weight = combined_vis * (combined_vis >= vis_threshold).float()
+
+    if vis_weight.sum() < 1e-6:
+        return gen_keypoints.new_tensor(0.0)
+
+    diff = (gen_keypoints - ref_keypoints.detach()).abs().sum(-1)
+    weighted = diff * vis_weight
+    loss = weighted.sum() / vis_weight.sum().clamp(min=1e-6)
+    return loss
+
+
 def skeleton_translation_loss(
     gen_keypoints: torch.Tensor,
     gen_visibility: torch.Tensor,

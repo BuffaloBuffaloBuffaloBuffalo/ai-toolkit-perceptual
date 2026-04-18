@@ -1,9 +1,9 @@
-# Skeleton-motion-ONLY — w5t01 (absolute loss w=5, full t-range [0,1], 500 steps)
-# Regular VADER-style backprop through TAEHV + ViTPose.
+# Diffusion-only baseline — no skeleton loss, weight=1.0, 1000 steps.
+# Apples-to-apples comparison vs skeleton_motion_only_w5t01_b2_dl01_500 run.
 ---
 job: extension
 config:
-  name: "skeleton_motion_only_w5t01_b2_dl01_500"
+  name: "diff_only_w1_1000"
   process:
     - type: 'sd_trainer'
       training_folder: "output"
@@ -39,23 +39,14 @@ config:
           weight_decay: 1e-4
         skip_first_sample: true
         dtype: bf16
-        diffusion_loss_weight: 0.1
+        diffusion_loss_weight: 1.0
         min_denoising_steps: 0
-        max_denoising_steps: 1000  # full t ∈ [0, 1]
+        max_denoising_steps: 1000
         cache_text_embeddings: true
       model:
         name_or_path: "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
         arch: 'wan21'
         quantize_te: true
-      skeleton_motion:
-        absolute_loss_weight: 5.0
-        loss_weight: 0.0
-        velocity_loss_weight: 0.0
-        translation_loss_weight: 0.0
-        min_t: 0.0
-        max_t: 1.0
-        preview_every: 50
-        preview_min_t: 0.0
       sample:
         sampler: "flowmatch"
         sample_every: 100

@@ -153,6 +153,7 @@ class SDTrainer(BaseSDTrainProcess):
         self._last_skel_pos_loss: Optional[float] = None
         self._last_skel_vel_loss: Optional[float] = None
         self._last_skel_trans_loss: Optional[float] = None
+        self._last_skel_abs_loss: Optional[float] = None
         self._last_vae_anchor_loss: Optional[float] = None
         self._last_vae_anchor_loss_applied: Optional[float] = None
         self._last_vae_anchor_per_level: Optional[dict] = None
@@ -798,7 +799,12 @@ class SDTrainer(BaseSDTrainProcess):
 
         # Load skeleton motion loss model (ViTPose + TAEHV) for video training
         if self.skeleton_motion_config is not None:
-            skel_w = self.skeleton_motion_config.get('loss_weight', 0.0)
+            skel_w = max(
+                self.skeleton_motion_config.get('loss_weight', 0.0),
+                self.skeleton_motion_config.get('velocity_loss_weight', 0.0),
+                self.skeleton_motion_config.get('translation_loss_weight', 0.0),
+                self.skeleton_motion_config.get('absolute_loss_weight', 0.0),
+            )
             if skel_w > 0:
                 from toolkit.skeleton_motion import (
                     ViTPoseExtractor, cache_video_skeleton, load_taehv_wan21,
@@ -2578,12 +2584,13 @@ class SDTrainer(BaseSDTrainProcess):
             from toolkit.skeleton_motion import (
                 decode_wan_x0_to_frames, skeleton_motion_loss,
                 skeleton_velocity_loss, skeleton_translation_loss,
-                save_skeleton_preview,
+                skeleton_absolute_loss, save_skeleton_preview,
             )
             skel_cfg = self.skeleton_motion_config
             skel_loss_w = skel_cfg.get('loss_weight', 0.0)
             skel_vel_w = skel_cfg.get('velocity_loss_weight', 0.0)
             skel_trans_w = skel_cfg.get('translation_loss_weight', 0.0)
+            skel_abs_w = skel_cfg.get('absolute_loss_weight', 0.0)
             skel_preview_every = skel_cfg.get('preview_every', 0)
             skel_preview_min_t = skel_cfg.get('preview_min_t', 0.0)
             skel_min_t = skel_cfg.get('min_t', 0.0)
@@ -2602,50 +2609,73 @@ class SDTrainer(BaseSDTrainProcess):
                 # with gradients fits in ~10GB. No chunking or latents_mean/std needed.
                 x0_frames = decode_wan_x0_to_frames(x0_pred_video, self.skeleton_motion_taehv)
 
-                # Per-frame ViTPose with gradient checkpointing (keeps peak memory bounded)
+                # Batched ViTPose with gradient checkpointing — one kernel
+                # dispatch for all (batch × time) frames. Checkpoint keeps
+                # activations out of live memory while Wan's backward runs.
                 from torch.utils.checkpoint import checkpoint as _ckpt
-                all_frames = x0_frames[0].permute(1, 0, 2, 3)  # (T_out, 3, H, W)
-                all_kp, all_vis_list = [], []
-                for t in range(all_frames.shape[0]):
-                    frame_t = all_frames[t:t+1]
-                    kp_t, vis_t = _ckpt(
-                        self.skeleton_motion_model, frame_t, use_reentrant=False)
-                    all_kp.append(kp_t); all_vis_list.append(vis_t)
-                gen_kp = torch.cat(all_kp, dim=0)
-                gen_vis = torch.cat(all_vis_list, dim=0)
+                B_vid = x0_frames.shape[0]
+                T_out = x0_frames.shape[2]
+                # (B, 3, T, H, W) → (B, T, 3, H, W) → (B*T, 3, H, W)
+                flat_frames = x0_frames.permute(0, 2, 1, 3, 4).flatten(0, 1)
+                gen_kp_flat, gen_vis_flat = _ckpt(
+                    self.skeleton_motion_model, flat_frames,
+                    use_reentrant=False,
+                )
+                # (B*T, 17, 2) → (B, T, 17, 2); (B*T, 17) → (B, T, 17)
+                gen_kp_b = gen_kp_flat.reshape(B_vid, T_out, *gen_kp_flat.shape[1:])
+                gen_vis_b = gen_vis_flat.reshape(B_vid, T_out, *gen_vis_flat.shape[1:])
 
-                # Align temporal length with reference
-                ref_kp = self._skeleton_motion_ref_kp
-                ref_vis = self._skeleton_motion_ref_vis
-                T_min = min(gen_kp.shape[0], ref_kp.shape[0])
-                if gen_kp.shape[0] != ref_kp.shape[0]:
-                    if gen_kp.shape[0] > T_min:
-                        ix = torch.linspace(0, gen_kp.shape[0] - 1, T_min).long()
-                        gen_kp, gen_vis = gen_kp[ix], gen_vis[ix]
-                    if ref_kp.shape[0] > T_min:
-                        ix = torch.linspace(0, ref_kp.shape[0] - 1, T_min).long()
-                        ref_kp, ref_vis = ref_kp[ix], ref_vis[ix]
+                ref_kp_full = self._skeleton_motion_ref_kp
+                ref_vis_full = self._skeleton_motion_ref_vis
 
                 skel_loss = noise_pred.new_tensor(0.0)
-                pos_v = vel_v = trans_v = 0.0
-                if skel_loss_w > 0:
-                    pos_loss = skeleton_motion_loss(gen_kp, gen_vis, ref_kp, ref_vis)
-                    skel_loss = skel_loss + skel_loss_w * pos_loss
-                    pos_v = pos_loss.detach().item()
-                if skel_vel_w > 0:
-                    vel_loss = skeleton_velocity_loss(gen_kp, gen_vis, ref_kp, ref_vis)
-                    skel_loss = skel_loss + skel_vel_w * vel_loss
-                    vel_v = vel_loss.detach().item()
-                if skel_trans_w > 0:
-                    trans_loss = skeleton_translation_loss(gen_kp, gen_vis, ref_kp, ref_vis)
-                    skel_loss = skel_loss + skel_trans_w * trans_loss
-                    trans_v = trans_loss.detach().item()
+                pos_v = vel_v = trans_v = abs_v = 0.0
+                # Preview uses batch index 0 — set at loop end
+                all_frames = None; gen_kp = None; gen_vis = None
+                ref_kp = None; ref_vis = None
+
+                for _b in range(B_vid):
+                    gk = gen_kp_b[_b]
+                    gv = gen_vis_b[_b]
+                    rk = ref_kp_full
+                    rv = ref_vis_full
+                    T_min = min(gk.shape[0], rk.shape[0])
+                    if gk.shape[0] != rk.shape[0]:
+                        if gk.shape[0] > T_min:
+                            ix = torch.linspace(0, gk.shape[0] - 1, T_min).long()
+                            gk, gv = gk[ix], gv[ix]
+                        if rk.shape[0] > T_min:
+                            ix = torch.linspace(0, rk.shape[0] - 1, T_min).long()
+                            rk, rv = rk[ix], rv[ix]
+
+                    if skel_loss_w > 0:
+                        pos_loss = skeleton_motion_loss(gk, gv, rk, rv)
+                        skel_loss = skel_loss + (skel_loss_w / B_vid) * pos_loss
+                        pos_v += pos_loss.detach().item() / B_vid
+                    if skel_vel_w > 0:
+                        vel_loss = skeleton_velocity_loss(gk, gv, rk, rv)
+                        skel_loss = skel_loss + (skel_vel_w / B_vid) * vel_loss
+                        vel_v += vel_loss.detach().item() / B_vid
+                    if skel_trans_w > 0:
+                        trans_loss = skeleton_translation_loss(gk, gv, rk, rv)
+                        skel_loss = skel_loss + (skel_trans_w / B_vid) * trans_loss
+                        trans_v += trans_loss.detach().item() / B_vid
+                    if skel_abs_w > 0:
+                        abs_loss = skeleton_absolute_loss(gk, gv, rk, rv)
+                        skel_loss = skel_loss + (skel_abs_w / B_vid) * abs_loss
+                        abs_v += abs_loss.detach().item() / B_vid
+
+                    if _b == 0:
+                        all_frames = x0_frames[0].permute(1, 0, 2, 3)
+                        gen_kp, gen_vis = gk, gv
+                        ref_kp, ref_vis = rk, rv
 
                 loss = loss + skel_loss
                 self._last_skeleton_motion_loss = skel_loss.detach().item()
                 self._last_skel_pos_loss = pos_v
                 self._last_skel_vel_loss = vel_v
                 self._last_skel_trans_loss = trans_v
+                self._last_skel_abs_loss = abs_v
 
                 # Save preview (skeleton overlays on generated frames, side-by-side with ref)
                 # Gated by step frequency AND min timestep (to focus on high-t samples)
@@ -4393,6 +4423,9 @@ class SDTrainer(BaseSDTrainProcess):
         if self._last_skel_trans_loss is not None:
             loss_dict['skel_trans_loss'] = self._last_skel_trans_loss
             self._last_skel_trans_loss = None
+        if self._last_skel_abs_loss is not None:
+            loss_dict['skel_abs_loss'] = self._last_skel_abs_loss
+            self._last_skel_abs_loss = None
         if self._last_timestep is not None:
             loss_dict['timestep'] = self._last_timestep
             self._last_timestep = None

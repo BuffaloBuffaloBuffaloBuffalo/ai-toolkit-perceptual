@@ -1,8 +1,8 @@
 # AI Toolkit - Perceptual Anchoring Fork
 
-A fork of [AI Toolkit by Ostris](https://github.com/ostris/ai-toolkit) that adds **perceptual anchoring** for identity-aware LoRA training. Frozen perception models (ArcFace, ViTPose) compare the training model's predictions against reference images, anchoring the output to preserve a person's face and body proportions. Face suppression can dampen or eliminate face learning entirely — useful for training style or clothing LoRAs without memorizing the faces in the dataset.
+A fork of [AI Toolkit by Ostris](https://github.com/ostris/ai-toolkit) that adds **perceptual anchoring** for identity-aware LoRA training. Frozen perception models (ArcFace, ViTPose) compare the training model's predictions against reference images, anchoring the output to preserve a person's face and body proportions. Face suppression can dampen or eliminate face learning entirely — useful for training style or clothing LoRAs without memorizing the faces in the dataset. Wan 2.1 video LoRAs additionally get a **skeleton motion loss** that matches specific motions frame-by-frame against a reference video.
 
-**Supported models:** SDXL, FLUX.2 Klein 9B
+**Supported models:** SDXL, FLUX.2 Klein 9B, Wan 2.1 (1.3B, 14B)
 
 ## Perceptual Anchoring
 
@@ -58,6 +58,49 @@ datasets:
     face_suppression_weight: 1.0       # full suppression — don't learn faces
 ```
 
+## Wan 2.1 Video Training — Skeleton Motion Loss
+
+For Wan 2.1 video LoRAs, a **skeleton motion loss** matches per-frame body pose between the predicted video and a cached reference video. This captures *specific motions* (cartwheels, dances, gestures) rather than just static body proportions.
+
+The loss decodes the x0 prediction to pixels via a tiny 11M-param TAEHV decoder (cheap enough to decode all 117 frames with gradients in ~10GB peak VRAM), runs ViTPose over the flattened `(B·T, 3, H, W)` frame batch under gradient checkpointing, extracts 17 COCO keypoints per frame via temperature-scaled soft-argmax, and compares against the cached reference with a combination of up to four loss heads.
+
+### Four loss heads
+
+| Config key | Meaning |
+|---|---|
+| `loss_weight` | Body-centered, height-normalized L1 — pose shape only, scale/position invariant |
+| `velocity_loss_weight` | L1 on consecutive-frame deltas of normalized coords — motion dynamics |
+| `translation_loss_weight` | L1 on image-space body-center trajectory — camera-space translation |
+| `absolute_loss_weight` | Raw image-space L1 on all keypoints — pose + translation unified |
+
+All four are visibility-weighted (low-confidence keypoints are down-weighted) and gated by the four core torso keypoints (shoulders + hips). Timestep window (`min_t`/`max_t`) lets you restrict the loss to a specific noise regime.
+
+### Config
+
+```yaml
+skeleton_motion:
+  loss_weight: 0.5              # pose (body-normalized)
+  velocity_loss_weight: 0.5     # velocity
+  translation_loss_weight: 1.0  # image-space translation
+  absolute_loss_weight: 0.0     # unified raw-pixel keypoints
+  min_t: 0.0
+  max_t: 1.0
+  preview_every: 100            # save skeleton preview every N steps
+  preview_min_t: 0.0            # only preview samples above this timestep
+```
+
+Reference keypoints are extracted once at job start (first video in the dataset) via `cache_video_skeleton` and held on GPU — zero per-step cost for the reference.
+
+Preview webps (side-by-side reference vs predicted skeleton overlay at 16 fps) land in `{save_root}/skeleton_previews/`.
+
+### Example configs
+
+- `config/examples/train_skeleton_motion_wan21_1b.yaml` — full training with skeleton motion + diffusion loss
+- `config/examples/train_skeleton_motion_only_wan21_1b.yaml` — VADER-style skeleton-only backprop through TAEHV + ViTPose (no diffusion loss)
+- `config/examples/train_diff_only_wan21_1b.yaml` — baseline without skeleton loss, for A/B comparison
+
+TAEHV is trained on the Wan 2.1 VAE latent space, so the loss also works with Wan 2.1 14B (just heavier on VRAM). Wan 2.2 5B has a different VAE (16× compression, 48 latent channels) and is not supported by this path — see `idea_plans/wan22_identity_skeleton_losses.md` for the extension design.
+
 ## Training Metrics
 
 All active losses log both raw and weighted (`_applied`) values. Metrics are visible in the UI loss chart and written to the SQLite database.
@@ -71,6 +114,7 @@ All active losses log both raw and weighted (`_applied`) values. Metrics are vis
 | `body_proportion_loss` | ViTPose bone-length ratio error |
 | `bp_sim_tXX` | Body proportion similarity by timestep |
 | `latent_perceptual_loss` | E-LatentLPIPS distance in latent space |
+| `skeleton_motion_loss` | Wan 2.1 video: summed skeleton loss (pos + velocity + translation + absolute, each weighted) |
 
 Set `face_id.identity_metrics: true` to log identity similarity metrics without applying the loss.
 
@@ -82,6 +126,7 @@ Preview images are saved to subdirectories of the training output folder, giving
 |---|---|---|
 | `id_previews/` | Side-by-side: noisy input, x0 prediction, ArcFace crop, face bounding box. Annotated with cosine similarity and timestep. | Every step with a face detection |
 | `body_previews/` | Reference and predicted skeleton overlays (17-keypoint ViTPose). Shows keypoint confidence. | Every step with a body detection |
+| `skeleton_previews/` | Wan 2.1 video: side-by-side reference vs predicted skeleton overlay, webp at 16 fps. | Every `preview_every` steps above `preview_min_t` |
 
 ---
 

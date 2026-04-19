@@ -551,6 +551,131 @@ const docs: { [key: string]: ConfigDoc } = {
       </>
     ),
   },
+  'subject_mask.enabled': {
+    title: 'Subject Masking',
+    description: (
+      <>
+        Caches per-image person/body/clothing masks (YOLO person detection → SAM 2 silhouette →
+        SegFormer-clothes semantic parse). Masks are stored once per image in <code>_face_id_cache/</code>
+        alongside face embeddings, then used at training time to weight the diffusion loss by region.
+        <br /><br />
+        Enabling this alone has no effect on training — you must also set one of the region loss weights
+        (Background / Clothing / Body) or enable <i>Restrict Perceptual Losses to Body</i>.
+      </>
+    ),
+  },
+  'subject_mask.sam_size': {
+    title: 'SAM 2 Size',
+    description: (
+      <>
+        Model size for the SAM 2 silhouette stage. On an RTX 4090 at fp16, timings per image are roughly:
+        tiny ~15 ms, small ~15 ms, base_plus ~27 ms, large ~55 ms. Quality is nearly identical for
+        portraits — <b>small</b> is the recommended default.
+        <br /><br />
+        This only runs at cache time (once per image), so training-time cost is zero regardless of size.
+      </>
+    ),
+  },
+  'subject_mask.yolo_conf': {
+    title: 'YOLO Confidence Threshold',
+    description: (
+      <>
+        Minimum confidence for a detected person to be kept. 0.25 is a sensible default for COCO-trained
+        YOLO; raise it if you see spurious detections, lower it if detections are missed.
+      </>
+    ),
+  },
+  'subject_mask.primary_only': {
+    title: 'Primary Person Only',
+    description: (
+      <>
+        When enabled, only the largest detected person is masked — background strangers are dropped.
+        Recommended for identity LoRA training where you don't want loss signal from other people in
+        the frame. Disable if you're training a multi-person concept.
+      </>
+    ),
+  },
+  'subject_mask.segformer_res': {
+    title: 'SegFormer Resolution',
+    description: (
+      <>
+        Input resolution for the SegFormer-clothes parser. 768 is the recommended default. Higher values
+        (1024, 1280) produce cleaner class boundaries but are slower at cache time. Output is always
+        upsampled to the original image resolution before mask smoothing.
+      </>
+    ),
+  },
+  'subject_mask.cache_resolution': {
+    title: 'Cache Resolution',
+    description: (
+      <>
+        Size (in pixels) at which masks are stored on disk. 256 is sufficient for latent-space loss
+        weighting and keeps cache files tiny (~200 KB per image). Raise to 512 if you need finer
+        boundaries for perceptual losses, at roughly 4× storage cost.
+      </>
+    ),
+  },
+  'subject_mask.background_loss_weight': {
+    title: 'Background Loss Weight',
+    description: (
+      <>
+        Multiplier applied to the diffusion loss in the <i>background</i> region (pixels outside the person
+        silhouette). Leave empty for no change (default training). Set to <b>0</b> to completely ignore
+        the background, or a small value like 0.1 to de-emphasize it while still training on it.
+        <br /><br />
+        Per-dataset overrides take priority over this global value.
+      </>
+    ),
+  },
+  'subject_mask.clothing_loss_weight': {
+    title: 'Clothing Loss Weight',
+    description: (
+      <>
+        Multiplier applied to the diffusion loss on <i>clothing</i> pixels (dresses, pants, shirts, shoes,
+        bags, etc). Set below 1 to reduce the model's tendency to memorize specific garments while still
+        training faces and body.
+        <br /><br />
+        Per-dataset overrides take priority over this global value.
+      </>
+    ),
+  },
+  'subject_mask.body_loss_weight': {
+    title: 'Body Loss Weight',
+    description: (
+      <>
+        Multiplier applied to the diffusion loss on <i>body</i> pixels (hair, face, arms, legs — the
+        identity-relevant parts). Set above 1 to boost the loss signal for identity, or combine with
+        background/clothing weights to concentrate training on the subject's body.
+        <br /><br />
+        Per-dataset overrides take priority over this global value.
+      </>
+    ),
+  },
+  'subject_mask.perceptual_restrict_to_body': {
+    title: 'Restrict Perceptual Losses to Body',
+    description: (
+      <>
+        When enabled, per-pixel perceptual losses (currently the Sapiens normal loss) are masked to the
+        body region so they focus on identity-relevant surfaces (hair, skin) instead of clothing or
+        background. Items that haven't opted in keep their original perceptual loss unchanged.
+      </>
+    ),
+  },
+  'subject_mask.save_debug_previews': {
+    title: 'Save Debug Preview Tiles',
+    description: (
+      <>
+        When enabled, writes a 5-panel PNG per image to the job's output folder at
+        <code> &lt;training_folder&gt;/&lt;name&gt;/subject_mask_previews/&lt;stem&gt;.png</code> during mask caching:
+        original image, person overlay, body overlay, clothing overlay, and full SegFormer parse colormap.
+        Useful for spot-checking mask quality on new datasets before training.
+        <br /><br />
+        Previews live in the job output folder, not alongside the dataset, so they can't be picked up as
+        training images. Only runs during the first-time cache pass (cache-hit path is unaffected). Disable
+        after initial validation to avoid disk clutter — tiles are ~500 KB each.
+      </>
+    ),
+  },
 };
 
 export const getDoc = (key: string | null | undefined): ConfigDoc | null => {

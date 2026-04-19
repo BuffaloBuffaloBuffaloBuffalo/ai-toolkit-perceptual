@@ -580,18 +580,26 @@ class SDTrainer(BaseSDTrainProcess):
                     cache_normal_embeddings(dataset.file_list, self.face_id_config)
 
         # Auto-masking (YOLO + SAM 2 + SegFormer-clothes): cache person/body/clothing
-        # masks for future region-aware losses. Phase 1 is caching only — masks are
-        # attached to file_items but no loss reads them yet.
+        # masks for region-aware loss weighting. Debug preview tiles (when enabled)
+        # are written to save_root/subject_mask_previews/ — NOT inside the dataset
+        # folder — so they can't accidentally be picked up as training images.
         if self.subject_mask_config is not None and self.subject_mask_config.enabled:
             print_acc("Auto-masking: Extracting and caching subject masks...")
+            _sm_preview_dir = os.path.join(self.save_root, 'subject_mask_previews')
             if self.data_loader is not None:
                 datasets = get_dataloader_datasets(self.data_loader)
                 for dataset in datasets:
-                    cache_subject_masks(dataset.file_list, self.subject_mask_config)
+                    cache_subject_masks(
+                        dataset.file_list, self.subject_mask_config,
+                        preview_dir=_sm_preview_dir,
+                    )
             if self.data_loader_reg is not None:
                 datasets = get_dataloader_datasets(self.data_loader_reg)
                 for dataset in datasets:
-                    cache_subject_masks(dataset.file_list, self.subject_mask_config)
+                    cache_subject_masks(
+                        dataset.file_list, self.subject_mask_config,
+                        preview_dir=_sm_preview_dir,
+                    )
 
         # VAE anchor features: cache multi-scale VAE encoder features for perceptual anchor loss
         if _vae_anchor_enabled:

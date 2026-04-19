@@ -944,6 +944,9 @@ class SubjectMaskConfig:
         self.clothing_loss_weight: Optional[float] = kwargs.get('clothing_loss_weight', None)
         self.body_loss_weight: Optional[float] = kwargs.get('body_loss_weight', None)
         self.perceptual_restrict_to_body: bool = kwargs.get('perceptual_restrict_to_body', False)
+        # Debug previews — when True, cache_subject_masks writes a 5-panel tile.png
+        # per image to {img_dir}/_face_id_cache/_previews/{stem}.png for visual QA.
+        self.save_debug_previews: bool = kwargs.get('save_debug_previews', False)
 
 
 class DatasetConfig:

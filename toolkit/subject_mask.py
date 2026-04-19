@@ -173,6 +173,10 @@ class SubjectMaskExtractor:
     def extract(self, pil_image) -> Dict[str, np.ndarray]:
         """Extract {person, body, clothing} bool masks at original resolution.
 
+        Also returns the raw SegFormer ``class_map`` (int32 class ids) and the
+        list of YOLO ``boxes`` so callers (e.g. debug preview rendering) can
+        visualize detector inputs alongside masks.
+
         SAM is run (for debug / reference) but NOT intersected into the final
         masks — SegFormer is primary source of truth.
         """
@@ -190,14 +194,12 @@ class SubjectMaskExtractor:
         # person = body ∪ clothing (pure SegFormer), then closed + hole-filled.
         person_mask = _smooth_mask(body_mask | clothing_mask, close_radius=3)
 
-        # If YOLO found nothing, we keep the SegFormer-derived masks as-is — an
-        # empty mask is a warning, not an error (mirrors cache_face_embeddings).
-        _ = boxes  # intentional: kept available if we want to intersect later
-
         return {
             "person": person_mask.astype(np.bool_),
             "body": body_mask.astype(np.bool_),
             "clothing": clothing_mask.astype(np.bool_),
+            "class_map": class_map.astype(np.int32),
+            "boxes": boxes,
         }
 
     def cleanup(self):
@@ -221,6 +223,82 @@ class SubjectMaskExtractor:
 
 
 # ============================================================
+# Debug preview rendering
+# ============================================================
+
+
+def _overlay_mask(image_rgb: np.ndarray, mask: np.ndarray, color, alpha: float = 0.55) -> np.ndarray:
+    """Blend a binary mask onto an RGB image with a solid color + yellow outline."""
+    out = image_rgb.astype(np.float32).copy()
+    m = mask[..., None].astype(np.float32)
+    color_layer = np.array(color, dtype=np.float32)
+    out = out * (1 - alpha * m) + color_layer * alpha * m
+    try:
+        from scipy.ndimage import binary_dilation
+        border = binary_dilation(mask.astype(bool), iterations=2) & (~mask.astype(bool))
+        out[border] = np.array([255, 255, 0])
+    except Exception:
+        pass
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def _colormap_from_classes(class_map: np.ndarray, n_classes: int) -> np.ndarray:
+    """Render a class map to an RGB color image using a deterministic palette."""
+    rng = np.random.RandomState(7)
+    pal = np.zeros((n_classes, 3), dtype=np.uint8)
+    for i in range(1, n_classes):
+        pal[i] = rng.randint(40, 230, 3)
+    return pal[class_map.astype(np.int32)]
+
+
+def _render_preview_tile(pil_image, masks: Dict[str, np.ndarray], n_classes: int,
+                         col_width: int = 380):
+    """5-panel tile: image | person | body | clothing | parse colormap.
+
+    Returns a PIL Image ready to save.
+    """
+    from PIL import Image, ImageDraw, ImageFont
+    img_np = np.array(pil_image)
+
+    person = masks["person"].astype(np.uint8)
+    body = masks["body"].astype(np.uint8)
+    clothing = masks["clothing"].astype(np.uint8)
+    class_map = masks["class_map"]
+
+    ov_person = _overlay_mask(img_np, person, (100, 180, 255))
+    ov_body = _overlay_mask(img_np, body, (255, 120, 80))
+    ov_clothing = _overlay_mask(img_np, clothing, (120, 255, 120))
+    color_map = _colormap_from_classes(class_map, n_classes)
+    parse_blend = (img_np.astype(np.float32) * 0.5 + color_map.astype(np.float32) * 0.5)
+    parse_blend = np.clip(parse_blend, 0, 255).astype(np.uint8)
+
+    panels = [img_np, ov_person, ov_body, ov_clothing, parse_blend]
+    labels = ["Original", "Person", "Body (hair+face+limbs)", "Clothing", "Parse colormap"]
+
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 14)
+    except Exception:
+        font = ImageFont.load_default()
+
+    resized = []
+    for a in panels:
+        r = col_width / a.shape[1]
+        new_h = int(a.shape[0] * r)
+        resized.append(np.array(Image.fromarray(a).resize((col_width, new_h), Image.BILINEAR)))
+    h_max = max(a.shape[0] for a in resized)
+    label_h = 26
+    canvas = Image.new("RGB", (col_width * len(panels) + 8 * (len(panels) - 1),
+                               h_max + label_h), (20, 20, 20))
+    draw = ImageDraw.Draw(canvas)
+    x = 0
+    for a, lbl in zip(resized, labels):
+        canvas.paste(Image.fromarray(a), (x, label_h))
+        draw.text((x + 6, 6), lbl, fill=(230, 230, 230), font=font)
+        x += col_width + 8
+    return canvas
+
+
+# ============================================================
 # Cache helper
 # ============================================================
 
@@ -240,6 +318,7 @@ def _downsample_bool(mask: np.ndarray, target_hw: int) -> torch.Tensor:
 def cache_subject_masks(
     file_items: List['FileItemDTO'],
     config: 'SubjectMaskConfig',
+    preview_dir: Optional[str] = None,
 ) -> None:
     """Extract and cache subject masks for all file items.
 
@@ -257,6 +336,14 @@ def cache_subject_masks(
     where (H_c, W_c) == (cache_resolution, cache_resolution).
 
     Skips extraction if cache exists and has the matching version key.
+
+    Args:
+        preview_dir: If provided AND ``config.save_debug_previews`` is True, a
+            5-panel ``{stem}.png`` tile is written here for each extracted image.
+            Callers (SDTrainer) should pass the job output folder
+            (``save_root/subject_mask_previews``) so previews don't end up
+            inside the image dataset itself. If None, previews are skipped even
+            when the flag is on.
     """
     from PIL import Image
     from PIL.ImageOps import exif_transpose
@@ -316,6 +403,23 @@ def cache_subject_masks(
             CACHE_VERSION_KEY: torch.ones(1),
         }
         save_file(save_data, cache_path)
+
+        # Optional: write a 5-panel preview tile for visual inspection.
+        # Only if both the flag is on AND a target directory was provided —
+        # we never write inside the image dataset, so the caller must decide
+        # where previews live.
+        if getattr(config, 'save_debug_previews', False) and preview_dir:
+            os.makedirs(preview_dir, exist_ok=True)
+            preview_path = os.path.join(preview_dir, f'{stem}.png')
+            try:
+                tile = _render_preview_tile(
+                    pil_image, masks,
+                    n_classes=extractor.seg_cfg.num_labels,
+                )
+                tile.save(preview_path)
+            except Exception as e:
+                # Preview failures are non-fatal — the cache is the real artifact.
+                print(f"  -  Warning: failed to render preview for {stem}: {e}")
 
     # Free VRAM held by models (only loaded if we had cache misses)
     if extractor is not None:

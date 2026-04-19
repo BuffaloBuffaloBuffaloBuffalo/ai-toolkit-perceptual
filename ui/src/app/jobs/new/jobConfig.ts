@@ -1,4 +1,4 @@
-import { JobConfig, DatasetConfig, SliderConfig, FaceIDConfig, BodyIDConfig } from '@/types';
+import { JobConfig, DatasetConfig, SliderConfig, FaceIDConfig, BodyIDConfig, SubjectMaskConfig } from '@/types';
 
 export const defaultDatasetConfig: DatasetConfig = {
   folder_path: '/path/to/images/folder',
@@ -65,6 +65,19 @@ export const defaultBodyIDConfig: BodyIDConfig = {
   init_scale: 0.01,
 };
 
+export const defaultSubjectMaskConfig: SubjectMaskConfig = {
+  enabled: false,
+  yolo_ckpt: 'yolo11n.pt',
+  yolo_conf: 0.25,
+  primary_only: true,
+  sam_size: 'small',
+  segformer_res: 768,
+  cache_resolution: 256,
+  dtype: 'fp16',
+  perceptual_restrict_to_body: false,
+  save_debug_previews: false,
+};
+
 export const defaultSliderConfig: SliderConfig = {
   guidance_strength: 3.0,
   anchor_strength: 1.0,
@@ -100,6 +113,7 @@ export const defaultJobConfig: JobConfig = {
         },
         face_id: { ...defaultFaceIDConfig },
         body_id: { ...defaultBodyIDConfig },
+        subject_mask: { ...defaultSubjectMaskConfig },
         save: {
           dtype: 'bf16',
           save_every: 250,

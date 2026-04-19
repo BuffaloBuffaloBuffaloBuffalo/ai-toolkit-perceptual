@@ -42,3 +42,4 @@ insightface
 onnxruntime-gpu
 onnx2torch
 dsntnn
+ultralytics

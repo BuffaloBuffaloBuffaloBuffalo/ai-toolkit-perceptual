@@ -39,12 +39,13 @@ from toolkit.models.diffusion_feature_extraction import DiffusionFeatureExtracto
 from toolkit.util.losses import wavelet_loss, stepped_loss
 import torch.nn.functional as F
 from toolkit.unloader import unload_text_encoder
-from toolkit.config_modules import FaceIDConfig, BodyIDConfig
+from toolkit.config_modules import FaceIDConfig, BodyIDConfig, SubjectMaskConfig
 from toolkit.face_id import FaceIDProjector, VisionFaceProjector, DifferentiableFaceEncoder, DifferentiableLandmarkEncoder, cache_face_embeddings
 from toolkit.body_id import BodyIDProjector, DifferentiableBodyProportionEncoder, cache_body_embeddings, cache_body_proportion_embeddings
 from toolkit.body_shape import DifferentiableBodyShapeEncoder, cache_body_shape_embeddings
 from toolkit.normal_id import DifferentiableNormalEncoder, cache_normal_embeddings
 from toolkit.vae_anchor import VAEAnchorEncoder, cache_vae_anchor_features
+from toolkit.subject_mask import cache_subject_masks
 from PIL import Image
 from torchvision.transforms import functional as TF
 
@@ -118,6 +119,13 @@ class SDTrainer(BaseSDTrainProcess):
             self.face_id_config = FaceIDConfig(**face_id_raw)
         else:
             self.face_id_config = None
+
+        # Auto-masking (Phase 1: caching only — not yet consumed by loss)
+        subject_mask_raw = self.get_conf('subject_mask', None)
+        if subject_mask_raw is not None:
+            self.subject_mask_config = SubjectMaskConfig(**subject_mask_raw)
+        else:
+            self.subject_mask_config = None
         self.face_id_projector: Optional[FaceIDProjector] = None
         self.vision_face_projector: Optional[VisionFaceProjector] = None
         self.id_loss_model: Optional[DifferentiableFaceEncoder] = None
@@ -570,6 +578,20 @@ class SDTrainer(BaseSDTrainProcess):
                 datasets = get_dataloader_datasets(self.data_loader_reg)
                 for dataset in datasets:
                     cache_normal_embeddings(dataset.file_list, self.face_id_config)
+
+        # Auto-masking (YOLO + SAM 2 + SegFormer-clothes): cache person/body/clothing
+        # masks for future region-aware losses. Phase 1 is caching only — masks are
+        # attached to file_items but no loss reads them yet.
+        if self.subject_mask_config is not None and self.subject_mask_config.enabled:
+            print_acc("Auto-masking: Extracting and caching subject masks...")
+            if self.data_loader is not None:
+                datasets = get_dataloader_datasets(self.data_loader)
+                for dataset in datasets:
+                    cache_subject_masks(dataset.file_list, self.subject_mask_config)
+            if self.data_loader_reg is not None:
+                datasets = get_dataloader_datasets(self.data_loader_reg)
+                for dataset in datasets:
+                    cache_subject_masks(dataset.file_list, self.subject_mask_config)
 
         # VAE anchor features: cache multi-scale VAE encoder features for perceptual anchor loss
         if _vae_anchor_enabled:

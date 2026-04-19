@@ -920,6 +920,32 @@ class BodyIDConfig:
         self.init_scale: float = kwargs.get('init_scale', 0.01)
 
 
+class SubjectMaskConfig:
+    """Configuration for auto-masking via YOLO + SAM 2 + SegFormer-clothes.
+
+    Phase 1 is caching only — these masks are extracted and stored per-image
+    but are not yet consumed by any training loss. Loss-weighting knobs below
+    are present so YAML configs forward-compat to Phase 2, but they are
+    currently ignored by the trainer.
+    """
+
+    def __init__(self, **kwargs):
+        self.enabled: bool = kwargs.get('enabled', False)
+        self.yolo_ckpt: str = kwargs.get('yolo_ckpt', 'yolo11n.pt')
+        self.yolo_conf: float = kwargs.get('yolo_conf', 0.25)
+        self.primary_only: bool = kwargs.get('primary_only', True)
+        # stored for future use; not consumed by cache yet (SegFormer is primary source of truth)
+        self.sam_size: str = kwargs.get('sam_size', 'small')
+        self.segformer_res: int = kwargs.get('segformer_res', 768)
+        self.cache_resolution: int = kwargs.get('cache_resolution', 256)
+        self.dtype: str = kwargs.get('dtype', 'fp16')
+        # Phase 2 knobs — present but unused by training yet
+        self.background_loss_weight: Optional[float] = kwargs.get('background_loss_weight', None)
+        self.clothing_loss_weight: Optional[float] = kwargs.get('clothing_loss_weight', None)
+        self.body_loss_weight: Optional[float] = kwargs.get('body_loss_weight', None)
+        self.perceptual_restrict_to_body: bool = kwargs.get('perceptual_restrict_to_body', False)
+
+
 class DatasetConfig:
     """
     Dataset config for sd-datasets

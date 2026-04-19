@@ -168,6 +168,16 @@ class FileItemDTO(
         self.latent_perceptual_loss_weight: Union[float, None] = self.dataset_config.latent_perceptual_loss_weight
         self.latent_perceptual_loss_min_t: Union[float, None] = self.dataset_config.latent_perceptual_loss_min_t
         self.latent_perceptual_loss_max_t: Union[float, None] = self.dataset_config.latent_perceptual_loss_max_t
+        # Subject mask (Phase 2) per-dataset overrides; None = inherit global SubjectMaskConfig
+        self.background_loss_weight: Union[float, None] = self.dataset_config.background_loss_weight
+        self.clothing_loss_weight: Union[float, None] = self.dataset_config.clothing_loss_weight
+        self.body_loss_weight: Union[float, None] = self.dataset_config.body_loss_weight
+        self.perceptual_restrict_to_body: Union[bool, None] = self.dataset_config.perceptual_restrict_to_body
+        # Populated by cache_subject_masks (Phase 1) when subject_mask.enabled.
+        # bool tensors of shape (cache_resolution, cache_resolution), on CPU.
+        self.subject_mask: Union[torch.Tensor, None] = None
+        self.body_mask: Union[torch.Tensor, None] = None
+        self.clothing_mask: Union[torch.Tensor, None] = None
 
         self.network_weight: float = self.dataset_config.network_weight
         self.is_reg = self.dataset_config.is_reg
@@ -232,6 +242,11 @@ class DataLoaderBatchDTO:
             self.vae_anchor_features: Union[Dict, None] = None  # per-level VAE encoder features
             self.face_bboxes: Union[List, None] = None  # per-item face bboxes in original image coords
             self.person_bboxes: Union[List, None] = None  # per-item person bboxes in original image coords
+            # Subject mask (Phase 2) stacked tensors, shape (B, 1, H_c, W_c), dtype bool, CPU.
+            # None when no file_item has cached masks.
+            self.subject_masks: Union[torch.Tensor, None] = None
+            self.body_masks: Union[torch.Tensor, None] = None
+            self.clothing_masks: Union[torch.Tensor, None] = None
 
             # just for holding noise and preds during training
             self.audio_target: Union[torch.Tensor, None] = None
@@ -405,6 +420,19 @@ class DataLoaderBatchDTO:
             ]
             self.vae_anchor_loss_max_t_list: List[Union[float, None]] = [
                 x.vae_anchor_loss_max_t for x in self.file_items
+            ]
+            # Subject mask (Phase 2) per-item weight overrides; None = inherit global
+            self.background_loss_weight_list: List[Union[float, None]] = [
+                getattr(x, 'background_loss_weight', None) for x in self.file_items
+            ]
+            self.clothing_loss_weight_list: List[Union[float, None]] = [
+                getattr(x, 'clothing_loss_weight', None) for x in self.file_items
+            ]
+            self.body_loss_weight_list: List[Union[float, None]] = [
+                getattr(x, 'body_loss_weight', None) for x in self.file_items
+            ]
+            self.perceptual_restrict_to_body_list: List[Union[bool, None]] = [
+                getattr(x, 'perceptual_restrict_to_body', None) for x in self.file_items
             ]
 
             if any([x.clip_image_tensor is not None for x in self.file_items]):
@@ -643,6 +671,31 @@ class DataLoaderBatchDTO:
             if any([getattr(x, 'person_bbox', None) is not None for x in self.file_items]):
                 self.person_bboxes = [getattr(x, 'person_bbox', None) for x in self.file_items]
 
+            # Stack cached subject masks, if any (Phase 2).
+            # Each file_item.subject_mask / body_mask / clothing_mask is a torch.bool
+            # tensor of shape (H_c, W_c) set by cache_subject_masks. Missing items
+            # are padded with zeros so the per-sample weight composition stays a no-op.
+            def _stack_mask(attr):
+                tensors = [getattr(x, attr, None) for x in self.file_items]
+                if not any(t is not None for t in tensors):
+                    return None
+                # Find a reference shape / dtype
+                ref = next(t for t in tensors if t is not None)
+                H, W = ref.shape[-2], ref.shape[-1]
+                filled = []
+                for t in tensors:
+                    if t is None:
+                        filled.append(torch.zeros((1, H, W), dtype=torch.bool))
+                    else:
+                        if t.dim() == 2:
+                            t = t.unsqueeze(0)  # (1, H, W)
+                        filled.append(t.to(torch.bool))
+                return torch.stack(filled, dim=0)  # (B, 1, H, W)
+
+            self.subject_masks = _stack_mask('subject_mask')
+            self.body_masks = _stack_mask('body_mask')
+            self.clothing_masks = _stack_mask('clothing_mask')
+
             # collect body embeddings (SMPL betas)
             if any([getattr(x, 'body_embedding', None) is not None for x in self.file_items]):
                 body_embeds = []
@@ -710,6 +763,9 @@ class DataLoaderBatchDTO:
         del self.vae_anchor_features
         del self.face_bboxes
         del self.person_bboxes
+        del self.subject_masks
+        del self.body_masks
+        del self.clothing_masks
         for file_item in self.file_items:
             file_item.cleanup()
 

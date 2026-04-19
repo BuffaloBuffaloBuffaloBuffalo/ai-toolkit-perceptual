@@ -1084,6 +1084,170 @@ class SDTrainer(BaseSDTrainProcess):
 
         return output, batch.tensor.to(self.device_torch, dtype=get_torch_dtype(self.train_config.dtype))
 
+    def _build_subject_mask_weight(
+        self,
+        batch: 'DataLoaderBatchDTO',
+        noisy_latents_shape,
+        dtype=torch.float32,
+    ):
+        """Build the per-region loss weight map from cached subject masks.
+
+        Returns a float tensor of shape (B, C_latent, lat_h, lat_w) that can be
+        multiplied into ``mask_multiplier`` (composes multiplicatively with face
+        suppression; does not replace it), or ``None`` when no weighting applies.
+
+        Composition rules (order matters; each default is no-op):
+          weight_map = ones
+          if bg_w is set:        weight_map *= where(person, 1, bg_w)
+          if clothing_w is set:  weight_map *= where(clothing, clothing_w, 1)
+          if body_w is set:      weight_map *= where(body, body_w, 1)
+
+        Each of bg_w / clothing_w / body_w is resolved per-item:
+          non-None per-dataset override > non-None global > None (no-op).
+        """
+        smc = getattr(self, 'subject_mask_config', None)
+        if smc is None or not smc.enabled:
+            return None
+        have_masks = (
+            getattr(batch, 'subject_masks', None) is not None
+            or getattr(batch, 'body_masks', None) is not None
+            or getattr(batch, 'clothing_masks', None) is not None
+        )
+        if not have_masks:
+            return None
+
+        g_bg = smc.background_loss_weight
+        g_cl = smc.clothing_loss_weight
+        g_bd = smc.body_loss_weight
+
+        bg_list = getattr(batch, 'background_loss_weight_list', None) or []
+        cl_list = getattr(batch, 'clothing_loss_weight_list', None) or []
+        bd_list = getattr(batch, 'body_loss_weight_list', None) or []
+        bs = len(batch.file_items)
+
+        def _pad(lst):
+            out = list(lst)
+            if len(out) < bs:
+                out = out + [None] * (bs - len(out))
+            return out
+
+        bg_ws = [(w if w is not None else g_bg) for w in _pad(bg_list)]
+        cl_ws = [(w if w is not None else g_cl) for w in _pad(cl_list)]
+        bd_ws = [(w if w is not None else g_bd) for w in _pad(bd_list)]
+
+        any_bg = any(w is not None for w in bg_ws)
+        any_cl = any(w is not None for w in cl_ws)
+        any_bd = any(w is not None for w in bd_ws)
+        if not (any_bg or any_cl or any_bd):
+            return None
+
+        if len(noisy_latents_shape) == 5:
+            # Video B,C,T,H,W
+            lat_h, lat_w = noisy_latents_shape[3], noisy_latents_shape[4]
+        else:
+            lat_h, lat_w = noisy_latents_shape[2], noisy_latents_shape[3]
+        device = getattr(self, 'device_torch', torch.device('cpu'))
+
+        def _resize_mask(stacked):
+            # stacked: (B, 1, H_c, W_c) bool → float on device (B, 1, lat_h, lat_w)
+            if stacked is None:
+                return None
+            m = stacked.to(device=device, dtype=torch.float32)
+            m = torch.nn.functional.interpolate(
+                m, size=(lat_h, lat_w), mode='nearest'
+            )
+            return m
+
+        person_lat = _resize_mask(getattr(batch, 'subject_masks', None))
+        body_lat = _resize_mask(getattr(batch, 'body_masks', None))
+        clothing_lat = _resize_mask(getattr(batch, 'clothing_masks', None))
+
+        def _per_item(weights):
+            ws = [float(w) if w is not None else 1.0 for w in weights]
+            return torch.tensor(ws, device=device, dtype=dtype).view(bs, 1, 1, 1)
+
+        def _active(weights):
+            return torch.tensor(
+                [1.0 if w is not None else 0.0 for w in weights],
+                device=device, dtype=dtype,
+            ).view(bs, 1, 1, 1)
+
+        bg_scalar = _per_item(bg_ws)
+        cl_scalar = _per_item(cl_ws)
+        bd_scalar = _per_item(bd_ws)
+        bg_active = _active(bg_ws)
+        cl_active = _active(cl_ws)
+        bd_active = _active(bd_ws)
+
+        subject_weight = torch.ones(
+            (bs, 1, lat_h, lat_w), device=device, dtype=dtype,
+        )
+
+        if any_bg and person_lat is not None:
+            person = person_lat.to(dtype=dtype)
+            term_on = torch.ones_like(person)
+            term_off = bg_scalar.expand_as(person)
+            layer = person * term_on + (1.0 - person) * term_off
+            layer = bg_active * layer + (1.0 - bg_active) * torch.ones_like(layer)
+            subject_weight = subject_weight * layer
+
+        if any_cl and clothing_lat is not None:
+            clothing = clothing_lat.to(dtype=dtype)
+            term_on = cl_scalar.expand_as(clothing)
+            term_off = torch.ones_like(clothing)
+            layer = clothing * term_on + (1.0 - clothing) * term_off
+            layer = cl_active * layer + (1.0 - cl_active) * torch.ones_like(layer)
+            subject_weight = subject_weight * layer
+
+        if any_bd and body_lat is not None:
+            body = body_lat.to(dtype=dtype)
+            term_on = bd_scalar.expand_as(body)
+            term_off = torch.ones_like(body)
+            layer = body * term_on + (1.0 - body) * term_off
+            layer = bd_active * layer + (1.0 - bd_active) * torch.ones_like(layer)
+            subject_weight = subject_weight * layer
+
+        # Broadcast over latent channels for downstream multiplication
+        subject_weight = subject_weight.expand(
+            -1, noisy_latents_shape[1], -1, -1,
+        )
+        return subject_weight
+
+    def _build_body_restrict_mask(self, batch: 'DataLoaderBatchDTO', spatial_shape):
+        """Return a float (B, H, W) body-region mask resized to ``spatial_shape`` or None.
+
+        None = perceptual_restrict_to_body disabled (global and all per-item) or
+        body masks not cached. When returned, the mask has 1.0 inside the body
+        region and 0.0 outside. Items that have not opted in are set to 1.0
+        everywhere so their perceptual loss is unchanged.
+
+        Used by per-pixel perceptual losses (currently normal_loss) so they can
+        focus on identity-relevant regions (hair/face/limbs) when enabled.
+        """
+        smc = getattr(self, 'subject_mask_config', None)
+        if smc is None or not smc.enabled:
+            return None
+        if getattr(batch, 'body_masks', None) is None:
+            return None
+        g_restrict = bool(getattr(smc, 'perceptual_restrict_to_body', False))
+        per_item = [
+            (v if v is not None else g_restrict)
+            for v in getattr(batch, 'perceptual_restrict_to_body_list', [])
+        ]
+        if not any(per_item):
+            return None
+        _, H, W = spatial_shape
+        B = len(per_item)
+        body = batch.body_masks.to(torch.float32)  # (B, 1, H_c, W_c)
+        body = torch.nn.functional.interpolate(body, size=(H, W), mode='nearest')
+        body = body.squeeze(1)  # (B, H, W)
+        restrict_vec = torch.tensor(
+            [1.0 if v else 0.0 for v in per_item], dtype=torch.float32
+        ).view(B, 1, 1)
+        # items that opted in: body mask; items that didn't: all-ones
+        out = restrict_vec * body + (1.0 - restrict_vec) * torch.ones_like(body)
+        return out
+
     # you can expand these in a child class to make customization easier
     def calculate_loss(
             self,
@@ -2345,12 +2509,29 @@ class SDTrainer(BaseSDTrainProcess):
                     if nrm_valid_mask.any():
                         # Cosine dissimilarity per pixel, averaged spatially
                         cos_per_pixel = (ref_normals * gen_normals).sum(dim=1)  # (B, H, W)
-                        cos_mean = cos_per_pixel.mean(dim=(1, 2))  # (B,)
-                        cos_loss = 1.0 - cos_mean  # (B,)
 
                         # L1 per pixel, averaged spatially
                         l1_per_pixel = (ref_normals - gen_normals).abs().mean(dim=1)  # (B, H, W)
-                        l1_mean = l1_per_pixel.mean(dim=(1, 2))  # (B,)
+
+                        # Perceptual restriction to body mask (Phase 2 subject_mask).
+                        # If any item requests it, multiply per-pixel error by the body
+                        # mask at x0_pixels resolution before spatial averaging.
+                        _body_restrict_mask = self._build_body_restrict_mask(
+                            batch, cos_per_pixel.shape
+                        )
+                        if _body_restrict_mask is not None:
+                            # normalize per-sample so items not restricted keep ~same magnitude
+                            _brm = _body_restrict_mask.to(
+                                cos_per_pixel.device, dtype=cos_per_pixel.dtype
+                            )
+                            # avoid div-by-zero for items with empty body mask
+                            _brm_sum = _brm.sum(dim=(1, 2)).clamp(min=1.0)
+                            cos_mean = (cos_per_pixel * _brm).sum(dim=(1, 2)) / _brm_sum
+                            l1_mean = (l1_per_pixel * _brm).sum(dim=(1, 2)) / _brm_sum
+                        else:
+                            cos_mean = cos_per_pixel.mean(dim=(1, 2))  # (B,)
+                            l1_mean = l1_per_pixel.mean(dim=(1, 2))  # (B,)
+                        cos_loss = 1.0 - cos_mean  # (B,)
 
                         # Combined loss: L1 + cosine dissimilarity (same as Sapiens training)
                         nrm_loss_per_sample = (cos_loss + l1_mean) * nrm_weight * nrm_valid_mask.float()
@@ -3272,6 +3453,15 @@ class SDTrainer(BaseSDTrainProcess):
                 else:
                     print("WARNING: face_suppression_weight is set but no face bboxes available. "
                           "Enable face_id or ensure InsightFace face detection is running.")
+
+            # -------- Subject-mask region loss weighting (Phase 2) --------
+            # Delegates to _build_subject_mask_weight. Composes multiplicatively
+            # with face_suppression above; does NOT replace it.
+            subject_weight = self._build_subject_mask_weight(
+                batch, noisy_latents.shape, dtype=dtype,
+            )
+            if subject_weight is not None:
+                mask_multiplier = mask_multiplier * subject_weight
 
         def get_adapter_multiplier():
             if self.adapter and isinstance(self.adapter, T2IAdapter):

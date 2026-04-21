@@ -39,13 +39,18 @@ from toolkit.models.diffusion_feature_extraction import DiffusionFeatureExtracto
 from toolkit.util.losses import wavelet_loss, stepped_loss
 import torch.nn.functional as F
 from toolkit.unloader import unload_text_encoder
-from toolkit.config_modules import FaceIDConfig, BodyIDConfig, SubjectMaskConfig
+from toolkit.config_modules import FaceIDConfig, BodyIDConfig, SubjectMaskConfig, DepthConsistencyConfig
 from toolkit.face_id import FaceIDProjector, VisionFaceProjector, DifferentiableFaceEncoder, DifferentiableLandmarkEncoder, cache_face_embeddings
 from toolkit.body_id import BodyIDProjector, DifferentiableBodyProportionEncoder, cache_body_embeddings, cache_body_proportion_embeddings
 from toolkit.body_shape import DifferentiableBodyShapeEncoder, cache_body_shape_embeddings
 from toolkit.normal_id import DifferentiableNormalEncoder, cache_normal_embeddings
 from toolkit.vae_anchor import VAEAnchorEncoder, cache_vae_anchor_features
 from toolkit.subject_mask import cache_subject_masks
+from toolkit.depth_consistency import (
+    DifferentiableDepthEncoder,
+    compute_depth_consistency_loss,
+    cache_depth_gt_embeddings,
+)
 from PIL import Image
 from torchvision.transforms import functional as TF
 
@@ -126,6 +131,14 @@ class SDTrainer(BaseSDTrainProcess):
             self.subject_mask_config = SubjectMaskConfig(**subject_mask_raw)
         else:
             self.subject_mask_config = None
+
+        # Depth-consistency loss (MiDaS SSI + multi-scale gradient via DA2)
+        depth_consistency_raw = self.get_conf('depth_consistency', None)
+        if depth_consistency_raw is not None:
+            self.depth_consistency_config = DepthConsistencyConfig(**depth_consistency_raw)
+        else:
+            self.depth_consistency_config = None
+
         self.face_id_projector: Optional[FaceIDProjector] = None
         self.vision_face_projector: Optional[VisionFaceProjector] = None
         self.id_loss_model: Optional[DifferentiableFaceEncoder] = None
@@ -135,6 +148,11 @@ class SDTrainer(BaseSDTrainProcess):
         self.normal_model: Optional[DifferentiableNormalEncoder] = None
         self.vae_anchor_encoder: Optional[VAEAnchorEncoder] = None
         self.vae_anchor_projector = None
+        self.depth_encoder: Optional[DifferentiableDepthEncoder] = None
+        self._last_depth_consistency_loss: Optional[float] = None
+        self._last_depth_consistency_loss_applied: Optional[float] = None
+        self._last_depth_consistency_ssi: Optional[float] = None
+        self._last_depth_consistency_grad: Optional[float] = None
         self._last_identity_loss: Optional[float] = None
         self._last_landmark_loss: Optional[float] = None
         self._last_body_proportion_loss: Optional[float] = None
@@ -579,6 +597,25 @@ class SDTrainer(BaseSDTrainProcess):
                 for dataset in datasets:
                     cache_normal_embeddings(dataset.file_list, self.face_id_config)
 
+        # Depth consistency: cache GT depth maps (DA2 output) for all datasets
+        if (self.depth_consistency_config is not None
+                and self.depth_consistency_config.loss_weight > 0):
+            print_acc("DepthConsistency: Extracting and caching GT depth maps...")
+            if self.data_loader is not None:
+                datasets = get_dataloader_datasets(self.data_loader)
+                for dataset in datasets:
+                    cache_depth_gt_embeddings(
+                        dataset.file_list, self.depth_consistency_config,
+                        device=self.device_torch,
+                    )
+            if self.data_loader_reg is not None:
+                datasets = get_dataloader_datasets(self.data_loader_reg)
+                for dataset in datasets:
+                    cache_depth_gt_embeddings(
+                        dataset.file_list, self.depth_consistency_config,
+                        device=self.device_torch,
+                    )
+
         # Auto-masking (YOLO + SAM 2 + SegFormer-clothes): cache person/body/clothing
         # masks for region-aware loss weighting. Debug preview tiles (when enabled)
         # are written to save_root/subject_mask_previews/ — NOT inside the dataset
@@ -748,6 +785,17 @@ class SDTrainer(BaseSDTrainProcess):
             print_acc("LoRA+ID: Loading normal loss model (Sapiens 0.3B)...")
             self.normal_model = DifferentiableNormalEncoder()
             self.normal_model.to(self.device_torch)
+
+        # Load Depth-Anything-V2 perceptor for depth consistency loss if enabled
+        if (self.depth_consistency_config is not None
+                and self.depth_consistency_config.loss_weight > 0):
+            print_acc("DepthConsistency: Loading Depth-Anything-V2 perceptor...")
+            self.depth_encoder = DifferentiableDepthEncoder(
+                model_id=self.depth_consistency_config.model_id,
+                input_size=self.depth_consistency_config.input_size,
+                grad_checkpoint=self.depth_consistency_config.grad_checkpoint,
+                device=self.device_torch,
+            )
 
         # Load E-LatentLPIPS model if latent perceptual loss is enabled
         if self.train_config.latent_perceptual_loss_weight > 0:
@@ -2730,6 +2778,136 @@ class SDTrainer(BaseSDTrainProcess):
                             level_str = ' '.join(f'{k}={v:.4f}' for k, v in va_per_level.items())
                             print(f"  [VAE anchor] step={self.step_num} total={(va_loss_per_sample.sum() / va_active_count).item():.4f} {level_str}")
 
+        # === Depth consistency loss (MiDaS SSI + multi-scale gradient via DA2) ===
+        # Independent of face_id_config; does its own x0 decode and per-sample loop.
+        if (self.depth_encoder is not None
+                and getattr(batch, 'depth_gt_list', None) is not None):
+            _dc_cfg = self.depth_consistency_config
+            _dc_nt = float(self.sd.noise_scheduler.config.num_train_timesteps)
+            _dc_t = timesteps.float() / _dc_nt
+            _dc_active = (_dc_t > _dc_cfg.loss_min_t) & (_dc_t < _dc_cfg.loss_max_t)
+
+            if _dc_active.any():
+                # Recover x0 prediction from model output (same math as the
+                # face-losses block — we duplicate it so depth can run with
+                # no face_id config present).
+                if self.sd.is_flow_matching:
+                    _dc_sigma = _dc_t.view(-1, 1, 1, 1)
+                    _dc_x0_pred = noisy_latents - _dc_sigma * noise_pred
+                else:
+                    _dc_ab = self.sd.noise_scheduler.alphas_cumprod.to(
+                        device=timesteps.device, dtype=noisy_latents.dtype
+                    )[timesteps.long()].view(-1, 1, 1, 1)
+                    _dc_sa = _dc_ab.sqrt()
+                    _dc_s1ma = (1.0 - _dc_ab).sqrt()
+                    if self.sd.prediction_type == 'v_prediction':
+                        _dc_x0_pred = _dc_sa * noisy_latents - _dc_s1ma * noise_pred
+                    else:
+                        _dc_x0_pred = (noisy_latents - _dc_s1ma * noise_pred) / _dc_sa.clamp(min=1e-8)
+
+                # Decode x0 to pixel space (same path the face-losses block uses).
+                if hasattr(self, '_taef2_decoder') and self._taef2_decoder is not None:
+                    _dc_for_dec = _dc_x0_pred
+                    if _dc_for_dec.shape[1] != 32:
+                        _dc_for_dec = rearrange(
+                            _dc_for_dec,
+                            "b (c p1 p2) h w -> b c (h p1) (w p2)",
+                            c=32, p1=2, p2=2,
+                        )
+                    _dc_dd = next(self._taef2_decoder.parameters()).dtype
+                    _dc_pixels = self._taef2_decoder(_dc_for_dec.to(_dc_dd)).float().clamp(0, 1)
+                elif self.taesd is not None:
+                    _dc_td = next(self.taesd.parameters()).dtype
+                    _dc_pixels = self.taesd.decode(_dc_x0_pred.to(_dc_td)).sample.float()
+                    _dc_pixels = (_dc_pixels + 1.0) * 0.5
+                else:
+                    _dc_vd = self.sd.vae.dtype
+                    _dc_us = _dc_x0_pred / self.sd.vae.config['scaling_factor']
+                    if 'shift_factor' in self.sd.vae.config and self.sd.vae.config['shift_factor']:
+                        _dc_us = _dc_us + self.sd.vae.config['shift_factor']
+                    _dc_pixels = self.sd.vae.decode(_dc_us.to(_dc_vd)).sample
+                    _dc_pixels = (_dc_pixels.float() + 1.0) * 0.5
+                _dc_pixels = _dc_pixels.clamp(0, 1)
+
+                # Spatial mask source
+                _dc_masks = None
+                if _dc_cfg.mask_source == 'subject':
+                    _dc_masks = getattr(batch, 'subject_masks', None)
+                elif _dc_cfg.mask_source == 'body':
+                    _dc_masks = getattr(batch, 'body_masks', None)
+
+                # Iterate per-sample (cached GT depths have per-image shapes).
+                _dc_total = _dc_pixels.new_zeros(())
+                _dc_ssi_sum = 0.0
+                _dc_grad_sum = 0.0
+                _dc_n = 0
+                for _dc_i in range(_dc_pixels.shape[0]):
+                    if not _dc_active[_dc_i]:
+                        continue
+                    _dc_gt_i = batch.depth_gt_list[_dc_i] if _dc_i < len(batch.depth_gt_list) else None
+                    if _dc_gt_i is None:
+                        continue
+                    _dc_gt_t = _dc_gt_i.to(_dc_pixels.device, dtype=torch.float32)
+                    if _dc_gt_t.dim() == 2:
+                        _dc_gt_t = _dc_gt_t.unsqueeze(0)
+                    _dc_mask_t = None
+                    if _dc_masks is not None and _dc_i < _dc_masks.shape[0]:
+                        _dc_mask_t = _dc_masks[_dc_i].float().to(_dc_pixels.device)
+                        if _dc_mask_t.dim() == 3:
+                            _dc_mask_t = _dc_mask_t.squeeze(0)
+                    _dc_loss_i, _dc_ssi_i, _dc_grad_i, _dc_dpred_i, _dc_dgt_i = compute_depth_consistency_loss(
+                        self.depth_encoder,
+                        _dc_pixels[_dc_i:_dc_i + 1],
+                        _dc_gt_t,
+                        _dc_mask_t,
+                        ssi_weight=_dc_cfg.ssi_weight,
+                        grad_weight=_dc_cfg.grad_weight,
+                        grad_scales=_dc_cfg.grad_scales,
+                    )
+                    _dc_total = _dc_total + _dc_loss_i
+                    _dc_ssi_sum += float(_dc_ssi_i)
+                    _dc_grad_sum += float(_dc_grad_i)
+                    _dc_n += 1
+
+                    # Preview: save [GT RGB | GT depth | Pred RGB | Pred depth] every N steps.
+                    if (_dc_cfg.preview_every > 0
+                            and self.step_num % _dc_cfg.preview_every == 0
+                            and _dc_i < len(batch.file_items)):
+                        try:
+                            from toolkit.depth_consistency import render_depth_preview
+                            from PIL import Image as _PILImage
+                            from PIL.ImageOps import exif_transpose as _exif_transpose
+                            pred_rgb = _dc_pixels[_dc_i].detach().clamp(0, 1).cpu()
+                            pred_pil = TF.to_pil_image(pred_rgb)
+                            ref_path = batch.file_items[_dc_i].path
+                            ref_pil = _exif_transpose(_PILImage.open(ref_path)).convert('RGB')
+                            combo = render_depth_preview(
+                                pred_pil, ref_pil,
+                                _dc_dpred_i.squeeze(0) if _dc_dpred_i.dim() == 3 else _dc_dpred_i,
+                                _dc_dgt_i.squeeze(0) if _dc_dgt_i.dim() == 3 else _dc_dgt_i,
+                                mask=_dc_mask_t,
+                            )
+                            dc_preview_dir = os.path.join(self.save_root, 'depth_previews')
+                            os.makedirs(dc_preview_dir, exist_ok=True)
+                            _t_val = _dc_t[_dc_i].item()
+                            _dc_val = float(_dc_loss_i)
+                            src_name = os.path.splitext(os.path.basename(ref_path))[0]
+                            combo.save(os.path.join(
+                                dc_preview_dir,
+                                f'{src_name}_step{self.step_num:06d}_t{_t_val:.2f}_dc{_dc_val:.4f}.jpg'
+                            ))
+                        except Exception as e:  # noqa: BLE001
+                            print_acc(f"  depth preview failed: {e}")
+
+                if _dc_n > 0:
+                    _dc_avg = _dc_total / _dc_n
+                    _dc_applied = _dc_cfg.loss_weight * _dc_avg
+                    loss = loss + _dc_applied
+                    self._last_depth_consistency_loss = _dc_avg.detach().item()
+                    self._last_depth_consistency_loss_applied = _dc_applied.detach().item()
+                    self._last_depth_consistency_ssi = _dc_ssi_sum / _dc_n
+                    self._last_depth_consistency_grad = _dc_grad_sum / _dc_n
+
         # E-LatentLPIPS perceptual loss in latent space
         if self.latent_perceptual_model is not None:
             try:
@@ -4445,6 +4623,19 @@ class SDTrainer(BaseSDTrainProcess):
             for level_name, level_val in self._last_vae_anchor_per_level.items():
                 loss_dict[f'va_{level_name}'] = level_val
             self._last_vae_anchor_per_level = None
+        # Depth consistency loss (MiDaS SSI + multi-scale gradient via DA2)
+        if self._last_depth_consistency_loss is not None:
+            loss_dict['depth_consistency_loss'] = self._last_depth_consistency_loss
+            self._last_depth_consistency_loss = None
+        if self._last_depth_consistency_loss_applied is not None:
+            loss_dict['depth_consistency_loss_applied'] = self._last_depth_consistency_loss_applied
+            self._last_depth_consistency_loss_applied = None
+        if self._last_depth_consistency_ssi is not None:
+            loss_dict['depth_consistency_ssi'] = self._last_depth_consistency_ssi
+            self._last_depth_consistency_ssi = None
+        if self._last_depth_consistency_grad is not None:
+            loss_dict['depth_consistency_grad'] = self._last_depth_consistency_grad
+            self._last_depth_consistency_grad = None
         if self._last_timestep is not None:
             loss_dict['timestep'] = self._last_timestep
             self._last_timestep = None

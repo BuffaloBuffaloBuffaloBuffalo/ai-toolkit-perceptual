@@ -325,6 +325,26 @@ export interface SubjectMaskConfig {
   save_debug_previews?: boolean;
 }
 
+export interface DepthConsistencyConfig {
+  // Enable by setting loss_weight > 0
+  loss_weight?: number;
+  loss_min_t?: number;
+  loss_max_t?: number;
+  // Frozen Depth-Anything-V2 perceptor
+  model_id?: string;
+  input_size?: number;
+  // Loss composition (MiDaS formulation)
+  ssi_weight?: number;
+  grad_weight?: number;
+  grad_scales?: number;
+  // Spatial mask source
+  mask_source?: 'none' | 'subject' | 'body';
+  // Memory controls
+  grad_checkpoint?: boolean;
+  // Preview cadence (steps); 0 disables
+  preview_every?: number;
+}
+
 export interface ProcessConfig {
   type: string;
   sqlite_db_path?: string;
@@ -337,6 +357,7 @@ export interface ProcessConfig {
   face_id?: FaceIDConfig;
   body_id?: BodyIDConfig;
   subject_mask?: SubjectMaskConfig;
+  depth_consistency?: DepthConsistencyConfig;
   save: SaveConfig;
   datasets: DatasetConfig[];
   train: TrainConfig;

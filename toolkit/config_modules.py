@@ -920,6 +920,49 @@ class BodyIDConfig:
         self.init_scale: float = kwargs.get('init_scale', 0.01)
 
 
+class DepthConsistencyConfig:
+    """Depth-consistency auxiliary loss via a frozen Depth-Anything-V2 perceptor.
+
+    Enabled by setting ``loss_weight > 0`` (same convention as identity and
+    body-proportion losses).  The loss compares the generated image's depth
+    map (from x0_pred decoded to pixels) against the ground-truth depth map
+    (cached per image at dataset-prep time) using MiDaS's scale-and-shift-
+    invariant L1 plus a multi-scale gradient-matching term.
+
+    Note on spatial alignment: the GT depth is cached from the original
+    image; at loss time it's resized to match x0_pixels.  If the dataset
+    uses aggressive augmentation crops, cached GT depth will be slightly
+    misaligned with x0_pixels.  For typical LoRA training with modest
+    augmentation this is acceptable because SSI alignment absorbs any
+    global offset and the gradient loss operates on local structure.
+    """
+
+    def __init__(self, **kwargs):
+        # Enable by setting loss_weight > 0
+        self.loss_weight: float = kwargs.get('loss_weight', 0.0)
+        self.loss_min_t: float = kwargs.get('loss_min_t', 0.0)
+        self.loss_max_t: float = kwargs.get('loss_max_t', 1.0)
+        # Frozen perceptor
+        self.model_id: str = kwargs.get(
+            'model_id', 'depth-anything/Depth-Anything-V2-Small-hf'
+        )
+        self.input_size: int = kwargs.get('input_size', 518)
+        # Loss composition (MiDaS formulation)
+        self.ssi_weight: float = kwargs.get('ssi_weight', 1.0)
+        self.grad_weight: float = kwargs.get('grad_weight', 0.5)
+        self.grad_scales: int = kwargs.get('grad_scales', 4)
+        # Spatial masking
+        #   'none'      - full-image loss
+        #   'subject'   - use cached person/subject mask (default)
+        #   'body'      - use cached body-only mask
+        self.mask_source: str = kwargs.get('mask_source', 'subject')
+        # Memory controls
+        self.grad_checkpoint: bool = kwargs.get('grad_checkpoint', True)
+        # Preview cadence — save a (GT RGB | GT depth | Pred RGB | Pred depth)
+        # tile every N steps to save_root/depth_previews/.  0 disables.
+        self.preview_every: int = kwargs.get('preview_every', 100)
+
+
 class SubjectMaskConfig:
     """Configuration for auto-masking via YOLO + SAM 2 + SegFormer-clothes.
 

@@ -1,4 +1,4 @@
-import { JobConfig, DatasetConfig, SliderConfig, FaceIDConfig, BodyIDConfig, SubjectMaskConfig } from '@/types';
+import { JobConfig, DatasetConfig, SliderConfig, FaceIDConfig, BodyIDConfig, SubjectMaskConfig, DepthConsistencyConfig } from '@/types';
 
 export const defaultDatasetConfig: DatasetConfig = {
   folder_path: '/path/to/images/folder',
@@ -78,6 +78,20 @@ export const defaultSubjectMaskConfig: SubjectMaskConfig = {
   save_debug_previews: false,
 };
 
+export const defaultDepthConsistencyConfig: DepthConsistencyConfig = {
+  loss_weight: 0.0,
+  loss_min_t: 0.0,
+  loss_max_t: 1.0,
+  model_id: 'depth-anything/Depth-Anything-V2-Small-hf',
+  input_size: 518,
+  ssi_weight: 1.0,
+  grad_weight: 0.5,
+  grad_scales: 4,
+  mask_source: 'subject',
+  grad_checkpoint: true,
+  preview_every: 100,
+};
+
 export const defaultSliderConfig: SliderConfig = {
   guidance_strength: 3.0,
   anchor_strength: 1.0,
@@ -114,6 +128,7 @@ export const defaultJobConfig: JobConfig = {
         face_id: { ...defaultFaceIDConfig },
         body_id: { ...defaultBodyIDConfig },
         subject_mask: { ...defaultSubjectMaskConfig },
+        depth_consistency: { ...defaultDepthConsistencyConfig },
         save: {
           dtype: 'bf16',
           save_every: 250,

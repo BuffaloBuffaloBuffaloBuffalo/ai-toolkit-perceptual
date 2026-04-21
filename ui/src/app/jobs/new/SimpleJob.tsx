@@ -1197,6 +1197,136 @@ export default function SimpleJob({
                     />
                   </>
                 )}
+                {/* -------- Depth Consistency (Depth-Anything-V2 SSI + gradient) -------- */}
+                <NumberInput
+                  label="Depth Consistency Loss Weight"
+                  docKey="depth_consistency.loss_weight"
+                  className="pt-4"
+                  value={jobConfig.config.process[0].depth_consistency?.loss_weight ?? 0.0}
+                  onChange={value =>
+                    setJobConfig(value, 'config.process[0].depth_consistency.loss_weight')
+                  }
+                  placeholder="0 = disabled"
+                  min={0}
+                />
+                {(jobConfig.config.process[0].depth_consistency?.loss_weight ?? 0) > 0 && (
+                  <>
+                    <NumberInput
+                      label="Depth Min t"
+                      docKey="depth_consistency.loss_min_t"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].depth_consistency?.loss_min_t ?? 0.0}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].depth_consistency.loss_min_t')
+                      }
+                      placeholder="eg. 0"
+                      min={0.0}
+                      max={1.0}
+                    />
+                    <NumberInput
+                      label="Depth Max t"
+                      docKey="depth_consistency.loss_max_t"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].depth_consistency?.loss_max_t ?? 1.0}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].depth_consistency.loss_max_t')
+                      }
+                      placeholder="eg. 0.9"
+                      min={0.0}
+                      max={1.0}
+                    />
+                    <SelectInput
+                      label="Depth Mask Source"
+                      docKey="depth_consistency.mask_source"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].depth_consistency?.mask_source ?? 'subject'}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].depth_consistency.mask_source')
+                      }
+                      options={[
+                        { label: 'none (full image)', value: 'none' },
+                        { label: 'subject (person mask)', value: 'subject' },
+                        { label: 'body (identity-relevant only)', value: 'body' },
+                      ]}
+                    />
+                    <NumberInput
+                      label="SSI L1 Weight"
+                      docKey="depth_consistency.ssi_weight"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].depth_consistency?.ssi_weight ?? 1.0}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].depth_consistency.ssi_weight')
+                      }
+                      placeholder="eg. 1.0"
+                      min={0}
+                    />
+                    <NumberInput
+                      label="Gradient Matching Weight"
+                      docKey="depth_consistency.grad_weight"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].depth_consistency?.grad_weight ?? 0.5}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].depth_consistency.grad_weight')
+                      }
+                      placeholder="eg. 0.5"
+                      min={0}
+                    />
+                    <NumberInput
+                      label="Gradient Scales"
+                      docKey="depth_consistency.grad_scales"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].depth_consistency?.grad_scales ?? 4}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].depth_consistency.grad_scales')
+                      }
+                      placeholder="eg. 4"
+                      min={1}
+                      max={8}
+                    />
+                    <NumberInput
+                      label="Preview Every (steps)"
+                      docKey="depth_consistency.preview_every"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].depth_consistency?.preview_every ?? 100}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].depth_consistency.preview_every')
+                      }
+                      placeholder="eg. 100; 0 disables"
+                      min={0}
+                    />
+                    <TextInput
+                      label="DA2 Model ID"
+                      docKey="depth_consistency.model_id"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].depth_consistency?.model_id ?? 'depth-anything/Depth-Anything-V2-Small-hf'}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].depth_consistency.model_id')
+                      }
+                      placeholder="depth-anything/Depth-Anything-V2-Small-hf"
+                    />
+                    <NumberInput
+                      label="DA2 Input Size"
+                      docKey="depth_consistency.input_size"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].depth_consistency?.input_size ?? 518}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].depth_consistency.input_size')
+                      }
+                      placeholder="518 (multiple of 14)"
+                      min={224}
+                      max={896}
+                    />
+                    <Checkbox
+                      label="Gradient Checkpointing (DA2)"
+                      docKey="depth_consistency.grad_checkpoint"
+                      className="pt-2"
+                      checked={jobConfig.config.process[0].depth_consistency?.grad_checkpoint ?? true}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].depth_consistency.grad_checkpoint')
+                      }
+                    />
+                  </>
+                )}
                 {/* Body shape, normal map, VAE anchor, body conditioning — experimental, hidden for now
                 <NumberInput
                   label="Body Shape Loss Weight (HybrIK)"

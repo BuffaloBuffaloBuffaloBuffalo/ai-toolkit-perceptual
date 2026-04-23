@@ -25,6 +25,7 @@ IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
 
 CACHE_VERSION_KEY = "depth_gt_v1"
+CACHE_VERSION_VIDEO_KEY = "depth_gt_video_v1"
 
 
 class DifferentiableDepthEncoder(nn.Module):
@@ -343,3 +344,263 @@ def cache_depth_gt_embeddings(
         print(
             f"  -  Warning: zero depth for {zero_depth_count}/{len(file_items)} images"
         )
+
+
+# ---------------------------------------------------------------------------
+# Wan 2.1 video path: TAEHV x0 decode + per-frame depth GT caching
+# ---------------------------------------------------------------------------
+
+
+def load_taehv_wan21(device: str = "cuda", dtype: torch.dtype = torch.bfloat16):
+    """Load TAEHV (tiny autoencoder) pretrained for Wan 2.1 latents.
+
+    11M-param decoder — decodes 100+ frames with gradients in ~10 GB peak
+    (vs ~20 GB+ for the full Wan 3D VAE). Output is [0, 1] directly
+    (no latents_mean/std denormalization needed).
+
+    Weights (``taew2_1.pth``) live at ``toolkit/taehv/taew2_1.pth``; they
+    are gitignored and must be placed there manually.
+    """
+    import sys
+    _here = os.path.dirname(os.path.abspath(__file__))
+    _taehv_dir = os.path.join(_here, "taehv")
+    if _taehv_dir not in sys.path:
+        sys.path.insert(0, _taehv_dir)
+    from taehv import TAEHV  # noqa: E402
+    ckpt = os.path.join(_taehv_dir, "taew2_1.pth")
+    if not os.path.exists(ckpt):
+        raise FileNotFoundError(
+            f"TAEHV checkpoint not found at {ckpt}. "
+            "Download taew2_1.pth and place it there before training."
+        )
+    tae = TAEHV(checkpoint_path=ckpt).to(device).to(dtype).eval()
+    for p in tae.parameters():
+        p.requires_grad_(False)
+    return tae
+
+
+def decode_wan_x0_to_frames(
+    x0_latents: torch.Tensor,
+    decoder,
+) -> torch.Tensor:
+    """Decode Wan video x0 prediction from latent to pixel frames.
+
+    Supports TAEHV (tiny, ~10 GB peak for 100+ frames w/ grads) or a full
+    ``AutoencoderKLWan``.
+
+    Args:
+        x0_latents: (B, C, T, H, W) in normalized latent space (NCTHW).
+        decoder: TAEHV instance OR AutoencoderKLWan instance.
+
+    Returns:
+        frames: (B, 3, T_out, H_out, W_out) in [0, 1] (NCTHW).
+    """
+    is_taehv = hasattr(decoder, "t_upscale") and hasattr(decoder, "decode_video")
+
+    if is_taehv:
+        # TAEHV expects NTCHW; our latents are NCTHW → permute.
+        x0_ntchw = x0_latents.permute(0, 2, 1, 3, 4).to(
+            next(decoder.parameters()).dtype
+        )
+        frames_ntchw = decoder.decode_video(
+            x0_ntchw, parallel=True, show_progress_bar=False
+        )
+        return frames_ntchw.permute(0, 2, 1, 3, 4).float().clamp(0, 1)
+
+    # Fallback: full Wan VAE — needs denormalization.
+    vae = decoder
+    latents_mean = (
+        torch.tensor(vae.config.latents_mean)
+        .view(1, vae.config.z_dim, 1, 1, 1)
+        .to(x0_latents.device, x0_latents.dtype)
+    )
+    latents_std = (
+        1.0 / torch.tensor(vae.config.latents_std)
+        .view(1, vae.config.z_dim, 1, 1, 1)
+        .to(x0_latents.device, x0_latents.dtype)
+    )
+    raw_latents = x0_latents / latents_std + latents_mean
+    video = vae.decode(raw_latents.to(vae.dtype), return_dict=False)[0]
+    pixels = (video.float() + 1.0) * 0.5
+    return pixels.clamp(0, 1)
+
+
+def cache_video_depth_gt_embeddings(
+    file_items: List["FileItemDTO"],  # noqa: F821
+    config: "DepthConsistencyConfig",  # noqa: F821
+    device: Optional[torch.device] = None,
+    num_frames: Optional[int] = None,
+    batch_size: int = 4,
+) -> None:
+    """Extract and cache per-frame GT depth maps for video file items.
+
+    Cached at ``{video_dir}/_face_id_cache/{stem}.safetensors`` under the key
+    ``depth_gt_video`` with shape ``(T, H, W)`` float16 at DA2's native output
+    resolution. Versioned by ``CACHE_VERSION_VIDEO_KEY``.
+
+    Args:
+        file_items: items whose ``is_video`` is truthy are processed.
+        config: ``DepthConsistencyConfig`` — supplies DA2 model id / input size.
+        device: CUDA device for extraction.
+        num_frames: if set, uniformly subsamples the video to this many frames
+            before caching. Must match the training ``num_frames`` so the
+            cached T lines up with the decoded x0 T at training time.
+        batch_size: frames per DA2 forward pass during caching.
+    """
+    import cv2
+    import numpy as np
+
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    video_items = [f for f in file_items if getattr(f, "is_video", False)]
+    if not video_items:
+        return
+
+    print(
+        f"  -  Loading Depth-Anything-V2 perceptor for GT video depth caching "
+        f"({len(video_items)} videos)..."
+    )
+    encoder = DifferentiableDepthEncoder(
+        model_id=config.model_id,
+        input_size=config.input_size,
+        grad_checkpoint=False,
+        device=device,
+    )
+
+    for file_item in tqdm(video_items, desc="Caching GT depth (video)"):
+        vid_dir = os.path.dirname(file_item.path)
+        cache_dir = os.path.join(vid_dir, "_face_id_cache")
+        stem = os.path.splitext(os.path.basename(file_item.path))[0]
+        cache_path = os.path.join(cache_dir, f"{stem}.safetensors")
+
+        # Cache hit: reuse if version matches AND cached T == requested T.
+        if os.path.exists(cache_path):
+            data = load_file(cache_path)
+            if (
+                "depth_gt_video" in data
+                and CACHE_VERSION_VIDEO_KEY in data
+                and (num_frames is None or data["depth_gt_video"].shape[0] == num_frames)
+            ):
+                file_item.depth_gt_video = data["depth_gt_video"].clone()
+                continue
+
+        # Read frames from disk.
+        cap = cv2.VideoCapture(file_item.path)
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total <= 0:
+            cap.release()
+            print(f"  -  Warning: cannot read video frames: {file_item.path}")
+            continue
+
+        if num_frames is not None and num_frames < total:
+            indices = np.linspace(0, total - 1, num_frames, dtype=int)
+        else:
+            indices = np.arange(total)
+
+        frames = []
+        for idx in indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
+            ok, fr = cap.read()
+            if not ok:
+                continue
+            fr = cv2.cvtColor(fr, cv2.COLOR_BGR2RGB)
+            frames.append(
+                torch.from_numpy(fr).float().permute(2, 0, 1) / 255.0
+            )
+        cap.release()
+
+        if not frames:
+            print(f"  -  Warning: no frames read from {file_item.path}")
+            continue
+
+        video_tensor = torch.stack(frames)  # (T, 3, H, W)
+
+        # Per-frame depth via DA2, no-grad, batched.
+        depth_frames: List[torch.Tensor] = []
+        with torch.no_grad():
+            for start in range(0, video_tensor.shape[0], batch_size):
+                batch = video_tensor[start:start + batch_size].to(device)
+                d = encoder(batch)  # (b, H_out, W_out)
+                depth_frames.append(d.detach().cpu().to(torch.float16))
+        depth_video = torch.cat(depth_frames, dim=0)  # (T, H_out, W_out)
+
+        file_item.depth_gt_video = depth_video
+
+        os.makedirs(cache_dir, exist_ok=True)
+        save_data = {}
+        if os.path.exists(cache_path):
+            try:
+                existing = load_file(cache_path)
+                save_data = {k: v.clone() for k, v in existing.items()}
+            except Exception:  # noqa: BLE001 — corrupt cache → rewrite
+                save_data = {}
+        save_data["depth_gt_video"] = depth_video
+        save_data[CACHE_VERSION_VIDEO_KEY] = torch.ones(1)
+        save_file(save_data, cache_path)
+
+    del encoder
+    torch.cuda.empty_cache()
+
+
+def save_video_depth_preview(
+    output_path: str,
+    gen_rgb: torch.Tensor,     # (T, 3, H, W) in [0, 1]
+    gen_depth: torch.Tensor,   # (T, H_d, W_d) float
+    gt_depth: torch.Tensor,    # (T_g, H_d, W_d) float
+    fps: int = 16,
+) -> None:
+    """Write an animated webp: [gen_rgb | gen_depth | gt_depth] per frame.
+
+    ``gt_depth`` is linspace-resampled along T to match ``gen_rgb``.
+    Depth frames are percentile-normalized (p2-p98) per frame for contrast.
+    """
+    import numpy as np
+    from PIL import Image
+
+    def _depth_to_pil(dep_np, size):
+        d = dep_np
+        if d.ndim == 3:
+            d = d[0]
+        lo, hi = np.percentile(d, 2), np.percentile(d, 98)
+        dn = np.clip((d - lo) / max(1e-6, (hi - lo)), 0, 1)
+        im = Image.fromarray((dn * 255).astype(np.uint8))
+        return im.resize(size, Image.BICUBIC).convert("RGB")
+
+    T = gen_rgb.shape[0]
+    T_g = gt_depth.shape[0]
+    if T_g != T:
+        ix = torch.linspace(0, T_g - 1, T).long()
+        gt_depth = gt_depth[ix]
+
+    gen_rgb_np = gen_rgb.detach().float().clamp(0, 1).cpu().numpy()
+    gen_d_np = gen_depth.detach().float().cpu().numpy()
+    gt_d_np = gt_depth.detach().float().cpu().numpy()
+
+    H, W = gen_rgb_np.shape[2], gen_rgb_np.shape[3]
+    pil_frames = []
+    for t in range(T):
+        rgb = (gen_rgb_np[t].transpose(1, 2, 0) * 255).astype(np.uint8)
+        rgb_pil = Image.fromarray(rgb)
+        gen_d_pil = _depth_to_pil(gen_d_np[t], (W, H))
+        gt_d_pil = _depth_to_pil(gt_d_np[t], (W, H))
+
+        combo = Image.new("RGB", (W * 3 + 8, H), (0, 0, 0))
+        combo.paste(rgb_pil, (0, 0))
+        combo.paste(gen_d_pil, (W + 4, 0))
+        combo.paste(gt_d_pil, (W * 2 + 8, 0))
+        pil_frames.append(combo)
+
+    if not output_path.endswith(".webp"):
+        output_path = output_path + ".webp"
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+
+    duration_ms = int(1000 / max(1, fps))
+    pil_frames[0].save(
+        output_path,
+        format="WEBP",
+        save_all=True,
+        append_images=pil_frames[1:],
+        duration=duration_ms,
+        loop=0,
+    )

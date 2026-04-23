@@ -240,6 +240,8 @@ class DataLoaderBatchDTO:
             self.body_shape_embedding: Union[torch.Tensor, None] = None
             # Depth consistency loss: per-image GT depth maps (variable shape)
             self.depth_gt_list: Union[list, None] = None
+            # Depth consistency loss (video): per-video GT depth cubes, (T, H, W)
+            self.depth_gt_video_list: Union[list, None] = None
             self.normal_embedding: Union[torch.Tensor, None] = None
             self.vae_anchor_features: Union[Dict, None] = None  # per-level VAE encoder features
             self.face_bboxes: Union[List, None] = None  # per-item face bboxes in original image coords
@@ -638,6 +640,12 @@ class DataLoaderBatchDTO:
                     getattr(x, 'depth_gt', None) for x in self.file_items
                 ]
 
+            # collect GT depth cubes for video items (T, H, W) float16 — list
+            if any([getattr(x, 'depth_gt_video', None) is not None for x in self.file_items]):
+                self.depth_gt_video_list = [
+                    getattr(x, 'depth_gt_video', None) for x in self.file_items
+                ]
+
             # collect normal embeddings (Sapiens normal maps, for normal loss)
             if any([getattr(x, 'normal_embedding', None) is not None for x in self.file_items]):
                 nm_embeds = []
@@ -768,6 +776,7 @@ class DataLoaderBatchDTO:
         del self.body_proportion_embedding
         del self.body_shape_embedding
         del self.depth_gt_list
+        del self.depth_gt_video_list
         del self.normal_embedding
         del self.vae_anchor_features
         del self.face_bboxes

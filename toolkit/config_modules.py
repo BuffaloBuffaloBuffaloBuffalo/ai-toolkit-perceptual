@@ -961,6 +961,11 @@ class DepthConsistencyConfig:
         # Preview cadence — save a (GT RGB | GT depth | Pred RGB | Pred depth)
         # tile every N steps to save_root/depth_previews/.  0 disables.
         self.preview_every: int = kwargs.get('preview_every', 100)
+        # Preview only for steps whose t-ratio is >= this value (video path).
+        self.preview_min_t: float = kwargs.get('preview_min_t', 0.0)
+        # Video path only: frames per DA2 chunk during x0→depth backward. Keeps
+        # peak activation memory bounded regardless of the video's total T.
+        self.frames_per_chunk: int = kwargs.get('frames_per_chunk', 8)
 
 
 class SubjectMaskConfig:

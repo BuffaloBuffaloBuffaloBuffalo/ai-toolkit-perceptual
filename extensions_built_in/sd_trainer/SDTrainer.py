@@ -50,6 +50,10 @@ from toolkit.depth_consistency import (
     DifferentiableDepthEncoder,
     compute_depth_consistency_loss,
     cache_depth_gt_embeddings,
+    cache_video_depth_gt_embeddings,
+    load_taehv_wan21,
+    decode_wan_x0_to_frames,
+    save_video_depth_preview,
 )
 from PIL import Image
 from torchvision.transforms import functional as TF
@@ -149,6 +153,9 @@ class SDTrainer(BaseSDTrainProcess):
         self.vae_anchor_encoder: Optional[VAEAnchorEncoder] = None
         self.vae_anchor_projector = None
         self.depth_encoder: Optional[DifferentiableDepthEncoder] = None
+        # Wan 2.1 video path: TAEHV tiny decoder for x0 → frames. Lazy-loaded
+        # the first time a 5D noise_pred arrives through the depth block.
+        self._wan_depth_decoder = None
         self._last_depth_consistency_loss: Optional[float] = None
         self._last_depth_consistency_loss_applied: Optional[float] = None
         self._last_depth_consistency_ssi: Optional[float] = None
@@ -597,24 +604,31 @@ class SDTrainer(BaseSDTrainProcess):
                 for dataset in datasets:
                     cache_normal_embeddings(dataset.file_list, self.face_id_config)
 
-        # Depth consistency: cache GT depth maps (DA2 output) for all datasets
+        # Depth consistency: cache GT depth maps (DA2 output) for all datasets.
+        # Image datasets use the scalar per-image cache; video datasets
+        # (num_frames > 1) additionally cache a per-frame (T, H, W) cube.
         if (self.depth_consistency_config is not None
                 and self.depth_consistency_config.loss_weight > 0):
             print_acc("DepthConsistency: Extracting and caching GT depth maps...")
+
+            def _cache_dataset_depth(ds):
+                cache_depth_gt_embeddings(
+                    ds.file_list, self.depth_consistency_config,
+                    device=self.device_torch,
+                )
+                if getattr(ds, 'num_frames', 1) > 1:
+                    cache_video_depth_gt_embeddings(
+                        ds.file_list, self.depth_consistency_config,
+                        device=self.device_torch,
+                        num_frames=ds.num_frames,
+                    )
+
             if self.data_loader is not None:
-                datasets = get_dataloader_datasets(self.data_loader)
-                for dataset in datasets:
-                    cache_depth_gt_embeddings(
-                        dataset.file_list, self.depth_consistency_config,
-                        device=self.device_torch,
-                    )
+                for dataset in get_dataloader_datasets(self.data_loader):
+                    _cache_dataset_depth(dataset)
             if self.data_loader_reg is not None:
-                datasets = get_dataloader_datasets(self.data_loader_reg)
-                for dataset in datasets:
-                    cache_depth_gt_embeddings(
-                        dataset.file_list, self.depth_consistency_config,
-                        device=self.device_torch,
-                    )
+                for dataset in get_dataloader_datasets(self.data_loader_reg):
+                    _cache_dataset_depth(dataset)
 
         # Auto-masking (YOLO + SAM 2 + SegFormer-clothes): cache person/body/clothing
         # masks for region-aware loss weighting. Debug preview tiles (when enabled)
@@ -689,7 +703,10 @@ class SDTrainer(BaseSDTrainProcess):
                 if nonzero:
                     self._avg_body_embedding = torch.stack(nonzero).mean(dim=0)
 
-        # Determine if any face loss needs a latent decoder (TAESD)
+        # Determine if any loss needs a latent decoder (TAESD / TAEF2).
+        # Depth-consistency also decodes x0 to pixels, so it shares the same
+        # decoder path — critical for Flux-2 where the base VAE has no
+        # diffusers-style `.config` / `.scaling_factor` attributes.
         _need_face_decoder = (
             self.face_id_config is not None
             and (self.face_id_config.identity_loss_weight > 0
@@ -700,6 +717,9 @@ class SDTrainer(BaseSDTrainProcess):
                  or _vae_anchor_enabled
                  or self.face_id_config.identity_metrics
                  or _ds_identity or _ds_landmark or _ds_body_prop or _ds_body_shape or _ds_normal)
+        ) or (
+            self.depth_consistency_config is not None
+            and self.depth_consistency_config.loss_weight > 0
         )
 
         # Load identity loss model (ArcFace + TAESD) if enabled
@@ -2780,7 +2800,9 @@ class SDTrainer(BaseSDTrainProcess):
 
         # === Depth consistency loss (MiDaS SSI + multi-scale gradient via DA2) ===
         # Independent of face_id_config; does its own x0 decode and per-sample loop.
+        # 4D (image) path — 5D (video) is handled by a separate block below.
         if (self.depth_encoder is not None
+                and len(noise_pred.shape) == 4
                 and getattr(batch, 'depth_gt_list', None) is not None):
             _dc_cfg = self.depth_consistency_config
             _dc_nt = float(self.sd.noise_scheduler.config.num_train_timesteps)
@@ -2821,6 +2843,11 @@ class SDTrainer(BaseSDTrainProcess):
                     _dc_pixels = self.taesd.decode(_dc_x0_pred.to(_dc_td)).sample.float()
                     _dc_pixels = (_dc_pixels + 1.0) * 0.5
                 else:
+                    # VAE may be offloaded to CPU when latents are cached
+                    # (see hook_before_train_loop). Ensure it is on the
+                    # training device before decoding.
+                    if next(self.sd.vae.parameters()).device != self.device_torch:
+                        self.sd.vae.to(self.device_torch)
                     _dc_vd = self.sd.vae.dtype
                     _dc_us = _dc_x0_pred / self.sd.vae.config['scaling_factor']
                     if 'shift_factor' in self.sd.vae.config and self.sd.vae.config['shift_factor']:
@@ -2907,6 +2934,162 @@ class SDTrainer(BaseSDTrainProcess):
                     self._last_depth_consistency_loss_applied = _dc_applied.detach().item()
                     self._last_depth_consistency_ssi = _dc_ssi_sum / _dc_n
                     self._last_depth_consistency_grad = _dc_grad_sum / _dc_n
+
+        # === Depth consistency loss — 5D video path (Wan 2.1) ===
+        # Decodes x0 with TAEHV (tiny, 11M params) for the full frame count,
+        # runs the DA2 perceptor on flattened (B*T, 3, H, W) frames in chunks
+        # under gradient checkpointing, then computes per-frame SSI + multi-scale
+        # gradient loss against a cached per-frame GT cube.
+        if (self.depth_encoder is not None
+                and len(noise_pred.shape) == 5
+                and getattr(batch, 'depth_gt_video_list', None) is not None):
+            _dc_cfg = self.depth_consistency_config
+            _dc_nt = float(self.sd.noise_scheduler.config.num_train_timesteps)
+            _dc_t = timesteps.float() / _dc_nt
+            _dc_active = (_dc_t > _dc_cfg.loss_min_t) & (_dc_t < _dc_cfg.loss_max_t)
+
+            if _dc_active.any():
+                # Lazy-load TAEHV on first video step — keeps image-only runs lean.
+                if self._wan_depth_decoder is None:
+                    print_acc("DepthConsistency (video): loading TAEHV tiny decoder...")
+                    self._wan_depth_decoder = load_taehv_wan21(
+                        device=self.device_torch,
+                        dtype=get_torch_dtype(self.train_config.dtype),
+                    )
+
+                # x0 recovery (flow-matching only — Wan 2.1 uses flowmatch).
+                if self.sd.is_flow_matching:
+                    _dc_sigma = _dc_t.view(-1, 1, 1, 1, 1)
+                    _dc_x0_pred = noisy_latents - _dc_sigma * noise_pred
+                else:
+                    # Non-flow video is unusual; skip cleanly if it ever happens.
+                    _dc_x0_pred = None
+
+                if _dc_x0_pred is not None:
+                    # Decode to (B, 3, T, H, W) in [0, 1].
+                    _dc_frames = decode_wan_x0_to_frames(
+                        _dc_x0_pred, self._wan_depth_decoder
+                    )
+                    B_vid, _, T_out, H_out, W_out = _dc_frames.shape
+                    # (B, 3, T, H, W) → (B, T, 3, H, W) → (B*T, 3, H, W).
+                    _dc_flat = _dc_frames.permute(0, 2, 1, 3, 4).reshape(
+                        B_vid * T_out, 3, H_out, W_out
+                    )
+
+                    # Run DA2 on chunks with gradient checkpointing to cap peak
+                    # memory. Chunk size keeps activations bounded regardless of
+                    # video length; grad-ckpt frees them across the wrapping
+                    # VAE+transformer backward.
+                    from torch.utils.checkpoint import checkpoint as _ckpt
+                    _dc_chunk = int(getattr(_dc_cfg, 'frames_per_chunk', 8))
+
+                    def _enc_fn(x):
+                        return self.depth_encoder(x)
+
+                    _dc_depth_chunks = []
+                    for _c in _dc_flat.split(_dc_chunk, dim=0):
+                        _dc_depth_chunks.append(
+                            _ckpt(_enc_fn, _c, use_reentrant=False)
+                        )
+                    _dc_depth_flat = torch.cat(_dc_depth_chunks, dim=0)
+                    # (B*T, H, W) or (B*T, 1, H, W) — normalize to (B*T, H, W).
+                    if _dc_depth_flat.dim() == 4:
+                        _dc_depth_flat = _dc_depth_flat.squeeze(1)
+                    _dc_depth = _dc_depth_flat.reshape(B_vid, T_out, *_dc_depth_flat.shape[1:])
+
+                    _dc_total = _dc_frames.new_zeros(())
+                    _dc_ssi_sum = 0.0
+                    _dc_grad_sum = 0.0
+                    _dc_n = 0
+                    _dc_preview_b = None
+
+                    for _b in range(B_vid):
+                        if not _dc_active[_b]:
+                            continue
+                        _gt_cube = (batch.depth_gt_video_list[_b]
+                                    if _b < len(batch.depth_gt_video_list) else None)
+                        if _gt_cube is None:
+                            continue
+                        _gt_cube = _gt_cube.to(_dc_frames.device, dtype=torch.float32)
+                        # Align GT T to generated T (should already match when the
+                        # cache was built with the dataset's num_frames).
+                        T_g = _gt_cube.shape[0]
+                        if T_g != T_out:
+                            ix = torch.linspace(0, T_g - 1, T_out, device=_gt_cube.device).long()
+                            _gt_cube = _gt_cube[ix]
+
+                        # Resize GT depth map to match generated depth spatial size
+                        # (DA2 output size may differ if source video had a
+                        # different aspect than x0 decode output).
+                        if _gt_cube.shape[-2:] != _dc_depth.shape[-2:]:
+                            _gt_cube = F.interpolate(
+                                _gt_cube.unsqueeze(1),  # (T, 1, H, W)
+                                size=_dc_depth.shape[-2:],
+                                mode='bilinear',
+                                align_corners=False,
+                            ).squeeze(1)
+
+                        # Per-frame SSI + multi-scale gradient loss. We feed the
+                        # already-extracted generated depth directly via a small
+                        # helper below; compute_depth_consistency_loss re-runs
+                        # the encoder which would double-compute.
+                        from toolkit.depth_consistency import ssi_l1, multiscale_grad_loss
+                        gen_d = _dc_depth[_b]  # (T, H, W)
+                        # Per-frame scalar loss, then mean over T.
+                        ssi_per = []
+                        grad_per = []
+                        for _t in range(T_out):
+                            _s, _, _ = ssi_l1(gen_d[_t], _gt_cube[_t])
+                            ssi_per.append(_s)
+                            grad_per.append(multiscale_grad_loss(
+                                gen_d[_t], _gt_cube[_t], scales=_dc_cfg.grad_scales
+                            ))
+                        ssi_mean = torch.stack(ssi_per).mean()
+                        grad_mean = torch.stack(grad_per).mean()
+                        loss_b = _dc_cfg.ssi_weight * ssi_mean + _dc_cfg.grad_weight * grad_mean
+
+                        _dc_total = _dc_total + loss_b
+                        _dc_ssi_sum += float(ssi_mean.detach())
+                        _dc_grad_sum += float(grad_mean.detach())
+                        _dc_n += 1
+                        if _dc_preview_b is None:
+                            _dc_preview_b = _b
+
+                    if _dc_n > 0:
+                        _dc_avg = _dc_total / _dc_n
+                        _dc_applied = _dc_cfg.loss_weight * _dc_avg
+                        loss = loss + _dc_applied
+                        self._last_depth_consistency_loss = _dc_avg.detach().item()
+                        self._last_depth_consistency_loss_applied = _dc_applied.detach().item()
+                        self._last_depth_consistency_ssi = _dc_ssi_sum / _dc_n
+                        self._last_depth_consistency_grad = _dc_grad_sum / _dc_n
+
+                        # Preview: animated webp [gen_rgb | gen_depth | gt_depth].
+                        _dc_preview_min_t = float(getattr(_dc_cfg, 'preview_min_t', 0.0))
+                        if (_dc_cfg.preview_every > 0
+                                and self.step_num % _dc_cfg.preview_every == 0
+                                and _dc_preview_b is not None
+                                and _dc_t[_dc_preview_b].item() >= _dc_preview_min_t):
+                            try:
+                                _gt_cube_p = batch.depth_gt_video_list[_dc_preview_b].to(
+                                    dtype=torch.float32
+                                )
+                                dc_preview_dir = os.path.join(self.save_root, 'depth_previews')
+                                os.makedirs(dc_preview_dir, exist_ok=True)
+                                _t_val = _dc_t[_dc_preview_b].item()
+                                out_path = os.path.join(
+                                    dc_preview_dir,
+                                    f'step{self.step_num:06d}_t{_t_val:.2f}.webp'
+                                )
+                                save_video_depth_preview(
+                                    out_path,
+                                    gen_rgb=_dc_frames[_dc_preview_b].permute(1, 0, 2, 3).detach(),
+                                    gen_depth=_dc_depth[_dc_preview_b].detach(),
+                                    gt_depth=_gt_cube_p,
+                                    fps=16,
+                                )
+                            except Exception as e:  # noqa: BLE001
+                                print_acc(f"  video depth preview failed: {e}")
 
         # E-LatentLPIPS perceptual loss in latent space
         if self.latent_perceptual_model is not None:

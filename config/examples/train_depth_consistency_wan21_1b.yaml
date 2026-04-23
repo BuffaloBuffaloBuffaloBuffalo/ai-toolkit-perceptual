@@ -1,0 +1,95 @@
+# Depth-consistency loss prototype — Wan 2.1 1.3B video training
+#
+# Trains at 256x256, 41 frames to validate the depth-consistency loss on
+# Wan 2.1 video. The loss:
+#   1. Recovers x0 from flow-matching noise_pred.
+#   2. Decodes the full latent cube with TAEHV (11M-param tiny decoder)
+#      to pixel frames in [0,1] — fits ~10GB peak for 100+ frames.
+#   3. Runs a frozen Depth-Anything-V2-Small perceptor per frame under
+#      gradient checkpointing (frames_per_chunk bounds peak memory).
+#   4. Compares against a per-frame GT depth cube cached from the source
+#      video at job start (DA2 native resolution, fp16 safetensors).
+#   5. Combines MiDaS scale-and-shift-invariant L1 with multi-scale
+#      gradient matching — the same formulation validated for the image
+#      path in scripts/depth_loss_validation.py.
+#
+# Requirements:
+#   - toolkit/taehv/taew2_1.pth must be present (gitignored; 22MB).
+#     Download from the Wan TAEHV release.
+#   - Depth-Anything-V2-Small is pulled from HF on first use (~100MB).
+#
+# This same config works with Wan 2.1 14B — only heavier on VRAM.
+# Wan 2.2 uses a different VAE and TAEHV does not apply there.
+---
+job: extension
+config:
+  name: "depth_consistency_wan21_1b_test"
+  process:
+    - type: 'sd_trainer'
+      training_folder: "output"
+      device: cuda:0
+      network:
+        type: "lora"
+        linear: 16
+        linear_alpha: 16
+      save:
+        dtype: float16
+        save_every: 100
+        max_step_saves_to_keep: 2
+      datasets:
+        - folder_path: "/path/to/video/folder"   # must contain .mp4/.webp videos
+          caption_ext: "txt"
+          caption_dropout_rate: 0.05
+          cache_latents_to_disk: true
+          resolution: [ 256 ]
+          num_frames: 41           # (41-1)/4+1 = 11 latent frames (Wan 2.1 temporal)
+          shrink_video_to_frames: true
+      train:
+        batch_size: 1
+        steps: 500
+        gradient_accumulation: 1
+        train_unet: true
+        train_text_encoder: false
+        gradient_checkpointing: true
+        noise_scheduler: "flowmatch"
+        timestep_type: 'sigmoid'
+        optimizer: "adamw8bit"
+        lr: 1e-4
+        optimizer_params:
+          weight_decay: 1e-4
+        skip_first_sample: true
+        dtype: bf16
+      model:
+        name_or_path: "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
+        arch: 'wan21'
+        quantize_te: true
+      # ----- Depth-consistency loss (Wan 2.1 video path) -----
+      depth_consistency:
+        loss_weight: 0.05          # start here; raise toward 0.1 if signal is weak
+        loss_min_t: 0.0
+        loss_max_t: 0.9            # skip very-clean end of schedule
+        ssi_weight: 1.0            # MiDaS scale-and-shift-invariant L1
+        grad_weight: 0.5           # multi-scale gradient matching
+        grad_scales: 4
+        mask_source: none          # per-frame subject masks not yet cached for video
+        grad_checkpoint: true
+        frames_per_chunk: 8        # chunk size for DA2 fwd+bwd — tune for VRAM
+        preview_every: 100         # save depth_previews/*.webp every N steps
+        preview_min_t: 0.0
+      sample:
+        sampler: "flowmatch"
+        sample_every: 100
+        width: 256
+        height: 256
+        num_frames: 41
+        fps: 15
+        prompts:
+          - "a person walking in an empty warehouse"
+        neg: ""
+        seed: 42
+        walk_seed: true
+        guidance_scale: 5
+        sample_steps: 30
+meta:
+  name: "[name]"
+  version: '1.0'

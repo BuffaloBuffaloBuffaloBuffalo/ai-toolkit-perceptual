@@ -187,7 +187,8 @@ aitk_db.db
 /.claude/
 /config/examples/generate_cartwheel_1024.yaml
 /test_data/
-/toolkit/taehv/
+/toolkit/taehv/*.pth
+/toolkit/taehv/__pycache__/
 
 # YOLO weights auto-downloaded by ultralytics at cwd
 /yolo*.pt

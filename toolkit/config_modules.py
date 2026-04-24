@@ -1142,6 +1142,8 @@ class DatasetConfig:
         self.latent_perceptual_loss_weight: Union[float, None] = kwargs.get('latent_perceptual_loss_weight', None)
         self.latent_perceptual_loss_min_t: Union[float, None] = kwargs.get('latent_perceptual_loss_min_t', None)
         self.latent_perceptual_loss_max_t: Union[float, None] = kwargs.get('latent_perceptual_loss_max_t', None)
+        self.depth_loss_min_t: Union[float, None] = kwargs.get('depth_loss_min_t', None)
+        self.depth_loss_max_t: Union[float, None] = kwargs.get('depth_loss_max_t', None)
         # Subject mask (Phase 2) per-dataset overrides: None inherits global SubjectMaskConfig
         self.background_loss_weight: Union[float, None] = kwargs.get('background_loss_weight', None)
         self.clothing_loss_weight: Union[float, None] = kwargs.get('clothing_loss_weight', None)

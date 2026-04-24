@@ -24,8 +24,33 @@ from tqdm import tqdm
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
 
-CACHE_VERSION_KEY = "depth_gt_v1"
-CACHE_VERSION_VIDEO_KEY = "depth_gt_video_v1"
+CACHE_VERSION_KEY = "depth_gt_v2"  # v2: cached from dataloader-transformed pixels
+CACHE_VERSION_VIDEO_KEY = "depth_gt_video_v2"
+
+
+def _apply_dataloader_transform(img, file_item):
+    """PIL → PIL: mirror dataloader_mixins.load_and_process_image 774-793.
+
+    Applies deterministic flips + bucket resize + crop when bucket params are
+    attached to ``file_item``. Falls back to the input image unchanged when
+    params are missing (non-bucketed datasets).
+    """
+    from PIL import Image as _PILImage
+    if getattr(file_item, 'flip_x', False):
+        img = img.transpose(_PILImage.FLIP_LEFT_RIGHT)
+    if getattr(file_item, 'flip_y', False):
+        img = img.transpose(_PILImage.FLIP_TOP_BOTTOM)
+    stw = getattr(file_item, 'scale_to_width', None)
+    sth = getattr(file_item, 'scale_to_height', None)
+    cx = getattr(file_item, 'crop_x', None)
+    cy = getattr(file_item, 'crop_y', None)
+    cw = getattr(file_item, 'crop_width', None)
+    ch = getattr(file_item, 'crop_height', None)
+    if None in (stw, sth, cx, cy, cw, ch):
+        return img
+    img = img.resize((int(stw), int(sth)), _PILImage.BICUBIC)
+    img = img.crop((int(cx), int(cy), int(cx) + int(cw), int(cy) + int(ch)))
+    return img
 
 
 class DifferentiableDepthEncoder(nn.Module):
@@ -313,7 +338,11 @@ def cache_depth_gt_embeddings(
                 file_item.depth_gt = data["depth_gt"].clone()
                 continue
 
-        pil_image = exif_transpose(Image.open(file_item.path)).convert("RGB")
+        # v2: run DA2 on the *dataloader-transformed* pixels so cached depth
+        # lines up with the training tensor the trainer actually sees. Mirrors
+        # toolkit/dataloader_mixins.load_and_process_image lines 774-793.
+        raw_pil = exif_transpose(Image.open(file_item.path)).convert("RGB")
+        pil_image = _apply_dataloader_transform(raw_pil, file_item)
         import numpy as np
 
         arr = torch.from_numpy(
@@ -485,11 +514,19 @@ def cache_video_depth_gt_embeddings(
                 file_item.depth_gt_video = data["depth_gt_video"].clone()
                 continue
 
-        # Read frames from disk.
+        # Read frames sequentially — cv2's CAP_PROP_FRAME_COUNT over-reports by
+        # 1 on some AVI containers and POS_FRAMES seek to the reported last
+        # frame fails silently. Sequential decode gives the actual count.
         cap = cv2.VideoCapture(file_item.path)
-        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        if total <= 0:
-            cap.release()
+        all_frames_bgr = []
+        while True:
+            ok, fr = cap.read()
+            if not ok:
+                break
+            all_frames_bgr.append(fr)
+        cap.release()
+        total = len(all_frames_bgr)
+        if total == 0:
             print(f"  -  Warning: cannot read video frames: {file_item.path}")
             continue
 
@@ -498,17 +535,35 @@ def cache_video_depth_gt_embeddings(
         else:
             indices = np.arange(total)
 
+        # v2: apply dataloader flip + resize + crop per frame so cached depth
+        # matches the training video tensor. Same chain used for images.
+        from PIL import Image as _PILImage
+        flip_x = bool(getattr(file_item, 'flip_x', False))
+        flip_y = bool(getattr(file_item, 'flip_y', False))
+
         frames = []
         for idx in indices:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
-            ok, fr = cap.read()
-            if not ok:
-                continue
-            fr = cv2.cvtColor(fr, cv2.COLOR_BGR2RGB)
-            frames.append(
-                torch.from_numpy(fr).float().permute(2, 0, 1) / 255.0
-            )
-        cap.release()
+            fr = all_frames_bgr[int(idx)]
+            fr_rgb = cv2.cvtColor(fr, cv2.COLOR_BGR2RGB)
+            pil = _PILImage.fromarray(fr_rgb)
+            # Per-frame transform (flip happens before resize+crop — same as
+            # dataloader_mixins.load_and_process_video).
+            if flip_x:
+                pil = pil.transpose(_PILImage.FLIP_LEFT_RIGHT)
+            if flip_y:
+                pil = pil.transpose(_PILImage.FLIP_TOP_BOTTOM)
+            stw = getattr(file_item, 'scale_to_width', None)
+            sth = getattr(file_item, 'scale_to_height', None)
+            cx = getattr(file_item, 'crop_x', None)
+            cy = getattr(file_item, 'crop_y', None)
+            cw = getattr(file_item, 'crop_width', None)
+            ch = getattr(file_item, 'crop_height', None)
+            if None not in (stw, sth, cx, cy, cw, ch):
+                pil = pil.resize((int(stw), int(sth)), _PILImage.BICUBIC)
+                pil = pil.crop((int(cx), int(cy),
+                                int(cx) + int(cw), int(cy) + int(ch)))
+            frame_arr = np.asarray(pil, dtype=np.float32) / 255.0
+            frames.append(torch.from_numpy(frame_arr).permute(2, 0, 1))
 
         if not frames:
             print(f"  -  Warning: no frames read from {file_item.path}")

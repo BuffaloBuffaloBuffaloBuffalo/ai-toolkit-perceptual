@@ -118,6 +118,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self._bp_loss_epoch_sum = 0.0
         self._bp_loss_epoch_count = 0
         self._pending_bp_loss_epoch_avg = None
+        # depth consistency loss epoch accumulation
+        self._dc_loss_epoch_sum = 0.0
+        self._dc_loss_epoch_count = 0
+        self._pending_dc_loss_epoch_avg = None
         # start at 1 so we can do a sample at the start
         self.grad_accumulation_step = 1
         # if true, then we do not do an optimizer step. We are accumulating gradients
@@ -2242,6 +2246,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
                                     self._pending_bp_loss_epoch_avg = self._bp_loss_epoch_sum / self._bp_loss_epoch_count
                                     self._bp_loss_epoch_sum = 0.0
                                     self._bp_loss_epoch_count = 0
+                                if self._dc_loss_epoch_count > 0:
+                                    self._pending_dc_loss_epoch_avg = self._dc_loss_epoch_sum / self._dc_loss_epoch_count
+                                    self._dc_loss_epoch_sum = 0.0
+                                    self._dc_loss_epoch_count = 0
                                 if self.train_config.gradient_accumulation_steps == -1:
                                     # if we are accumulating for an entire epoch, trigger a step
                                     self.is_grad_accumulation_step = False
@@ -2349,6 +2357,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     if 'body_proportion_loss' in loss_dict:
                         self._bp_loss_epoch_sum += loss_dict['body_proportion_loss']
                         self._bp_loss_epoch_count += 1
+                    if 'depth_consistency_loss' in loss_dict:
+                        self._dc_loss_epoch_sum += loss_dict['depth_consistency_loss']
+                        self._dc_loss_epoch_count += 1
 
                     prog_bar_string = f"lr: {learning_rate:.1e}"
                     for key, value in loss_dict.items():
@@ -2420,6 +2431,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                                         self.writer.add_scalar("id_sim_epoch_avg", self._pending_id_sim_epoch_avg, self.step_num)
                                     if self._pending_bp_loss_epoch_avg is not None:
                                         self.writer.add_scalar("body_proportion_loss_epoch_avg", self._pending_bp_loss_epoch_avg, self.step_num)
+                                    if self._pending_dc_loss_epoch_avg is not None:
+                                        self.writer.add_scalar("depth_consistency_loss_epoch_avg", self._pending_dc_loss_epoch_avg, self.step_num)
                                 if self.progress_bar is not None:
                                     self.progress_bar.unpause()
 
@@ -2449,6 +2462,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
                             if self._pending_bp_loss_epoch_avg is not None:
                                 self.logger.log({'loss/body_proportion_loss_epoch_avg': self._pending_bp_loss_epoch_avg})
                                 self._pending_bp_loss_epoch_avg = None
+                            if self._pending_dc_loss_epoch_avg is not None:
+                                self.logger.log({'loss/depth_consistency_loss_epoch_avg': self._pending_dc_loss_epoch_avg})
+                                self._pending_dc_loss_epoch_avg = None
                     elif self.logging_config.log_every is None:
                         if self.accelerator.is_main_process:
                             # log every step
@@ -2475,6 +2491,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
                             if self._pending_bp_loss_epoch_avg is not None:
                                 self.logger.log({'loss/body_proportion_loss_epoch_avg': self._pending_bp_loss_epoch_avg})
                                 self._pending_bp_loss_epoch_avg = None
+                            if self._pending_dc_loss_epoch_avg is not None:
+                                self.logger.log({'loss/depth_consistency_loss_epoch_avg': self._pending_dc_loss_epoch_avg})
+                                self._pending_dc_loss_epoch_avg = None
 
 
                     if self.performance_log_every > 0 and self.step_num % self.performance_log_every == 0:

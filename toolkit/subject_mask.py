@@ -43,7 +43,7 @@ BODY_CLASSES = {"Hair", "Face", "Left-arm", "Right-arm", "Left-leg", "Right-leg"
 CLOTHING_CLASSES = {"Hat", "Sunglasses", "Upper-clothes", "Skirt", "Pants",
                     "Dress", "Belt", "Left-shoe", "Right-shoe", "Bag", "Scarf"}
 
-CACHE_VERSION_KEY = "subject_mask_v1"
+CACHE_VERSION_KEY = "subject_mask_v2"  # v2: cached from dataloader-transformed pixels (flip+scale+crop), not raw file
 
 
 # ============================================================
@@ -315,6 +315,62 @@ def _downsample_bool(mask: np.ndarray, target_hw: int) -> torch.Tensor:
     return (t.squeeze(0).squeeze(0) > 0.5).to(torch.bool)
 
 
+def _resize_bool(mask: np.ndarray, out_h: int, out_w: int) -> torch.Tensor:
+    """Nearest-neighbor resize a bool mask to (out_h, out_w). CPU torch.bool."""
+    t = torch.from_numpy(mask.astype(np.uint8)).float().unsqueeze(0).unsqueeze(0)
+    t = F.interpolate(t, size=(out_h, out_w), mode="nearest")
+    return (t.squeeze(0).squeeze(0) > 0.5).to(torch.bool)
+
+
+def _apply_dataloader_transform(
+    img,  # PIL.Image.Image in RGB
+    file_item: 'FileItemDTO',
+):
+    """Mirror of dataloader_mixins.load_and_process_image lines 774-793.
+
+    Applies deterministic flips + bucket resize + crop. Falls back to the
+    input image unchanged if bucket params aren't attached (non-bucketing
+    datasets or pre-setup_buckets invocations).
+    """
+    from PIL import Image as _Image
+
+    # Per-file deterministic flips (if configured via dataset augments).
+    if getattr(file_item, 'flip_x', False):
+        img = img.transpose(_Image.FLIP_LEFT_RIGHT)
+    if getattr(file_item, 'flip_y', False):
+        img = img.transpose(_Image.FLIP_TOP_BOTTOM)
+
+    stw = getattr(file_item, 'scale_to_width', None)
+    sth = getattr(file_item, 'scale_to_height', None)
+    cx = getattr(file_item, 'crop_x', None)
+    cy = getattr(file_item, 'crop_y', None)
+    cw = getattr(file_item, 'crop_width', None)
+    ch = getattr(file_item, 'crop_height', None)
+
+    if None in (stw, sth, cx, cy, cw, ch):
+        # No bucket params — use raw. Caller will downsample to a square.
+        return img
+
+    img = img.resize((int(stw), int(sth)), _Image.BICUBIC)
+    img = img.crop((int(cx), int(cy), int(cx) + int(cw), int(cy) + int(ch)))
+    return img
+
+
+def _mask_output_hw(file_item: 'FileItemDTO', fallback_hw: int) -> tuple:
+    """Preferred output (H, W) for the cached mask.
+
+    If bucket crop dims are known, cache at (crop_h, crop_w) so the mask
+    matches the training-tensor aspect ratio and F.interpolate to the latent
+    grid at training time is a straight resize. Falls back to a square
+    (fallback_hw, fallback_hw) when bucket params are absent.
+    """
+    cw = getattr(file_item, 'crop_width', None)
+    ch = getattr(file_item, 'crop_height', None)
+    if cw is not None and ch is not None:
+        return int(ch), int(cw)
+    return int(fallback_hw), int(fallback_hw)
+
+
 def cache_subject_masks(
     file_items: List['FileItemDTO'],
     config: 'SubjectMaskConfig',
@@ -381,12 +437,21 @@ def cache_subject_masks(
         if extractor is None:
             extractor = SubjectMaskExtractor(config)
 
-        pil_image = exif_transpose(Image.open(file_item.path)).convert('RGB')
+        # v2: extract masks from the *dataloader-transformed* pixels so cached
+        # masks align with the training tensor (and thus latent grid). Applies
+        # the same flip → resize → crop chain as
+        # toolkit/dataloader_mixins.load_and_process_image (lines 774-793).
+        raw_pil = exif_transpose(Image.open(file_item.path)).convert('RGB')
+        pil_image = _apply_dataloader_transform(raw_pil, file_item)
         masks = extractor.extract(pil_image)
 
-        person_t = _downsample_bool(masks['person'], target_hw)
-        body_t = _downsample_bool(masks['body'], target_hw)
-        clothing_t = _downsample_bool(masks['clothing'], target_hw)
+        # Cache at training-tensor dimensions (crop_w, crop_h) when known.
+        # No square downsample — preserves aspect ratio so F.interpolate to
+        # the latent grid at training time is a straight resize.
+        out_h, out_w = _mask_output_hw(file_item, fallback_hw=target_hw)
+        person_t = _resize_bool(masks['person'], out_h, out_w)
+        body_t = _resize_bool(masks['body'], out_h, out_w)
+        clothing_t = _resize_bool(masks['clothing'], out_h, out_w)
 
         if not person_t.any():
             empty_count += 1

@@ -160,6 +160,7 @@ class SDTrainer(BaseSDTrainProcess):
         self._last_depth_consistency_loss_applied: Optional[float] = None
         self._last_depth_consistency_ssi: Optional[float] = None
         self._last_depth_consistency_grad: Optional[float] = None
+        self._last_depth_loss_bins: Optional[dict] = None
         self._last_identity_loss: Optional[float] = None
         self._last_landmark_loss: Optional[float] = None
         self._last_body_proportion_loss: Optional[float] = None
@@ -1906,6 +1907,14 @@ class SDTrainer(BaseSDTrainProcess):
                             orig_h = float(fi.height)
                             bx1, by1, bx2, by2 = raw_bbox.float()
 
+                            # Dataloader applies deterministic flips before
+                            # scale+crop; mirror that here in raw coords so the
+                            # bbox lands in the correct half of the training tensor.
+                            if getattr(fi, 'flip_x', False):
+                                bx1, bx2 = orig_w - bx2, orig_w - bx1
+                            if getattr(fi, 'flip_y', False):
+                                by1, by2 = orig_h - by2, orig_h - by1
+
                             stw = float(getattr(fi, 'scale_to_width', None) or orig_w)
                             sth = float(getattr(fi, 'scale_to_height', None) or orig_h)
                             bx1 = bx1 * (stw / orig_w)
@@ -2270,6 +2279,11 @@ class SDTrainer(BaseSDTrainProcess):
                                 orig_h = float(fi.height)
                                 pbx1, pby1, pbx2, pby2 = raw_bbox.float()
 
+                                if getattr(fi, 'flip_x', False):
+                                    pbx1, pbx2 = orig_w - pbx2, orig_w - pbx1
+                                if getattr(fi, 'flip_y', False):
+                                    pby1, pby2 = orig_h - pby2, orig_h - pby1
+
                                 stw = float(getattr(fi, 'scale_to_width', None) or orig_w)
                                 sth = float(getattr(fi, 'scale_to_height', None) or orig_h)
                                 pbx1 = pbx1 * (stw / orig_w)
@@ -2459,6 +2473,10 @@ class SDTrainer(BaseSDTrainProcess):
                                 fi = batch.file_items[idx]
                                 orig_w, orig_h = float(fi.width), float(fi.height)
                                 pbx1, pby1, pbx2, pby2 = raw_pb.float()
+                                if getattr(fi, 'flip_x', False):
+                                    pbx1, pbx2 = orig_w - pbx2, orig_w - pbx1
+                                if getattr(fi, 'flip_y', False):
+                                    pby1, pby2 = orig_h - pby2, orig_h - pby1
                                 stw = float(getattr(fi, 'scale_to_width', None) or orig_w)
                                 sth = float(getattr(fi, 'scale_to_height', None) or orig_h)
                                 pbx1 = pbx1 * (stw / orig_w)
@@ -2807,7 +2825,19 @@ class SDTrainer(BaseSDTrainProcess):
             _dc_cfg = self.depth_consistency_config
             _dc_nt = float(self.sd.noise_scheduler.config.num_train_timesteps)
             _dc_t = timesteps.float() / _dc_nt
-            _dc_active = (_dc_t > _dc_cfg.loss_min_t) & (_dc_t < _dc_cfg.loss_max_t)
+            # Per-sample t-band — matches identity-loss pattern: per-item
+            # overrides from the batch fall back to the global config.
+            _dc_min_list = getattr(batch, 'depth_loss_min_t_list', None) or [None] * _dc_t.shape[0]
+            _dc_max_list = getattr(batch, 'depth_loss_max_t_list', None) or [None] * _dc_t.shape[0]
+            _dc_min = torch.tensor(
+                [v if v is not None else _dc_cfg.loss_min_t for v in _dc_min_list],
+                device=_dc_t.device, dtype=_dc_t.dtype,
+            )
+            _dc_max = torch.tensor(
+                [v if v is not None else _dc_cfg.loss_max_t for v in _dc_max_list],
+                device=_dc_t.device, dtype=_dc_t.dtype,
+            )
+            _dc_active = (_dc_t > _dc_min) & (_dc_t < _dc_max)
 
             if _dc_active.any():
                 # Recover x0 prediction from model output (same math as the
@@ -2896,6 +2926,15 @@ class SDTrainer(BaseSDTrainProcess):
                     _dc_grad_sum += float(_dc_grad_i)
                     _dc_n += 1
 
+                    # Per-sample depth loss binned by timestep (0.1 bands) —
+                    # mirrors identity's id_sim_t00..t90 so the dashboard shows
+                    # depth loss evolution per noise level.
+                    if self._last_depth_loss_bins is None:
+                        self._last_depth_loss_bins = {}
+                    _dc_bin_start = int(_dc_t[_dc_i].item() * 10) / 10.0
+                    _dc_bin_key = f'depth_loss_t{int(_dc_bin_start*100):02d}'
+                    self._last_depth_loss_bins[_dc_bin_key] = float(_dc_loss_i)
+
                     # Preview: save [GT RGB | GT depth | Pred RGB | Pred depth] every N steps.
                     if (_dc_cfg.preview_every > 0
                             and self.step_num % _dc_cfg.preview_every == 0
@@ -2946,7 +2985,17 @@ class SDTrainer(BaseSDTrainProcess):
             _dc_cfg = self.depth_consistency_config
             _dc_nt = float(self.sd.noise_scheduler.config.num_train_timesteps)
             _dc_t = timesteps.float() / _dc_nt
-            _dc_active = (_dc_t > _dc_cfg.loss_min_t) & (_dc_t < _dc_cfg.loss_max_t)
+            _dc_min_list = getattr(batch, 'depth_loss_min_t_list', None) or [None] * _dc_t.shape[0]
+            _dc_max_list = getattr(batch, 'depth_loss_max_t_list', None) or [None] * _dc_t.shape[0]
+            _dc_min = torch.tensor(
+                [v if v is not None else _dc_cfg.loss_min_t for v in _dc_min_list],
+                device=_dc_t.device, dtype=_dc_t.dtype,
+            )
+            _dc_max = torch.tensor(
+                [v if v is not None else _dc_cfg.loss_max_t for v in _dc_max_list],
+                device=_dc_t.device, dtype=_dc_t.dtype,
+            )
+            _dc_active = (_dc_t > _dc_min) & (_dc_t < _dc_max)
 
             if _dc_active.any():
                 # Lazy-load TAEHV on first video step — keeps image-only runs lean.
@@ -3052,6 +3101,13 @@ class SDTrainer(BaseSDTrainProcess):
                         _dc_ssi_sum += float(ssi_mean.detach())
                         _dc_grad_sum += float(grad_mean.detach())
                         _dc_n += 1
+
+                        # Per-sample depth loss binned by timestep (0.1 bands).
+                        if self._last_depth_loss_bins is None:
+                            self._last_depth_loss_bins = {}
+                        _dc_bin_start = int(_dc_t[_b].item() * 10) / 10.0
+                        _dc_bin_key = f'depth_loss_t{int(_dc_bin_start*100):02d}'
+                        self._last_depth_loss_bins[_dc_bin_key] = float(loss_b.detach())
                         if _dc_preview_b is None:
                             _dc_preview_b = _b
 
@@ -3721,6 +3777,11 @@ class SDTrainer(BaseSDTrainProcess):
                         orig_w = float(fi.width)
                         orig_h = float(fi.height)
                         bx1, by1, bx2, by2 = [float(v) for v in raw_bbox]
+                        # Apply dataloader flips in raw coords before scale+crop.
+                        if getattr(fi, 'flip_x', False):
+                            bx1, bx2 = orig_w - bx2, orig_w - bx1
+                        if getattr(fi, 'flip_y', False):
+                            by1, by2 = orig_h - by2, orig_h - by1
                         # scale to resized coords
                         stw = float(getattr(fi, 'scale_to_width', None) or orig_w)
                         sth = float(getattr(fi, 'scale_to_height', None) or orig_h)
@@ -4819,6 +4880,10 @@ class SDTrainer(BaseSDTrainProcess):
         if self._last_depth_consistency_grad is not None:
             loss_dict['depth_consistency_grad'] = self._last_depth_consistency_grad
             self._last_depth_consistency_grad = None
+        if self._last_depth_loss_bins is not None:
+            for bin_key, loss_val in self._last_depth_loss_bins.items():
+                loss_dict[bin_key] = loss_val
+            self._last_depth_loss_bins = None
         if self._last_timestep is not None:
             loss_dict['timestep'] = self._last_timestep
             self._last_timestep = None

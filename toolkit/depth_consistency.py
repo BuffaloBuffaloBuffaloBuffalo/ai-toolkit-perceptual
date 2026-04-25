@@ -259,11 +259,13 @@ def render_depth_preview(
     d_gt: torch.Tensor,
     mask: Optional[torch.Tensor] = None,
 ) -> "Image.Image":
-    """Render a 4-panel composite: [GT RGB | GT depth | Pred RGB | Pred depth].
+    """Render a composite preview strip.
+
+    Without a mask: ``[GT RGB | GT depth | Pred RGB | Pred depth]`` (4 panels).
+    With a mask: a 5th ``Mask`` panel is appended (white = included).
 
     Depth maps are percentile-normalized (p2-p98) to grayscale, then color
-    inverted so nearer surfaces appear brighter.  When a mask is provided,
-    an outline is drawn on each RGB panel.
+    inverted so nearer surfaces appear brighter.
     """
     import numpy as np
     from PIL import Image, ImageDraw
@@ -282,16 +284,27 @@ def render_depth_preview(
     gt_pil = _depth_to_pil(d_gt, (W, H))
     pred_depth_pil = _depth_to_pil(d_pred, (W, H))
 
-    # Composite
-    combo = Image.new("RGB", (W * 4, H), (0, 0, 0))
-    combo.paste(ref_pil, (0, 0))
-    combo.paste(gt_pil.convert("RGB"), (W, 0))
-    combo.paste(pred_pil, (W * 2, 0))
-    combo.paste(pred_depth_pil.convert("RGB"), (W * 3, 0))
+    panels = [
+        ("GT RGB", ref_pil),
+        ("GT depth", gt_pil.convert("RGB")),
+        ("Pred RGB", pred_pil),
+        ("Pred depth", pred_depth_pil.convert("RGB")),
+    ]
+
+    if mask is not None:
+        m = mask.detach().float().cpu().numpy()
+        if m.ndim == 3:
+            m = m[0]
+        m = np.clip(m, 0.0, 1.0)
+        mask_pil = Image.fromarray((m * 255).astype(np.uint8)).resize((W, H), Image.BICUBIC).convert("RGB")
+        panels.append(("Mask", mask_pil))
+
+    combo = Image.new("RGB", (W * len(panels), H), (0, 0, 0))
+    for i, (_, panel_pil) in enumerate(panels):
+        combo.paste(panel_pil, (W * i, 0))
 
     draw = ImageDraw.Draw(combo)
-    labels = ["GT RGB", "GT depth", "Pred RGB", "Pred depth"]
-    for i, label in enumerate(labels):
+    for i, (label, _) in enumerate(panels):
         draw.text((W * i + 4, 4), label, fill=(255, 255, 0))
 
     return combo

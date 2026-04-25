@@ -189,7 +189,7 @@ class SubjectMaskExtractor:
         body_parse = np.isin(class_map, list(self._body_ids))
         clothing_parse = np.isin(class_map, list(self._clothing_ids))
 
-        body_mask = _smooth_mask(body_parse, close_radius=2)
+        body_mask = _smooth_mask(body_parse, close_radius=int(self.config.body_close_radius))
         clothing_mask = _smooth_mask(clothing_parse, close_radius=2)
         # person = body ∪ clothing (pure SegFormer), then closed + hole-filled.
         person_mask = _smooth_mask(body_mask | clothing_mask, close_radius=3)
@@ -249,6 +249,66 @@ def _colormap_from_classes(class_map: np.ndarray, n_classes: int) -> np.ndarray:
     for i in range(1, n_classes):
         pal[i] = rng.randint(40, 230, 3)
     return pal[class_map.astype(np.int32)]
+
+
+def _render_preview_tile_from_cache(
+    pil_image,
+    person_t: torch.Tensor,
+    body_t: torch.Tensor,
+    clothing_t: torch.Tensor,
+    col_width: int = 380,
+):
+    """4-panel tile from cached bool masks: image | person | body | clothing.
+
+    Used for upfront QC previews on cache hit, where the SegFormer ``class_map``
+    isn't stored. Mirrors :func:`_render_preview_tile` minus the parse colormap.
+    """
+    from PIL import Image, ImageDraw, ImageFont
+    img_np = np.array(pil_image)
+    H, W = img_np.shape[:2]
+
+    def _bool_to_np(t: torch.Tensor) -> np.ndarray:
+        # _overlay_mask expects 0/1 (it does alpha*m); 0/255 saturates the blend.
+        m = t.detach().cpu().to(torch.uint8).numpy()
+        if m.shape != (H, W):
+            # Resize via 0/255 so PIL.NEAREST works on visible values, then rebinarize.
+            m255 = (m * 255)
+            m = np.array(Image.fromarray(m255).resize((W, H), Image.NEAREST))
+            m = (m > 127).astype(np.uint8)
+        return m
+
+    person = _bool_to_np(person_t)
+    body = _bool_to_np(body_t)
+    clothing = _bool_to_np(clothing_t)
+
+    ov_person = _overlay_mask(img_np, person, (100, 180, 255))
+    ov_body = _overlay_mask(img_np, body, (255, 120, 80))
+    ov_clothing = _overlay_mask(img_np, clothing, (120, 255, 120))
+
+    panels = [img_np, ov_person, ov_body, ov_clothing]
+    labels = ["Original", "Person", "Body (hair+face+limbs)", "Clothing"]
+
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 14)
+    except Exception:
+        font = ImageFont.load_default()
+
+    resized = []
+    for a in panels:
+        r = col_width / a.shape[1]
+        new_h = int(a.shape[0] * r)
+        resized.append(np.array(Image.fromarray(a).resize((col_width, new_h), Image.BILINEAR)))
+    h_max = max(a.shape[0] for a in resized)
+    label_h = 26
+    canvas = Image.new("RGB", (col_width * len(panels) + 8 * (len(panels) - 1),
+                               h_max + label_h), (20, 20, 20))
+    draw = ImageDraw.Draw(canvas)
+    x = 0
+    for a, lbl in zip(resized, labels):
+        canvas.paste(Image.fromarray(a), (x, label_h))
+        draw.text((x + 6, 6), lbl, fill=(230, 230, 230), font=font)
+        x += col_width + 8
+    return canvas
 
 
 def _render_preview_tile(pil_image, masks: Dict[str, np.ndarray], n_classes: int,
@@ -424,13 +484,31 @@ def cache_subject_masks(
                 data = {}
             has_keys = all(k in data for k in ('person', 'body', 'clothing'))
             has_version = CACHE_VERSION_KEY in data
-            if has_keys and has_version:
+            # Body smoothing radius is baked into the cached masks — invalidate
+            # when the config value changes so users can iterate on it.
+            cached_bcr = int(data['body_close_radius'].item()) if 'body_close_radius' in data else 2
+            radius_match = cached_bcr == int(config.body_close_radius)
+            if has_keys and has_version and radius_match:
                 person = (data['person'].clone() > 127).to(torch.bool)
                 body = (data['body'].clone() > 127).to(torch.bool)
                 clothing = (data['clothing'].clone() > 127).to(torch.bool)
                 file_item.subject_mask = person
                 file_item.body_mask = body
                 file_item.clothing_mask = clothing
+
+                # Upfront QC preview: render from cache if missing on disk.
+                # Skips when the .png already exists so re-runs are free.
+                if getattr(config, 'save_debug_previews', False) and preview_dir:
+                    os.makedirs(preview_dir, exist_ok=True)
+                    preview_path = os.path.join(preview_dir, f'{stem}.png')
+                    if not os.path.exists(preview_path):
+                        try:
+                            raw_pil = exif_transpose(Image.open(file_item.path)).convert('RGB')
+                            pil_image = _apply_dataloader_transform(raw_pil, file_item)
+                            tile = _render_preview_tile_from_cache(pil_image, person, body, clothing)
+                            tile.save(preview_path)
+                        except Exception as e:
+                            print(f"  -  Warning: failed to render preview for {stem}: {e}")
                 continue  # cache hit — no need to run models
 
         # ------------------------------------------------------------- cache miss
@@ -465,6 +543,7 @@ def cache_subject_masks(
             'person': (person_t.to(torch.uint8) * 255),
             'body': (body_t.to(torch.uint8) * 255),
             'clothing': (clothing_t.to(torch.uint8) * 255),
+            'body_close_radius': torch.tensor([float(config.body_close_radius)]),
             CACHE_VERSION_KEY: torch.ones(1),
         }
         save_file(save_data, cache_path)

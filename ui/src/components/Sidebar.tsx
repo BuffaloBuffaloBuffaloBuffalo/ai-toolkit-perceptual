@@ -1,5 +1,5 @@
 import Link from 'next/link';
-import { Home, Settings, BrainCircuit, Images, Plus } from 'lucide-react';
+import { Home, Settings, BrainCircuit, Images, Plus, Wrench } from 'lucide-react';
 import { FaXTwitter, FaDiscord, FaYoutube } from 'react-icons/fa6';
 
 const Sidebar = () => {
@@ -8,6 +8,7 @@ const Sidebar = () => {
     { name: 'New Job', href: '/jobs/new', icon: Plus },
     { name: 'Training Queue', href: '/jobs', icon: BrainCircuit },
     { name: 'Datasets', href: '/datasets', icon: Images },
+    { name: 'Dataset Tools', href: '/dataset-tools', icon: Wrench },
     { name: 'Settings', href: '/settings', icon: Settings },
   ];
 

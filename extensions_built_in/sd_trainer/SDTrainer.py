@@ -186,7 +186,7 @@ class SDTrainer(BaseSDTrainProcess):
         self._last_id_sim: Optional[float] = None
         self._last_id_sim_bins: Optional[dict] = None
         self._last_id_clean_target: Optional[float] = None
-        self._last_id_shortfall: Optional[float] = None
+        self._last_id_clean_delta: Optional[float] = None
         self._last_pure_noise_cos: Optional[float] = None
         self._id_face_detector = None  # SCRFD detector for x0 quality gating
         self._last_shape_sim_bins: Optional[dict] = None
@@ -2102,8 +2102,8 @@ class SDTrainer(BaseSDTrainProcess):
                             if _has_clean_targets:
                                 valid_clean = clean_cos * valid_mask.float()
                                 self._last_id_clean_target = (valid_clean.sum() / raw_count).item()
-                                raw_shortfall = torch.clamp(clean_cos - cos_sim, min=0.0) * valid_mask.float()
-                                self._last_id_shortfall = (raw_shortfall.sum() / raw_count).item()
+                                raw_delta = (cos_sim - clean_cos) * valid_mask.float()
+                                self._last_id_clean_delta = (raw_delta.sum() / raw_count).item()
                             if self._last_id_sim_bins is None:
                                 self._last_id_sim_bins = {}
                             for idx in range(cos_sim.shape[0]):
@@ -4893,9 +4893,9 @@ class SDTrainer(BaseSDTrainProcess):
         if self._last_id_clean_target is not None:
             loss_dict['id_clean_target'] = self._last_id_clean_target
             self._last_id_clean_target = None
-        if self._last_id_shortfall is not None:
-            loss_dict['id_shortfall'] = self._last_id_shortfall
-            self._last_id_shortfall = None
+        if self._last_id_clean_delta is not None:
+            loss_dict['id_clean_delta'] = self._last_id_clean_delta
+            self._last_id_clean_delta = None
         if self._last_id_sim_bins is not None:
             for bin_key, sim_val in self._last_id_sim_bins.items():
                 loss_dict[bin_key] = sim_val

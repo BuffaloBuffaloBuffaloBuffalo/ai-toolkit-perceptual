@@ -987,6 +987,10 @@ class SubjectMaskConfig:
         self.segformer_res: int = kwargs.get('segformer_res', 768)
         self.cache_resolution: int = kwargs.get('cache_resolution', 256)
         self.dtype: str = kwargs.get('dtype', 'fp16')
+        # Morphological close radius applied to the body mask after SegFormer
+        # parsing — higher values fill blotchy gaps inside limbs/hair at the
+        # cost of boundary precision. Changing this invalidates cached masks.
+        self.body_close_radius: int = kwargs.get('body_close_radius', 2)
         # Phase 2 knobs — present but unused by training yet
         self.background_loss_weight: Optional[float] = kwargs.get('background_loss_weight', None)
         self.clothing_loss_weight: Optional[float] = kwargs.get('clothing_loss_weight', None)

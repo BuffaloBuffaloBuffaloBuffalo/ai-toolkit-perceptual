@@ -1142,6 +1142,18 @@ export default function SimpleJob({
                       max={1024}
                     />
                     <NumberInput
+                      label="Body Close Radius"
+                      docKey="subject_mask.body_close_radius"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].subject_mask?.body_close_radius ?? 2}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].subject_mask.body_close_radius')
+                      }
+                      placeholder="2 (higher fills blotchy gaps; re-extracts cache)"
+                      min={0}
+                      max={12}
+                    />
+                    <NumberInput
                       label="Background Loss Weight"
                       docKey="subject_mask.background_loss_weight"
                       className="pt-3"

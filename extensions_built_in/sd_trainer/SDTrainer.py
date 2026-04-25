@@ -191,6 +191,15 @@ class SDTrainer(BaseSDTrainProcess):
         self._id_face_detector = None  # SCRFD detector for x0 quality gating
         self._last_shape_sim_bins: Optional[dict] = None
 
+        # Bin dicts above hold a running-mean accumulator per t-band:
+        #   {bin_key: {'sum': float, 'count': int}}.
+        # See `_bin_update` for the per-sample writer and `_bin_finalize` for
+        # the flush-time mean. Bins are reset at the start of every optimizer
+        # step in `hook_train_loop` so that:
+        #   - same-bin samples within a microbatch don't overwrite each other,
+        #   - cross-microbatch (gradient_accumulation_steps>1) samples merge,
+        #   - bins from a prior optimizer step never bleed into the next one.
+
         # E-LatentLPIPS perceptual loss
         self.latent_perceptual_model = None
         self._latent_perceptual_loss_accumulator: float = 0.0
@@ -215,6 +224,45 @@ class SDTrainer(BaseSDTrainProcess):
         else:
             raise ValueError(f"Unknown guidance loss target type {type(self.train_config.guidance_loss_target)}")
 
+
+    # -------------------------------------------------------------
+    # Per-t-band running mean helpers (display-only metrics)
+    #
+    # Bin storage shape: {bin_key: {'sum': float, 'count': int}}.
+    # `_bin_update` writes; `_bin_finalize` collapses to {key: mean}.
+    # These ONLY touch metric scalars; they never participate in the
+    # loss tensor or its gradient.
+    # -------------------------------------------------------------
+    @staticmethod
+    def _bin_update(bins: dict, bin_key: str, value: float) -> None:
+        slot = bins.get(bin_key)
+        if slot is None:
+            bins[bin_key] = {'sum': float(value), 'count': 1}
+        else:
+            slot['sum'] += float(value)
+            slot['count'] += 1
+
+    @staticmethod
+    def _bin_finalize(bins: Optional[dict]) -> dict:
+        if not bins:
+            return {}
+        out: dict = {}
+        for k, slot in bins.items():
+            cnt = slot.get('count', 0) if isinstance(slot, dict) else 0
+            if cnt > 0:
+                out[k] = slot['sum'] / cnt
+        return out
+
+    def _reset_step_bins(self) -> None:
+        """Reset all per-t-band bin accumulators at the start of a fresh
+        optimizer step. Called from `hook_train_loop` so that bins span a
+        full optimizer step (all gradient-accumulation microbatches), then
+        flush cleanly via `get_loss_metrics`."""
+        self._last_id_sim_bins = None
+        self._last_shape_sim_bins = None
+        self._last_bp_sim_bins = None
+        self._last_bsh_sim_bins = None
+        self._last_depth_loss_bins = None
 
     def before_model_load(self):
         pass
@@ -2170,7 +2218,11 @@ class SDTrainer(BaseSDTrainProcess):
                                     t_val = t_ratio[idx].item()
                                     bin_start = int(t_val * 10) / 10.0
                                     bin_key = f'id_sim_t{int(bin_start*100):02d}'
-                                    self._last_id_sim_bins[bin_key] = cos_sim[idx].item()
+                                    self._bin_update(
+                                        self._last_id_sim_bins,
+                                        bin_key,
+                                        cos_sim[idx].item(),
+                                    )
                         # save decoded x0 predictions + ArcFace crops to visualize identity pipeline
                         if valid_mask.any():
                             id_preview_dir = os.path.join(self.save_root, 'id_previews')
@@ -2313,7 +2365,11 @@ class SDTrainer(BaseSDTrainProcess):
                                     t_val = t_ratio[idx].item()
                                     bin_start = int(t_val * 10) / 10.0
                                     bin_key = f'shape_sim_t{int(bin_start*100):02d}'
-                                    self._last_shape_sim_bins[bin_key] = lm_loss_per_sample[idx].item()
+                                    self._bin_update(
+                                        self._last_shape_sim_bins,
+                                        bin_key,
+                                        lm_loss_per_sample[idx].item(),
+                                    )
 
                 # --- Body proportion loss (ViTPose bone-length ratio matching) ---
                 if _need_body_proportion_loss:
@@ -2432,7 +2488,11 @@ class SDTrainer(BaseSDTrainProcess):
                                     t_val = t_ratio[idx].item()
                                     bin_start = int(t_val * 10) / 10.0
                                     bin_key = f'bp_sim_t{int(bin_start*100):02d}'
-                                    self._last_bp_sim_bins[bin_key] = 1.0 - bp_loss_per_sample[idx].item()
+                                    self._bin_update(
+                                        self._last_bp_sim_bins,
+                                        bin_key,
+                                        1.0 - bp_loss_per_sample[idx].item(),
+                                    )
 
                             # Save skeleton preview images (prediction + reference side-by-side)
                             from toolkit.body_id import draw_skeleton_overlay
@@ -2632,7 +2692,11 @@ class SDTrainer(BaseSDTrainProcess):
                                     t_val = t_ratio[idx].item()
                                     bin_start = int(t_val * 10) / 10.0
                                     bin_key = f'bsh_sim_t{int(bin_start*100):02d}'
-                                    self._last_bsh_sim_bins[bin_key] = bsh_cos[idx].item()
+                                    self._bin_update(
+                                        self._last_bsh_sim_bins,
+                                        bin_key,
+                                        bsh_cos[idx].item(),
+                                    )
 
                 # --- Normal map loss (Sapiens surface normal matching) ---
                 if _need_normal_loss and nrm_noise_mask.any():
@@ -2992,7 +3056,11 @@ class SDTrainer(BaseSDTrainProcess):
                         self._last_depth_loss_bins = {}
                     _dc_bin_start = int(_dc_t[_dc_i].item() * 10) / 10.0
                     _dc_bin_key = f'depth_loss_t{int(_dc_bin_start*100):02d}'
-                    self._last_depth_loss_bins[_dc_bin_key] = float(_dc_loss_i)
+                    self._bin_update(
+                        self._last_depth_loss_bins,
+                        _dc_bin_key,
+                        float(_dc_loss_i),
+                    )
 
                     # Preview: save [GT RGB | GT depth | Pred RGB | Pred depth] every N steps.
                     if (_dc_cfg.preview_every > 0
@@ -3166,7 +3234,11 @@ class SDTrainer(BaseSDTrainProcess):
                             self._last_depth_loss_bins = {}
                         _dc_bin_start = int(_dc_t[_b].item() * 10) / 10.0
                         _dc_bin_key = f'depth_loss_t{int(_dc_bin_start*100):02d}'
-                        self._last_depth_loss_bins[_dc_bin_key] = float(loss_b.detach())
+                        self._bin_update(
+                            self._last_depth_loss_bins,
+                            _dc_bin_key,
+                            float(loss_b.detach()),
+                        )
                         if _dc_preview_b is None:
                             _dc_preview_b = _b
 
@@ -4762,6 +4834,15 @@ class SDTrainer(BaseSDTrainProcess):
         # flush()
 
     def hook_train_loop(self, batch: Union[DataLoaderBatchDTO, List[DataLoaderBatchDTO]]):
+        # Reset display-only per-t-band bin accumulators at the start of every
+        # optimizer step so that:
+        #   (a) same-bin samples within a microbatch accumulate (running mean)
+        #       instead of overwriting each other,
+        #   (b) cross-microbatch (gradient_accumulation_steps > 1) samples
+        #       merge into one mean per bin,
+        #   (c) bins from prior optimizer steps don't leak into the next step.
+        # This is purely metric bookkeeping — no loss tensor is touched.
+        self._reset_step_bins()
         if isinstance(batch, list):
             batch_list = batch
         else:
@@ -4882,7 +4963,7 @@ class SDTrainer(BaseSDTrainProcess):
             loss_dict['body_proportion_loss_applied'] = self._last_body_proportion_loss_applied
             self._last_body_proportion_loss_applied = None
         if self._last_bp_sim_bins is not None:
-            for bin_key, sim_val in self._last_bp_sim_bins.items():
+            for bin_key, sim_val in self._bin_finalize(self._last_bp_sim_bins).items():
                 loss_dict[bin_key] = sim_val
             self._last_bp_sim_bins = None
         # Body shape loss (HybrIK SMPL betas)
@@ -4902,7 +4983,7 @@ class SDTrainer(BaseSDTrainProcess):
             loss_dict['body_shape_gated_pct'] = self._last_body_shape_gated_pct
             self._last_body_shape_gated_pct = None
         if self._last_bsh_sim_bins is not None:
-            for bin_key, sim_val in self._last_bsh_sim_bins.items():
+            for bin_key, sim_val in self._bin_finalize(self._last_bsh_sim_bins).items():
                 loss_dict[bin_key] = sim_val
             self._last_bsh_sim_bins = None
         # Normal loss (Sapiens surface normals)
@@ -4940,7 +5021,7 @@ class SDTrainer(BaseSDTrainProcess):
             loss_dict['depth_consistency_grad'] = self._last_depth_consistency_grad
             self._last_depth_consistency_grad = None
         if self._last_depth_loss_bins is not None:
-            for bin_key, loss_val in self._last_depth_loss_bins.items():
+            for bin_key, loss_val in self._bin_finalize(self._last_depth_loss_bins).items():
                 loss_dict[bin_key] = loss_val
             self._last_depth_loss_bins = None
         if self._last_timestep is not None:
@@ -4956,11 +5037,11 @@ class SDTrainer(BaseSDTrainProcess):
             loss_dict['id_clean_delta'] = self._last_id_clean_delta
             self._last_id_clean_delta = None
         if self._last_id_sim_bins is not None:
-            for bin_key, sim_val in self._last_id_sim_bins.items():
+            for bin_key, sim_val in self._bin_finalize(self._last_id_sim_bins).items():
                 loss_dict[bin_key] = sim_val
             self._last_id_sim_bins = None
         if self._last_shape_sim_bins is not None:
-            for bin_key, sim_val in self._last_shape_sim_bins.items():
+            for bin_key, sim_val in self._bin_finalize(self._last_shape_sim_bins).items():
                 loss_dict[bin_key] = sim_val
             self._last_shape_sim_bins = None
 

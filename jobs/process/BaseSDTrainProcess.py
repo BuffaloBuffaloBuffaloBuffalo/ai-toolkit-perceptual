@@ -2516,9 +2516,16 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     with self.timer('commit_logger'):
                         self.logger.commit(step=self.step_num)
 
-                # sets progress bar to match out step
+                # Sets progress bar to "completed N steps" semantics so
+                # tqdm's "X/total" display matches the sqlite step that
+                # was just logged for this iteration. Pre-fix, after iter
+                # 0 the bar still read 0/total even though sqlite already
+                # had a row at step=1 (off-by-one — confused users
+                # comparing the tqdm log line to the chart). Verified no
+                # other code reads `progress_bar.n`, so this is purely a
+                # display fix.
                 if self.progress_bar is not None:
-                    self.progress_bar.update(step - self.progress_bar.n)
+                    self.progress_bar.update(step + 1 - self.progress_bar.n)
 
                 #############################
                 # End of step

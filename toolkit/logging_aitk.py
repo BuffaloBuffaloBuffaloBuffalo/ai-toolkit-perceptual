@@ -127,6 +127,29 @@ class UILogger:
 
         self._init_schema(self._con)
 
+        # Step-4 marker: signals that this run uses the new
+        # `subsystem/kind/variant` canonical metric namespace (alongside
+        # the legacy keys, dual-written by SDTrainer.hook_train_loop).
+        # Consumers can detect new-format runs via the
+        # `_meta/schema_version` row in the metric_keys table. Writing it
+        # at step=0 keeps it well outside any user training step.
+        try:
+            self._con.execute(
+                "INSERT OR IGNORE INTO steps(step, wall_time) VALUES(0, ?);",
+                (time.time(),),
+            )
+            self._con.execute(
+                "INSERT OR REPLACE INTO metrics(step, key, value_real, value_text)"
+                " VALUES(0, '_meta/schema_version', 2.0, NULL);"
+            )
+            self._con.execute(
+                "INSERT OR REPLACE INTO metric_keys(key, first_seen_step, last_seen_step)"
+                " VALUES('_meta/schema_version', 0, 0);"
+            )
+        except sqlite3.Error:
+            # Best-effort: never block training because of a metadata row.
+            pass
+
         self._started = True
         self._last_flush = time.time()
 

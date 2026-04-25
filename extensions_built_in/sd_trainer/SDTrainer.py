@@ -5256,6 +5256,14 @@ class SDTrainer(BaseSDTrainProcess):
                 except (TypeError, ValueError):
                     loss_dict[k] = scalar
 
+        # Canonical naming dual-write: every legacy key gets a sibling
+        # under the new `subsystem/kind/variant` namespace (see
+        # `extensions_built_in.sd_trainer.metric_naming.CANONICAL_RENAMES`).
+        # Existing dashboards keep reading the legacy key for one release;
+        # the new metrics tab consumes the canonical key directly.
+        from extensions_built_in.sd_trainer.metric_naming import apply_dual_write
+        loss_dict = apply_dual_write(loss_dict)
+
         self.end_of_training_loop()
 
         return loss_dict

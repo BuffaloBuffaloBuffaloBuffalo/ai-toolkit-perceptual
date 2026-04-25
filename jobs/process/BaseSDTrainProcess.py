@@ -518,6 +518,46 @@ class BaseSDTrainProcess(BaseTrainProcess):
     def end_step_hook(self):
         pass
 
+    def _log_pending_epoch_avgs(self):
+        """Emit any pending epoch-average scalars to the logger and clear
+        them. Each metric is dual-written under both its legacy key (for
+        back-compat with existing dashboards) and its canonical
+        ``subsystem/kind/variant`` key (consumed by the new metrics tab).
+        """
+        # Lazy-import to avoid a top-of-file dependency on the SDTrainer
+        # extension when this base class is reused by other trainers.
+        try:
+            from extensions_built_in.sd_trainer.metric_naming import (
+                CANONICAL_RENAMES,
+            )
+        except Exception:  # noqa: BLE001
+            CANONICAL_RENAMES = {}
+
+        def _emit(legacy_key, value):
+            self.logger.log({legacy_key: value})
+            canonical = CANONICAL_RENAMES.get(legacy_key)
+            if canonical is not None and canonical != legacy_key:
+                self.logger.log({canonical: value})
+
+        if self._pending_epoch_avg is not None:
+            _emit('loss/epoch_avg', self._pending_epoch_avg)
+            self._pending_epoch_avg = None
+        if self._pending_id_loss_epoch_avg is not None:
+            _emit('loss/identity_loss_epoch_avg', self._pending_id_loss_epoch_avg)
+            self._pending_id_loss_epoch_avg = None
+        if self._pending_diff_loss_epoch_avg is not None:
+            _emit('loss/diffusion_loss_epoch_avg', self._pending_diff_loss_epoch_avg)
+            self._pending_diff_loss_epoch_avg = None
+        if self._pending_id_sim_epoch_avg is not None:
+            _emit('id_sim_epoch_avg', self._pending_id_sim_epoch_avg)
+            self._pending_id_sim_epoch_avg = None
+        if self._pending_bp_loss_epoch_avg is not None:
+            _emit('loss/body_proportion_loss_epoch_avg', self._pending_bp_loss_epoch_avg)
+            self._pending_bp_loss_epoch_avg = None
+        if self._pending_dc_loss_epoch_avg is not None:
+            _emit('loss/depth_consistency_loss_epoch_avg', self._pending_dc_loss_epoch_avg)
+            self._pending_dc_loss_epoch_avg = None
+
     def save(self, step=None):
         if not self.accelerator.is_main_process:
             return
@@ -2442,29 +2482,15 @@ class BaseSDTrainProcess(BaseTrainProcess):
                                 'learning_rate': learning_rate,
                             })
                             if loss_dict is not None:
+                                # Step 4: keys are now fully qualified by
+                                # SDTrainer.hook_train_loop's `apply_dual_write`
+                                # call — both legacy snake_case and canonical
+                                # `subsystem/kind/variant` siblings are present.
+                                # No more conditional `loss/` prefix; just log
+                                # whatever the trainer emits.
                                 for key, value in loss_dict.items():
-                                    if key == 'loss' or key.startswith('loss'):
-                                        self.logger.log({f'loss/{key}': value})
-                                    else:
-                                        self.logger.log({key: value})
-                            if self._pending_epoch_avg is not None:
-                                self.logger.log({'loss/epoch_avg': self._pending_epoch_avg})
-                                self._pending_epoch_avg = None
-                            if self._pending_id_loss_epoch_avg is not None:
-                                self.logger.log({'loss/identity_loss_epoch_avg': self._pending_id_loss_epoch_avg})
-                                self._pending_id_loss_epoch_avg = None
-                            if self._pending_diff_loss_epoch_avg is not None:
-                                self.logger.log({'loss/diffusion_loss_epoch_avg': self._pending_diff_loss_epoch_avg})
-                                self._pending_diff_loss_epoch_avg = None
-                            if self._pending_id_sim_epoch_avg is not None:
-                                self.logger.log({'id_sim_epoch_avg': self._pending_id_sim_epoch_avg})
-                                self._pending_id_sim_epoch_avg = None
-                            if self._pending_bp_loss_epoch_avg is not None:
-                                self.logger.log({'loss/body_proportion_loss_epoch_avg': self._pending_bp_loss_epoch_avg})
-                                self._pending_bp_loss_epoch_avg = None
-                            if self._pending_dc_loss_epoch_avg is not None:
-                                self.logger.log({'loss/depth_consistency_loss_epoch_avg': self._pending_dc_loss_epoch_avg})
-                                self._pending_dc_loss_epoch_avg = None
+                                    self.logger.log({key: value})
+                            self._log_pending_epoch_avgs()
                     elif self.logging_config.log_every is None:
                         if self.accelerator.is_main_process:
                             # log every step
@@ -2472,28 +2498,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                                 'learning_rate': learning_rate,
                             })
                             for key, value in loss_dict.items():
-                                if key == 'loss' or key.startswith('loss'):
-                                    self.logger.log({f'loss/{key}': value})
-                                else:
-                                    self.logger.log({key: value})
-                            if self._pending_epoch_avg is not None:
-                                self.logger.log({'loss/epoch_avg': self._pending_epoch_avg})
-                                self._pending_epoch_avg = None
-                            if self._pending_id_loss_epoch_avg is not None:
-                                self.logger.log({'loss/identity_loss_epoch_avg': self._pending_id_loss_epoch_avg})
-                                self._pending_id_loss_epoch_avg = None
-                            if self._pending_diff_loss_epoch_avg is not None:
-                                self.logger.log({'loss/diffusion_loss_epoch_avg': self._pending_diff_loss_epoch_avg})
-                                self._pending_diff_loss_epoch_avg = None
-                            if self._pending_id_sim_epoch_avg is not None:
-                                self.logger.log({'id_sim_epoch_avg': self._pending_id_sim_epoch_avg})
-                                self._pending_id_sim_epoch_avg = None
-                            if self._pending_bp_loss_epoch_avg is not None:
-                                self.logger.log({'loss/body_proportion_loss_epoch_avg': self._pending_bp_loss_epoch_avg})
-                                self._pending_bp_loss_epoch_avg = None
-                            if self._pending_dc_loss_epoch_avg is not None:
-                                self.logger.log({'loss/depth_consistency_loss_epoch_avg': self._pending_dc_loss_epoch_avg})
-                                self._pending_dc_loss_epoch_avg = None
+                                self.logger.log({key: value})
+                            self._log_pending_epoch_avgs()
 
 
                     if self.performance_log_every > 0 and self.step_num % self.performance_log_every == 0:

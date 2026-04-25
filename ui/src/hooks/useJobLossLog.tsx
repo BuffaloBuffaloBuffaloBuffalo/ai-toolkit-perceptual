@@ -3,6 +3,142 @@
 import { useEffect, useState, useRef, useCallback, useMemo } from 'react';
 import { apiClient } from '@/utils/api';
 
+// =====================================================================
+// Step 4: legacy-to-canonical rename map.
+//
+// Mirrors `extensions_built_in/sd_trainer/metric_naming.py` so historical
+// runs (where only the legacy key was logged) render under the new
+// `subsystem/kind/variant` namespace in the new metrics tab.
+//
+// The new dashboard groups by the segment before the first `/`. Anything
+// not in this map keeps its legacy name and falls into a "Custom" group.
+// Keep in lock-step with the Python `CANONICAL_RENAMES` map. Every entry
+// here MUST exist there (and vice versa) so dual-write and back-rendering
+// stay symmetric.
+// =====================================================================
+export const LEGACY_TO_CANONICAL: Record<string, string> = {
+  // core
+  loss: 'core/loss',
+  grad_norm: 'core/grad_norm',
+  timestep: 'core/timestep',
+
+  // diffusion
+  diffusion_loss: 'diffusion/loss_raw',
+  diffusion_loss_applied: 'diffusion/loss_applied',
+
+  // identity
+  identity_loss: 'identity/loss_raw',
+  identity_loss_applied: 'identity/loss_applied',
+  id_sim: 'identity/sim',
+  id_clean_target: 'identity/clean_target',
+  id_clean_delta: 'identity/clean_delta',
+
+  // landmark
+  landmark_loss: 'landmark/loss_raw',
+  landmark_loss_applied: 'landmark/loss_applied',
+
+  // body proportion
+  body_proportion_loss: 'body_proportion/loss_raw',
+  body_proportion_loss_applied: 'body_proportion/loss_applied',
+
+  // body shape
+  body_shape_loss: 'body_shape/loss_raw',
+  body_shape_loss_applied: 'body_shape/loss_applied',
+  body_shape_cos: 'body_shape/cos',
+  body_shape_l1: 'body_shape/l1',
+  body_shape_gated_pct: 'body_shape/gated_pct',
+
+  // normals
+  normal_loss: 'normal/loss_raw',
+  normal_loss_applied: 'normal/loss_applied',
+  normal_cos: 'normal/cos',
+
+  // vae anchor
+  vae_anchor_loss: 'vae_anchor/loss_raw',
+  vae_anchor_loss_applied: 'vae_anchor/loss_applied',
+  va_level_1: 'vae_anchor/level/level_1',
+  va_level_2: 'vae_anchor/level/level_2',
+  va_level_3: 'vae_anchor/level/level_3',
+  va_mid: 'vae_anchor/level/mid',
+  va_edge: 'vae_anchor/level/edge',
+
+  // depth
+  depth_consistency_loss: 'depth/loss_raw',
+  depth_consistency_loss_applied: 'depth/loss_applied',
+  depth_consistency_ssi: 'depth/ssi',
+  depth_consistency_grad: 'depth/grad',
+
+  // tokens
+  face_token_norm: 'tokens/face/norm',
+  vision_token_norm: 'tokens/vision/norm',
+  body_token_norm: 'tokens/body/norm',
+  txt_token_norm: 'tokens/text/norm',
+
+  // aux
+  pure_noise_cos: 'aux/pure_noise_cos',
+
+  // legacy `loss/` prefixed keys (BaseSDTrainProcess used to wrap
+  // anything starting with `loss` under a `loss/` namespace).
+  'loss/loss': 'core/loss',
+  'loss/grad_norm': 'core/grad_norm',
+  'loss/diffusion_loss': 'diffusion/loss_raw',
+  'loss/diffusion_loss_applied': 'diffusion/loss_applied',
+  'loss/identity_loss': 'identity/loss_raw',
+  'loss/identity_loss_applied': 'identity/loss_applied',
+  'loss/landmark_loss': 'landmark/loss_raw',
+  'loss/landmark_loss_applied': 'landmark/loss_applied',
+  'loss/body_proportion_loss': 'body_proportion/loss_raw',
+  'loss/body_proportion_loss_applied': 'body_proportion/loss_applied',
+  'loss/body_shape_loss': 'body_shape/loss_raw',
+  'loss/body_shape_loss_applied': 'body_shape/loss_applied',
+  'loss/normal_loss': 'normal/loss_raw',
+  'loss/normal_loss_applied': 'normal/loss_applied',
+  'loss/vae_anchor_loss': 'vae_anchor/loss_raw',
+  'loss/vae_anchor_loss_applied': 'vae_anchor/loss_applied',
+  'loss/depth_consistency_loss': 'depth/loss_raw',
+  'loss/depth_consistency_loss_applied': 'depth/loss_applied',
+
+  // epoch averages
+  'loss/epoch_avg': 'core/loss/epoch_avg',
+  'loss/identity_loss_epoch_avg': 'identity/loss_raw/epoch_avg',
+  'loss/diffusion_loss_epoch_avg': 'diffusion/loss_raw/epoch_avg',
+  id_sim_epoch_avg: 'identity/sim/epoch_avg',
+  'loss/body_proportion_loss_epoch_avg': 'body_proportion/loss_raw/epoch_avg',
+  'loss/depth_consistency_loss_epoch_avg': 'depth/loss_raw/epoch_avg',
+};
+
+// Pattern-shaped renames (per-t-band bins). Match `<prefix>_t<NN>` where
+// `<prefix>` is one of the legacy bin prefixes; canonical form is
+// `<subsystem>/<kind>/t<NN>`.
+const _BIN_PATTERN = /^([a-z_]+?)_t(\d{2,3})$/;
+const _BIN_PREFIX_TO_CANONICAL: Record<string, string> = {
+  id_sim: 'identity/sim',
+  shape_sim: 'landmark/sim',
+  bp_sim: 'body_proportion/sim',
+  bsh_sim: 'body_shape/sim',
+  depth_loss: 'depth/loss',
+};
+
+/** Map a legacy or canonical key to its canonical form. Returns the input
+ * unchanged if no mapping exists (e.g. user-defined custom metrics). */
+export function canonicalizeKey(key: string): string {
+  if (LEGACY_TO_CANONICAL[key]) return LEGACY_TO_CANONICAL[key];
+  const m = _BIN_PATTERN.exec(key);
+  if (m) {
+    const prefix = m[1];
+    const n = m[2];
+    const canonical = _BIN_PREFIX_TO_CANONICAL[prefix];
+    if (canonical) return `${canonical}/t${n}`;
+  }
+  return key;
+}
+
+/** Subsystem grouping segment (everything before the first `/`). */
+export function subsystemOf(key: string): string {
+  const idx = key.indexOf('/');
+  return idx === -1 ? 'custom' : key.slice(0, idx);
+}
+
 export interface LossBreakdownSample {
   value: number;
   t?: number;

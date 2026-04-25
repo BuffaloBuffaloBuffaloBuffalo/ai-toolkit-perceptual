@@ -303,3 +303,138 @@ export default function useJobLossLog(jobID: string, reloadInterval: null | numb
 
   return { series, keys, lossKeys, status, refreshLoss, setSeries };
 }
+
+// =====================================================================
+// Companion hook for the new metrics dashboard (step 5).
+//
+// Differences from `useJobLossLog`:
+//   - No regex allowlist — fetches every key in the run except
+//     `_meta/*` markers and `learning_rate` (which is rendered separately).
+//   - Maps each legacy key to its canonical form via `canonicalizeKey`,
+//     and merges duplicate-mapped series so legacy `loss` and
+//     dual-written `core/loss` show as a single canonical `core/loss`.
+//   - Preserves the `breakdown` field on each point so the new tooltip
+//     can render the per-sample drilldown.
+// =====================================================================
+export function useJobMetricsLog(jobID: string, reloadInterval: null | number = null) {
+  const [series, setSeries] = useState<SeriesMap>({});
+  const [rawKeys, setRawKeys] = useState<string[]>([]);
+  const [status, setStatus] = useState<'idle' | 'loading' | 'success' | 'error' | 'refreshing'>('idle');
+
+  const didInitialLoadRef = useRef(false);
+  const inFlightRef = useRef(false);
+  const lastStepByKeyRef = useRef<Record<string, number | null>>({});
+
+  // canonical keys derived from rawKeys
+  const canonicalKeys = useMemo(() => {
+    const set = new Set<string>();
+    for (const k of rawKeys) {
+      if (k.startsWith('_meta/')) continue;
+      if (k === 'learning_rate') continue;
+      set.add(canonicalizeKey(k));
+    }
+    return Array.from(set).sort();
+  }, [rawKeys]);
+
+  const refresh = useCallback(async () => {
+    if (!jobID) return;
+    if (inFlightRef.current) return;
+    inFlightRef.current = true;
+    setStatus(didInitialLoadRef.current ? 'refreshing' : 'loading');
+
+    try {
+      const first = await apiClient
+        .get(`/api/jobs/${jobID}/loss`, { params: { key: 'loss', limit: 1 } })
+        .then(res => res.data as { keys?: string[] });
+
+      const allKeys = (first.keys ?? []).filter(k => !k.startsWith('_meta/') && k !== 'learning_rate');
+      setRawKeys(first.keys ?? []);
+
+      // Fetch every legacy key, since each may carry distinct points (the
+      // dual-write may have only kicked in mid-run). We then merge by
+      // canonical name on the consumer side.
+      const requests = allKeys.map(k => {
+        const params: Record<string, any> = { key: k };
+        if (reloadInterval && lastStepByKeyRef.current[k] != null) {
+          params.since_step = lastStepByKeyRef.current[k];
+        }
+        params.limit = 1000000;
+        return apiClient
+          .get(`/api/jobs/${jobID}/loss`, { params })
+          .then(res => res.data as { key: string; points?: LossPoint[] });
+      });
+
+      const results = await Promise.all(requests);
+
+      setSeries(prev => {
+        const next: SeriesMap = { ...prev };
+
+        // Group fetched results by canonical key name. When the legacy
+        // and canonical name resolve to the same canonical key, their
+        // points are unioned by step so we don't draw two overlapping
+        // lines for the same metric.
+        const byCanonical: Record<string, LossPoint[]> = {};
+        for (const r of results) {
+          const canonical = canonicalizeKey(r.key);
+          const newPoints = (r.points ?? []).filter(p => p.value !== null);
+          (byCanonical[canonical] ||= []).push(...newPoints);
+
+          // track last seen step on the legacy key (raw sqlite step) so
+          // incremental polling stays incremental.
+          if (newPoints.length) {
+            const lastStep = newPoints[newPoints.length - 1].step;
+            const prevLast = lastStepByKeyRef.current[r.key];
+            if (prevLast == null || lastStep > prevLast) {
+              lastStepByKeyRef.current[r.key] = lastStep;
+            }
+          }
+        }
+
+        for (const [canonical, pts] of Object.entries(byCanonical)) {
+          // Merge with existing points by step. Later points (higher step)
+          // win on collision.
+          const existing = next[canonical] ?? [];
+          const stepMap = new Map<number, LossPoint>();
+          for (const p of existing) stepMap.set(p.step, p);
+          for (const p of pts) stepMap.set(p.step, p);
+          const merged = Array.from(stepMap.values()).sort((a, b) => a.step - b.step);
+          next[canonical] = merged;
+        }
+
+        // remove canonical keys that no longer have any underlying legacy key.
+        const liveCanonical = new Set<string>();
+        for (const k of allKeys) liveCanonical.add(canonicalizeKey(k));
+        for (const k of Object.keys(next)) {
+          if (!liveCanonical.has(k)) delete next[k];
+        }
+
+        return next;
+      });
+
+      setStatus('success');
+      didInitialLoadRef.current = true;
+    } catch (err) {
+      console.error('Error fetching metrics logs:', err);
+      setStatus('error');
+    } finally {
+      inFlightRef.current = false;
+    }
+  }, [jobID, reloadInterval]);
+
+  useEffect(() => {
+    didInitialLoadRef.current = false;
+    lastStepByKeyRef.current = {};
+    setSeries({});
+    setRawKeys([]);
+    setStatus('idle');
+
+    refresh();
+
+    if (reloadInterval) {
+      const interval = setInterval(refresh, reloadInterval);
+      return () => clearInterval(interval);
+    }
+  }, [jobID, reloadInterval, refresh]);
+
+  return { series, canonicalKeys, rawKeys, status, refresh, setSeries };
+}

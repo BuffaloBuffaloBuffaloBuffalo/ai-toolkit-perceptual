@@ -200,6 +200,52 @@ class SDTrainer(BaseSDTrainProcess):
         #   - cross-microbatch (gradient_accumulation_steps>1) samples merge,
         #   - bins from a prior optimizer step never bleed into the next one.
 
+        # MetricBuffer accumulates *every* metric scalar across all
+        # microbatches in one optimizer step (fixes the
+        # gradient_accumulation_steps > 1 overwrite bug, where every metric
+        # except `loss` reflected only the final microbatch). We snapshot
+        # every existing `self._last_*` value into the buffer at the end of
+        # `train_single_accumulation`; `get_loss_metrics` then prefers the
+        # buffer's cross-microbatch mean over the single-microbatch shim.
+        # The buffer is *display-only* — it never touches the loss tensor.
+        from extensions_built_in.sd_trainer.metric_buffer import MetricBuffer
+        self._metric_buffer: MetricBuffer = MetricBuffer(per_sample_cap=16)
+        # Mirror map: `_last_<attr>` → metric name in `loss_dict`. Keep in
+        # sync with the loss_dict construction at the bottom of
+        # `hook_train_loop` so the buffer's keys align with what users see.
+        self._last_to_metric: dict = {
+            '_last_face_token_norm': 'face_token_norm',
+            '_last_vision_token_norm': 'vision_token_norm',
+            '_last_body_token_norm': 'body_token_norm',
+            '_last_identity_loss': 'identity_loss',
+            '_last_landmark_loss': 'landmark_loss',
+            '_last_pure_noise_cos': 'pure_noise_cos',
+            '_last_diffusion_loss': 'diffusion_loss',
+            '_last_diffusion_loss_applied': 'diffusion_loss_applied',
+            '_last_identity_loss_applied': 'identity_loss_applied',
+            '_last_landmark_loss_applied': 'landmark_loss_applied',
+            '_last_body_proportion_loss': 'body_proportion_loss',
+            '_last_body_proportion_loss_applied': 'body_proportion_loss_applied',
+            '_last_body_shape_loss': 'body_shape_loss',
+            '_last_body_shape_loss_applied': 'body_shape_loss_applied',
+            '_last_body_shape_cos': 'body_shape_cos',
+            '_last_body_shape_l1': 'body_shape_l1',
+            '_last_body_shape_gated_pct': 'body_shape_gated_pct',
+            '_last_normal_loss': 'normal_loss',
+            '_last_normal_loss_applied': 'normal_loss_applied',
+            '_last_normal_cos': 'normal_cos',
+            '_last_vae_anchor_loss': 'vae_anchor_loss',
+            '_last_vae_anchor_loss_applied': 'vae_anchor_loss_applied',
+            '_last_depth_consistency_loss': 'depth_consistency_loss',
+            '_last_depth_consistency_loss_applied': 'depth_consistency_loss_applied',
+            '_last_depth_consistency_ssi': 'depth_consistency_ssi',
+            '_last_depth_consistency_grad': 'depth_consistency_grad',
+            '_last_timestep': 'timestep',
+            '_last_id_sim': 'id_sim',
+            '_last_id_clean_target': 'id_clean_target',
+            '_last_id_clean_delta': 'id_clean_delta',
+        }
+
         # E-LatentLPIPS perceptual loss
         self.latent_perceptual_model = None
         self._latent_perceptual_loss_accumulator: float = 0.0
@@ -263,6 +309,35 @@ class SDTrainer(BaseSDTrainProcess):
         self._last_bp_sim_bins = None
         self._last_bsh_sim_bins = None
         self._last_depth_loss_bins = None
+
+    def _snapshot_metrics_to_buffer(self) -> None:
+        """Mirror every freshly-written ``self._last_<attr>`` scalar into
+        ``self._metric_buffer`` so cross-microbatch means are correct under
+        ``gradient_accumulation_steps > 1``.
+
+        Called once at the end of every ``train_single_accumulation`` call.
+        Each mapped ``_last_<attr>`` is read, mirrored into the buffer with
+        weight=1.0 (one observation per microbatch), and then **reset to
+        None**. The reset prevents a stale value from microbatch N from
+        being double-counted in microbatch N+1 when the metric's gating
+        conditions don't fire.
+
+        The trade-off: the existing flush block at the bottom of
+        ``hook_train_loop`` will see ``None`` for these attrs and skip
+        them; the buffer-flush merge a few lines later then writes the
+        cross-microbatch mean back into ``loss_dict`` under the same key.
+
+        Display-only; never touches loss tensors.
+        """
+        if not hasattr(self, '_metric_buffer'):
+            return
+        buf = self._metric_buffer
+        for attr, metric_name in self._last_to_metric.items():
+            val = getattr(self, attr, None)
+            if val is None:
+                continue
+            buf.add_scalar(metric_name, val, weight=1.0)
+            setattr(self, attr, None)
 
     def before_model_load(self):
         pass
@@ -4830,6 +4905,11 @@ class SDTrainer(BaseSDTrainProcess):
                     # else:
                     self.accelerator.backward(loss)
 
+        # Mirror this microbatch's metric scalars into the buffer so that
+        # `hook_train_loop` can flush a real cross-microbatch mean. Pure
+        # bookkeeping — no loss tensor reference is read here, the loss has
+        # already been backpropped above.
+        self._snapshot_metrics_to_buffer()
         return loss.detach()
         # flush()
 
@@ -4843,6 +4923,11 @@ class SDTrainer(BaseSDTrainProcess):
         #   (c) bins from prior optimizer steps don't leak into the next step.
         # This is purely metric bookkeeping — no loss tensor is touched.
         self._reset_step_bins()
+        # Same reasoning for the cross-microbatch metric buffer: clear it at
+        # the very top of every optimizer step so the next step's
+        # `_snapshot_metrics_to_buffer` calls accumulate from zero.
+        if hasattr(self, '_metric_buffer'):
+            self._metric_buffer.reset()
         if isinstance(batch, list):
             batch_list = batch
         else:
@@ -5072,6 +5157,18 @@ class SDTrainer(BaseSDTrainProcess):
         if hasattr(self.sd, 'unet') and hasattr(self.sd.unet, '_last_txt_token_norm'):
             loss_dict['txt_token_norm'] = self.sd.unet._last_txt_token_norm
             self.sd.unet._last_txt_token_norm = None
+
+        # Cross-microbatch correction: every metric mirrored into the
+        # MetricBuffer during this optimizer step gets its weighted mean
+        # over all microbatches written back into loss_dict, overwriting
+        # the single-microbatch shim that the legacy `_last_*` flush block
+        # produced above. With `gradient_accumulation_steps == 1` this is a
+        # no-op (the buffer's mean equals the single observation); with > 1
+        # it fixes the "last microbatch wins" bug.
+        if hasattr(self, '_metric_buffer'):
+            buffered_scalars = self._metric_buffer.flush_scalars()
+            for k, v in buffered_scalars.items():
+                loss_dict[k] = v
 
         self.end_of_training_loop()
 

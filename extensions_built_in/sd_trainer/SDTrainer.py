@@ -605,31 +605,10 @@ class SDTrainer(BaseSDTrainProcess):
                 for dataset in datasets:
                     cache_normal_embeddings(dataset.file_list, self.face_id_config)
 
-        # Depth consistency: cache GT depth maps (DA2 output) for all datasets.
-        # Image datasets use the scalar per-image cache; video datasets
-        # (num_frames > 1) additionally cache a per-frame (T, H, W) cube.
-        if (self.depth_consistency_config is not None
-                and self.depth_consistency_config.loss_weight > 0):
-            print_acc("DepthConsistency: Extracting and caching GT depth maps...")
-
-            def _cache_dataset_depth(ds):
-                cache_depth_gt_embeddings(
-                    ds.file_list, self.depth_consistency_config,
-                    device=self.device_torch,
-                )
-                if getattr(ds, 'num_frames', 1) > 1:
-                    cache_video_depth_gt_embeddings(
-                        ds.file_list, self.depth_consistency_config,
-                        device=self.device_torch,
-                        num_frames=ds.num_frames,
-                    )
-
-            if self.data_loader is not None:
-                for dataset in get_dataloader_datasets(self.data_loader):
-                    _cache_dataset_depth(dataset)
-            if self.data_loader_reg is not None:
-                for dataset in get_dataloader_datasets(self.data_loader_reg):
-                    _cache_dataset_depth(dataset)
+        # NOTE: depth consistency GT caching is deferred until after the TAEF2
+        # decoder is loaded (further below) so the cache can run pixels through
+        # the same encode + decode chain training will use, giving the loss a
+        # true zero-floor target.
 
         # Auto-masking (YOLO + SAM 2 + SegFormer-clothes): cache person/body/clothing
         # masks for region-aware loss weighting. Debug preview tiles (when enabled)
@@ -936,6 +915,82 @@ class SDTrainer(BaseSDTrainProcess):
                 self.taesd.to(dtype=get_torch_dtype(self.train_config.dtype), device=self.device_torch)
                 self.taesd.eval()
                 self.taesd.requires_grad_(False)
+
+        # Depth consistency: cache GT depth maps (DA2 output) for all datasets.
+        # v3 caches GT from VAE-encode → trainer-decoder pixels so the live
+        # depth loss has a true zero-floor target (the cleanest the trainer
+        # can produce). Mirrors SDTrainer.py:2865-2890 decode dispatch.
+        if (self.depth_consistency_config is not None
+                and self.depth_consistency_config.loss_weight > 0):
+            print_acc("DepthConsistency: Extracting and caching GT depth maps...")
+
+            # Pull VAE scaling once; all VAEs we hit (Flux 2, SD, SDXL) expose these.
+            _vae_cfg = getattr(self.sd.vae, 'config', {}) or {}
+            _vae_scale = float(_vae_cfg.get('scaling_factor', 1.0)) if hasattr(_vae_cfg, 'get') else 1.0
+            _vae_shift = float(_vae_cfg.get('shift_factor', 0.0) or 0.0) if hasattr(_vae_cfg, 'get') else 0.0
+            _vae_dtype = self.sd.vae.dtype
+
+            def _vae_roundtrip_for_depth(arr: torch.Tensor) -> torch.Tensor:
+                """[0,1] pixels → VAE encode → trainer decoder → [0,1] pixels."""
+                if next(self.sd.vae.parameters()).device != self.device_torch:
+                    self.sd.vae.to(self.device_torch)
+                arr_norm = (arr * 2.0 - 1.0).to(_vae_dtype)
+                posterior = self.sd.vae.encode(arr_norm)
+                # Flux 2's VAE.encode returns a Tensor directly; standard
+                # diffusers VAEs return an object with `.latent_dist`. Cover both.
+                if hasattr(posterior, 'latent_dist'):
+                    raw_latent = posterior.latent_dist.mode()  # deterministic, batched
+                elif isinstance(posterior, torch.Tensor):
+                    raw_latent = posterior
+                elif hasattr(posterior, 'sample') and callable(getattr(posterior, 'sample')):
+                    raw_latent = posterior.sample()
+                else:
+                    raw_latent = posterior[0]
+                # Match dataloader's encode_images: scaling_factor * (latent - shift_factor)
+                scaled = _vae_scale * (raw_latent - _vae_shift)
+                if getattr(self, '_taef2_decoder', None) is not None:
+                    # TAEF2 expects 32-ch unpacked latents; Flux 2 VAE encoder
+                    # outputs 128-ch packed (same as model output). Mirror the
+                    # rearrange used in the depth loss decode path.
+                    if scaled.shape[1] != 32:
+                        scaled = rearrange(
+                            scaled,
+                            "b (c p1 p2) h w -> b c (h p1) (w p2)",
+                            c=32, p1=2, p2=2,
+                        )
+                    dec_dtype = next(self._taef2_decoder.parameters()).dtype
+                    pixels = self._taef2_decoder(scaled.to(dec_dtype)).float()
+                elif self.taesd is not None:
+                    td = next(self.taesd.parameters()).dtype
+                    pixels = self.taesd.decode(scaled.to(td)).sample.float()
+                    pixels = (pixels + 1.0) * 0.5
+                else:
+                    unscaled = scaled / _vae_scale
+                    if _vae_shift:
+                        unscaled = unscaled + _vae_shift
+                    pixels = self.sd.vae.decode(unscaled.to(_vae_dtype)).sample.float()
+                    pixels = (pixels + 1.0) * 0.5
+                return pixels.clamp(0, 1)
+
+            def _cache_dataset_depth(ds):
+                cache_depth_gt_embeddings(
+                    ds.file_list, self.depth_consistency_config,
+                    device=self.device_torch,
+                    vae_roundtrip_fn=_vae_roundtrip_for_depth,
+                )
+                if getattr(ds, 'num_frames', 1) > 1:
+                    cache_video_depth_gt_embeddings(
+                        ds.file_list, self.depth_consistency_config,
+                        device=self.device_torch,
+                        num_frames=ds.num_frames,
+                    )
+
+            if self.data_loader is not None:
+                for dataset in get_dataloader_datasets(self.data_loader):
+                    _cache_dataset_depth(dataset)
+            if self.data_loader_reg is not None:
+                for dataset in get_dataloader_datasets(self.data_loader_reg):
+                    _cache_dataset_depth(dataset)
 
         if self.is_caching_text_embeddings:
             # make sure model is on cpu for this part so we don't oom.
@@ -2034,18 +2089,22 @@ class SDTrainer(BaseSDTrainProcess):
                             cos_sim = F.cosine_similarity(gen_centered, ref_centered, dim=-1)  # (B,)
 
                         # Metric mask: valid face, gated by timestep window unless identity_metrics
+                        # is on (then all timesteps log so id_sim_tNN bins fill across t).
                         ref_valid = ref_embedding.abs().sum(dim=-1) > 0
                         if _id_metrics_always:
                             metric_mask = ref_valid  # all timesteps for logging
                         else:
                             metric_mask = ref_valid & high_noise_mask
-                        # Loss mask: also gate by per-sample cosine threshold to prevent hallucination
+                        # Loss mask: ALWAYS respects identity_loss_min_t/max_t even when
+                        # identity_metrics drops the t-window from metric_mask, plus the
+                        # per-sample cosine threshold to prevent pushing on hallucinated faces.
                         cos_threshold = torch.tensor(
                             [v if v is not None else self.face_id_config.identity_loss_min_cos
                              for v in batch.identity_loss_min_cos_list],
                             device=cos_sim.device, dtype=cos_sim.dtype,
                         )
-                        loss_mask = metric_mask & (cos_sim.detach() > cos_threshold) & _face_detected
+                        loss_mask = (ref_valid & high_noise_mask
+                                     & (cos_sim.detach() > cos_threshold) & _face_detected)
 
                         # Build per-sample identity weights early — gate loss_mask so
                         # zero-weight samples are fully excluded from loss computation

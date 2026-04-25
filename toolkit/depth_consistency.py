@@ -24,7 +24,7 @@ from tqdm import tqdm
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
 
-CACHE_VERSION_KEY = "depth_gt_v2"  # v2: cached from dataloader-transformed pixels
+CACHE_VERSION_KEY = "depth_gt_v3"  # v3: GT depth from VAE-encode-then-decode roundtrip pixels (zero-floor target)
 CACHE_VERSION_VIDEO_KEY = "depth_gt_video_v2"
 
 
@@ -314,6 +314,7 @@ def cache_depth_gt_embeddings(
     file_items: List["FileItemDTO"],  # noqa: F821
     config: "DepthConsistencyConfig",  # noqa: F821
     device: Optional[torch.device] = None,
+    vae_roundtrip_fn: Optional[callable] = None,  # noqa: A002 (lower-case callable is fine here)
 ) -> None:
     """Extract and cache GT depth maps for all file items.
 
@@ -322,6 +323,14 @@ def cache_depth_gt_embeddings(
     ``depth_gt`` (fp16).  Versioned by ``CACHE_VERSION_KEY``; re-runs when
     the version changes.  The cached depth is at DA2's native output
     resolution (aspect-preserving ``input_size`` long side).
+
+    Args:
+        vae_roundtrip_fn: optional callable ``(pixels[1,3,H,W] in [0,1]) ->
+            pixels[1,3,H,W] in [0,1]`` that runs the trainer's actual VAE
+            encode + decode chain. When supplied, GT depth is extracted from
+            the round-trip pixels rather than the raw original — that turns
+            the floor of the live training loss to zero (the model can
+            actually reach the target). Required for v3 caches.
     """
     from PIL import Image
     from PIL.ImageOps import exif_transpose
@@ -361,6 +370,12 @@ def cache_depth_gt_embeddings(
         arr = torch.from_numpy(
             np.asarray(pil_image, dtype=np.float32) / 255.0
         ).permute(2, 0, 1).unsqueeze(0).to(device)
+
+        # v3: round-trip through VAE encode + decode so the cached GT is the
+        # cleanest pixel representation the trainer can actually produce.
+        if vae_roundtrip_fn is not None:
+            with torch.no_grad():
+                arr = vae_roundtrip_fn(arr)
 
         with torch.no_grad():
             depth = encoder(arr)[0].cpu().to(torch.float16)

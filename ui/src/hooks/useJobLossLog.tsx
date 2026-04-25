@@ -60,7 +60,9 @@ export default function useJobLossLog(jobID: string, reloadInterval: null | numb
         const params: Record<string, any> = { key: k };
 
         if (reloadInterval && lastStepByKeyRef.current[k] != null) {
-          params.since_step = lastStepByKeyRef.current[k];
+          // lastStep tracks our shifted (-1) step; the API filters by raw
+          // sqlite step, so add 1 back to query incrementally.
+          params.since_step = (lastStepByKeyRef.current[k] as number) + 1;
         }
 
         params.limit = 1000000;
@@ -77,7 +79,13 @@ export default function useJobLossLog(jobID: string, reloadInterval: null | numb
 
         for (const r of results) {
           const k = r.key;
-          const newPoints = (r.points ?? []).filter(p => p.value !== null);
+          // Sqlite stores step as the trainer's loop index, which lands one
+          // ahead of the tqdm progress display (tqdm "248/1000" shares its row
+          // with sqlite step 249). Shift so the chart's "step N" lines up with
+          // the tqdm log row the user reads.
+          const newPoints = (r.points ?? [])
+            .filter(p => p.value !== null)
+            .map(p => ({ ...p, step: p.step - 1 }));
 
           if (!didInitialLoadRef.current) {
             // initial: replace

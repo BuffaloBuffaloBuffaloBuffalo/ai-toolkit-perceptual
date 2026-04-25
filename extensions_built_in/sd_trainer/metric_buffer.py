@@ -46,6 +46,28 @@ import math
 from typing import Any, Dict, List, Optional
 
 
+class MetricValue(float):
+    """Float-with-payload used to ship a per-sample breakdown alongside the
+    metric scalar through ``loss_dict`` without breaking any existing
+    consumer.
+
+    Subclasses ``float`` so all arithmetic, formatting, comparisons, and
+    ``f"{val:.3e}"`` formatting just work. The ``breakdown`` attribute
+    carries the JSON-serialisable per-sample payload that the logger picks
+    up via ``_coerce_value``.
+    """
+
+    breakdown: Dict[str, Any]
+
+    def __new__(cls, value: float, breakdown: Dict[str, Any]):
+        inst = super().__new__(cls, value)
+        inst.breakdown = breakdown
+        return inst
+
+    def __repr__(self) -> str:  # pragma: no cover — cosmetic
+        return f"MetricValue({float(self)!r}, breakdown_keys={list(self.breakdown.keys())})"
+
+
 class _ScalarSlot:
     __slots__ = ("sum", "weight")
 

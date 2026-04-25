@@ -246,8 +246,42 @@ class UILogger:
             return None, None
         if isinstance(v, bool):
             return float(int(v)), None
+        # MetricValue from extensions_built_in.sd_trainer.metric_buffer is
+        # a ``float`` subclass that carries a `breakdown` dict. Detect it
+        # *before* the int/float branch (which would also match) so we can
+        # emit the breakdown JSON into `value_text` alongside the scalar.
+        breakdown = getattr(v, "breakdown", None)
+        if breakdown is not None and isinstance(v, (int, float)):
+            try:
+                vr: Optional[float] = float(v)
+            except (TypeError, ValueError):
+                vr = None
+            vt: Optional[str] = None
+            try:
+                import json as _json
+                vt = _json.dumps(breakdown, ensure_ascii=False)
+            except (TypeError, ValueError):
+                vt = None
+            return vr, vt
         if isinstance(v, (int, float)):
             return float(v), None
+        # Rich payload shape used by the metrics-overhaul per-sample
+        # breakdown when an explicit dict is passed in:
+        # {"value": <float>, "breakdown": <json-serialisable dict>}.
+        if isinstance(v, dict) and "value" in v:
+            try:
+                vr = float(v["value"])  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                vr = None
+            vt = None
+            breakdown = v.get("breakdown")
+            if breakdown is not None:
+                try:
+                    import json as _json
+                    vt = _json.dumps(breakdown, ensure_ascii=False)
+                except (TypeError, ValueError):
+                    vt = None
+            return vr, vt
         try:
             return float(v), None  # type: ignore[arg-type]
         except Exception:

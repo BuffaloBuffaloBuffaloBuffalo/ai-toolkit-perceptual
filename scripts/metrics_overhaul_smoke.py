@@ -102,7 +102,10 @@ def smoke_step_2_metric_buffer() -> None:
 
 def smoke_step_3_per_sample() -> None:
     try:
-        from extensions_built_in.sd_trainer.metric_buffer import MetricBuffer
+        from extensions_built_in.sd_trainer.metric_buffer import (
+            MetricBuffer,
+            MetricValue,
+        )
     except Exception as e:  # noqa: BLE001
         print(f"[step 3] metric buffer not yet imported ({e}); skipping")
         return
@@ -123,18 +126,41 @@ def smoke_step_3_per_sample() -> None:
 
     samples = payload["samples"]
     assert len(samples) == 4, len(samples)
-    # Every retained sample must have farther |dev| than at least one dropped
-    # sample.
     kept_devs = sorted(abs(s["value"] - mean) for s in samples)
     dropped_devs = sorted(set(abs(v - mean) for v in values) - set(kept_devs))
     assert min(kept_devs) >= max(dropped_devs), (kept_devs, dropped_devs)
 
-    # JSON round-trip works.
     payload_json = json.dumps(payload)
     parsed = json.loads(payload_json)
     assert parsed["n"] == 6
 
-    print("[step 3] per-sample top-K-by-deviation: OK")
+    # MetricValue: behaves like a float for every downstream consumer
+    # (arithmetic, format strings, epoch accumulators) and exposes the
+    # breakdown via attribute access.
+    mv = MetricValue(0.7, payload)
+    assert isinstance(mv, float), "MetricValue must subclass float"
+    # Arithmetic still works.
+    assert math.isclose(float(mv) + 0.3, 1.0, abs_tol=1e-9)
+    # Format strings still work (used by the prog-bar printer).
+    assert f"{mv:.3e}" == f"{0.7:.3e}", f"{mv:.3e}"
+    # Breakdown survives the wrap.
+    assert mv.breakdown == payload
+
+    # Logger coerces MetricValue into (value_real, value_text).
+    from toolkit.logging_aitk import UILogger
+    logger = UILogger.__new__(UILogger)  # avoid db init
+    vr, vt = logger._coerce_value(mv)
+    assert math.isclose(vr, 0.7, abs_tol=1e-9), (vr, mv)
+    assert vt is not None and vt.startswith("{"), vt
+    parsed_vt = json.loads(vt)
+    assert parsed_vt["n"] == 6
+
+    # Plain ints/floats still hit the simple path.
+    vr2, vt2 = logger._coerce_value(0.42)
+    assert math.isclose(vr2, 0.42, abs_tol=1e-9)
+    assert vt2 is None
+
+    print("[step 3] per-sample top-K-by-deviation + MetricValue + logger: OK")
 
 
 def smoke_step_4_dual_write() -> None:

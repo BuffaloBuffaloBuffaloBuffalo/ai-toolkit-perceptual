@@ -3,10 +3,28 @@
 import { useEffect, useState, useRef, useCallback, useMemo } from 'react';
 import { apiClient } from '@/utils/api';
 
+export interface LossBreakdownSample {
+  value: number;
+  t?: number;
+  sample?: string;
+}
+
+export interface LossBreakdown {
+  samples: LossBreakdownSample[];
+  n: number;
+  mean: number | null;
+  std: number | null;
+}
+
 export interface LossPoint {
   step: number;
   wall_time?: number;
   value: number | null;
+  // Per-sample breakdown payload emitted by SDTrainer's MetricBuffer for
+  // select metrics (e.g. id_sim, depth_loss, body_proportion_loss). Only
+  // present on points where the trainer collected per-sample data; legacy
+  // runs and metrics without per-sample collection have no `breakdown`.
+  breakdown?: LossBreakdown;
 }
 
 type SeriesMap = Record<string, LossPoint[]>;

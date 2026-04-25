@@ -310,6 +310,39 @@ class SDTrainer(BaseSDTrainProcess):
         self._last_bsh_sim_bins = None
         self._last_depth_loss_bins = None
 
+    def _record_sample(
+        self,
+        metric_name: str,
+        value: float,
+        t: Optional[float] = None,
+        idx: Optional[int] = None,
+        batch=None,
+    ) -> None:
+        """Record one sample's value into the per-sample breakdown buffer.
+
+        ``idx`` + ``batch`` are used to derive the human-readable sample tag
+        (basename of the source image / video). Both are optional —
+        callers without batch metadata can pass just ``metric_name``,
+        ``value`` and ``t``.
+
+        Display-only; never participates in the loss tensor.
+        """
+        if not hasattr(self, '_metric_buffer'):
+            return
+        sample_tag = None
+        if batch is not None and idx is not None:
+            try:
+                file_items = getattr(batch, 'file_items', None)
+                if file_items is not None and idx < len(file_items):
+                    path = getattr(file_items[idx], 'path', None)
+                    if path:
+                        sample_tag = os.path.basename(str(path))
+            except Exception:
+                sample_tag = None
+        self._metric_buffer.add_per_sample(
+            metric_name, value, t=t, sample_tag=sample_tag,
+        )
+
     def _snapshot_metrics_to_buffer(self) -> None:
         """Mirror every freshly-written ``self._last_<attr>`` scalar into
         ``self._metric_buffer`` so cross-microbatch means are correct under
@@ -2293,10 +2326,16 @@ class SDTrainer(BaseSDTrainProcess):
                                     t_val = t_ratio[idx].item()
                                     bin_start = int(t_val * 10) / 10.0
                                     bin_key = f'id_sim_t{int(bin_start*100):02d}'
+                                    cs_val = cos_sim[idx].item()
                                     self._bin_update(
                                         self._last_id_sim_bins,
                                         bin_key,
-                                        cos_sim[idx].item(),
+                                        cs_val,
+                                    )
+                                    # Per-sample breakdown for the tooltip.
+                                    self._record_sample(
+                                        'id_sim', cs_val,
+                                        t=t_val, idx=idx, batch=batch,
                                     )
                         # save decoded x0 predictions + ArcFace crops to visualize identity pipeline
                         if valid_mask.any():
@@ -2440,10 +2479,15 @@ class SDTrainer(BaseSDTrainProcess):
                                     t_val = t_ratio[idx].item()
                                     bin_start = int(t_val * 10) / 10.0
                                     bin_key = f'shape_sim_t{int(bin_start*100):02d}'
+                                    lm_val = lm_loss_per_sample[idx].item()
                                     self._bin_update(
                                         self._last_shape_sim_bins,
                                         bin_key,
-                                        lm_loss_per_sample[idx].item(),
+                                        lm_val,
+                                    )
+                                    self._record_sample(
+                                        'landmark_loss', lm_val,
+                                        t=t_val, idx=idx, batch=batch,
                                     )
 
                 # --- Body proportion loss (ViTPose bone-length ratio matching) ---
@@ -2563,10 +2607,15 @@ class SDTrainer(BaseSDTrainProcess):
                                     t_val = t_ratio[idx].item()
                                     bin_start = int(t_val * 10) / 10.0
                                     bin_key = f'bp_sim_t{int(bin_start*100):02d}'
+                                    bp_val = bp_loss_per_sample[idx].item()
                                     self._bin_update(
                                         self._last_bp_sim_bins,
                                         bin_key,
-                                        1.0 - bp_loss_per_sample[idx].item(),
+                                        1.0 - bp_val,
+                                    )
+                                    self._record_sample(
+                                        'body_proportion_loss', bp_val,
+                                        t=t_val, idx=idx, batch=batch,
                                     )
 
                             # Save skeleton preview images (prediction + reference side-by-side)
@@ -2767,10 +2816,15 @@ class SDTrainer(BaseSDTrainProcess):
                                     t_val = t_ratio[idx].item()
                                     bin_start = int(t_val * 10) / 10.0
                                     bin_key = f'bsh_sim_t{int(bin_start*100):02d}'
+                                    bsh_val = bsh_cos[idx].item()
                                     self._bin_update(
                                         self._last_bsh_sim_bins,
                                         bin_key,
-                                        bsh_cos[idx].item(),
+                                        bsh_val,
+                                    )
+                                    self._record_sample(
+                                        'body_shape_cos', bsh_val,
+                                        t=t_val, idx=idx, batch=batch,
                                     )
 
                 # --- Normal map loss (Sapiens surface normal matching) ---
@@ -3129,12 +3183,17 @@ class SDTrainer(BaseSDTrainProcess):
                     # depth loss evolution per noise level.
                     if self._last_depth_loss_bins is None:
                         self._last_depth_loss_bins = {}
-                    _dc_bin_start = int(_dc_t[_dc_i].item() * 10) / 10.0
+                    _dc_t_val = _dc_t[_dc_i].item()
+                    _dc_bin_start = int(_dc_t_val * 10) / 10.0
                     _dc_bin_key = f'depth_loss_t{int(_dc_bin_start*100):02d}'
                     self._bin_update(
                         self._last_depth_loss_bins,
                         _dc_bin_key,
                         float(_dc_loss_i),
+                    )
+                    self._record_sample(
+                        'depth_consistency_loss', float(_dc_loss_i),
+                        t=_dc_t_val, idx=_dc_i, batch=batch,
                     )
 
                     # Preview: save [GT RGB | GT depth | Pred RGB | Pred depth] every N steps.
@@ -3307,12 +3366,17 @@ class SDTrainer(BaseSDTrainProcess):
                         # Per-sample depth loss binned by timestep (0.1 bands).
                         if self._last_depth_loss_bins is None:
                             self._last_depth_loss_bins = {}
-                        _dc_bin_start = int(_dc_t[_b].item() * 10) / 10.0
+                        _dc_b_t_val = _dc_t[_b].item()
+                        _dc_bin_start = int(_dc_b_t_val * 10) / 10.0
                         _dc_bin_key = f'depth_loss_t{int(_dc_bin_start*100):02d}'
                         self._bin_update(
                             self._last_depth_loss_bins,
                             _dc_bin_key,
                             float(loss_b.detach()),
+                        )
+                        self._record_sample(
+                            'depth_consistency_loss', float(loss_b.detach()),
+                            t=_dc_b_t_val, idx=_b, batch=batch,
                         )
                         if _dc_preview_b is None:
                             _dc_preview_b = _b
@@ -5169,6 +5233,28 @@ class SDTrainer(BaseSDTrainProcess):
             buffered_scalars = self._metric_buffer.flush_scalars()
             for k, v in buffered_scalars.items():
                 loss_dict[k] = v
+
+            # Per-sample breakdowns: for metrics where SDTrainer called
+            # `_record_sample(...)`, wrap the scalar in a `MetricValue`
+            # that *behaves like a float* for every downstream consumer
+            # (arithmetic, format strings, epoch accumulators, prog-bar
+            # printf) but carries the JSON breakdown payload as an
+            # attribute. The logger picks up the breakdown via
+            # `_coerce_value` and writes it into `value_text`. Metrics
+            # without per-sample collection keep their plain scalar form;
+            # this is purely additive.
+            from extensions_built_in.sd_trainer.metric_buffer import MetricValue
+            buffered_per_sample = self._metric_buffer.flush_per_sample()
+            for k, payload in buffered_per_sample.items():
+                scalar = loss_dict.get(k)
+                if scalar is None:
+                    scalar = payload.get('mean')
+                if scalar is None:
+                    continue
+                try:
+                    loss_dict[k] = MetricValue(float(scalar), payload)
+                except (TypeError, ValueError):
+                    loss_dict[k] = scalar
 
         self.end_of_training_loop()
 

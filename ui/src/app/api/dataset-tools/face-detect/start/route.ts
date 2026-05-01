@@ -9,7 +9,6 @@ import { TOOLKIT_ROOT } from '@/paths';
 const isWindows = process.platform === 'win32';
 
 function resolvePython(): string {
-  // Mirror cron/actions/startJob.ts venv resolution.
   const venvCandidates = [
     isWindows
       ? path.join(TOOLKIT_ROOT, '.venv', 'Scripts', 'python.exe')
@@ -42,11 +41,9 @@ export async function POST(request: NextRequest) {
 
     const trainingRoot = await getTrainingFolder();
     const runId = uuidv4();
-    const runDir = path.join(trainingRoot, 'dataset_preflight', runId);
+    const runDir = path.join(trainingRoot, 'dataset_face_detect', runId);
     fs.mkdirSync(runDir, { recursive: true });
 
-    // Write a placeholder progress.json so the UI can poll immediately even
-    // before the Python subprocess has booted (model load takes seconds).
     fs.writeFileSync(
       path.join(runDir, 'progress.json'),
       JSON.stringify({
@@ -57,9 +54,9 @@ export async function POST(request: NextRequest) {
       }),
     );
 
-    const scriptPath = path.join(TOOLKIT_ROOT, 'scripts', 'preflight_subject_masks.py');
+    const scriptPath = path.join(TOOLKIT_ROOT, 'scripts', 'preflight_face_detection.py');
     if (!fs.existsSync(scriptPath)) {
-      return NextResponse.json({ error: 'preflight_subject_masks.py not found' }, { status: 500 });
+      return NextResponse.json({ error: 'preflight_face_detection.py not found' }, { status: 500 });
     }
 
     const pythonPath = resolvePython();
@@ -67,19 +64,11 @@ export async function POST(request: NextRequest) {
       scriptPath,
       '--dataset-dir', datasetDir,
       '--output-dir', runDir,
-      '--segformer-res', String(cfg.segformer_res ?? 768),
-      '--body-close-radius', String(cfg.body_close_radius ?? 2),
-      '--mask-dilate-radius', String(cfg.mask_dilate_radius ?? 0),
-      '--skin-bias', String(cfg.skin_bias ?? 0),
-      '--yolo-conf', String(cfg.yolo_conf ?? 0.25),
-      '--primary-only', String(cfg.primary_only === false ? 0 : 1),
-      '--sam-size', String(cfg.sam_size ?? 'small'),
-      '--dtype', String(cfg.dtype ?? 'fp16'),
+      '--face-model', String(cfg.face_model ?? 'buffalo_l'),
+      '--det-size', String(cfg.det_size ?? 640),
       '--limit', String(cfg.limit ?? 0),
     ];
 
-    // Detach + ignore stdio so the run survives the request lifecycle.
-    // Python writes status/errors to {runDir}/progress.json.
     const subprocess = spawn(pythonPath, args, {
       cwd: TOOLKIT_ROOT,
       detached: true,
@@ -97,7 +86,7 @@ export async function POST(request: NextRequest) {
 
     return NextResponse.json({ runId, runDir, datasetName });
   } catch (err: any) {
-    console.error('preflight start error:', err);
+    console.error('face-detect start error:', err);
     return NextResponse.json({ error: err?.message || 'Internal error' }, { status: 500 });
   }
 }

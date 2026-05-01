@@ -27,12 +27,33 @@ class FaceIDExtractor:
         """Return the largest face by bounding box area."""
         return sorted(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]), reverse=True)[0]
 
+    def _detect(self, image: np.ndarray):
+        """Run detection with a padding fallback for tight close-ups.
+
+        RetinaFace's anchors don't fire when a face fills the frame, so on a
+        zero-face result we retry on a 25%-padded copy and subtract the pad
+        offset so bboxes stay in original-image coordinates.
+        """
+        faces = self.app.get(image)
+        if len(faces) > 0:
+            return faces, 0
+        h, w = image.shape[:2]
+        pad = max(h, w) // 4
+        padded = np.full((h + 2 * pad, w + 2 * pad, 3), 128, dtype=image.dtype)
+        padded[pad:pad + h, pad:pad + w] = image
+        faces = self.app.get(padded)
+        if len(faces) == 0:
+            return [], 0
+        for f in faces:
+            f.bbox = f.bbox - np.array([pad, pad, pad, pad], dtype=f.bbox.dtype)
+        return faces, pad
+
     def extract(self, image: np.ndarray) -> Optional[np.ndarray]:
         """Extract face embedding from a BGR numpy image (OpenCV format).
 
         Returns 512-dim L2-normalized embedding, or None if no face detected.
         """
-        faces = self.app.get(image)
+        faces, _ = self._detect(image)
         if len(faces) == 0:
             return None
         face = self._get_largest_face(faces)
@@ -43,7 +64,7 @@ class FaceIDExtractor:
 
         Returns (512-dim embedding, [x1,y1,x2,y2] bbox) or (None, None).
         """
-        faces = self.app.get(image)
+        faces, _ = self._detect(image)
         if len(faces) == 0:
             return None, None
         face = self._get_largest_face(faces)

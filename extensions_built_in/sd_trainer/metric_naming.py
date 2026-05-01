@@ -97,6 +97,11 @@ CANONICAL_RENAMES: Dict[str, str] = {
     "depth_consistency_ssi": "depth/ssi",
     "depth_consistency_grad": "depth/grad",
 
+    # gradient cosine diagnostic (per-loss grad norms + alignment)
+    "grad_norm_diffusion": "grad/norm/diffusion",
+    "grad_norm_depth": "grad/norm/depth",
+    "grad_cos_diff_depth": "grad/cos/diff_depth",
+
     # tokens
     "face_token_norm": "tokens/face/norm",
     "vision_token_norm": "tokens/vision/norm",
@@ -127,6 +132,7 @@ _BIN_PREFIX_TO_CANONICAL: Dict[str, str] = {
     "bp_sim": "body_proportion/sim",
     "bsh_sim": "body_shape/sim",
     "depth_loss": "depth/loss",
+    "diffusion_loss": "diffusion/loss",
 }
 
 

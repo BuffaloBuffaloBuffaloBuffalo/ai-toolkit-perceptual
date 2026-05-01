@@ -49,6 +49,8 @@ def main():
     p.add_argument('--output-dir', required=True, help='Where to write tile PNGs + progress.json')
     p.add_argument('--segformer-res', type=int, default=768)
     p.add_argument('--body-close-radius', type=int, default=2)
+    p.add_argument('--mask-dilate-radius', type=int, default=0)
+    p.add_argument('--skin-bias', type=float, default=0.0)
     p.add_argument('--yolo-conf', type=float, default=0.25)
     p.add_argument('--primary-only', type=int, default=1, help='1 = use only the largest YOLO box')
     p.add_argument('--sam-size', default='small', choices=['tiny', 'small', 'base_plus', 'large'])
@@ -101,6 +103,8 @@ def main():
             enabled=True,
             segformer_res=args.segformer_res,
             body_close_radius=args.body_close_radius,
+            mask_dilate_radius=args.mask_dilate_radius,
+            skin_bias=args.skin_bias,
             yolo_conf=args.yolo_conf,
             primary_only=bool(args.primary_only),
             sam_size=args.sam_size,

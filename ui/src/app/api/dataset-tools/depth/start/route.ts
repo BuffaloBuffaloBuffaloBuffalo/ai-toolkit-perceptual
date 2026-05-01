@@ -9,7 +9,6 @@ import { TOOLKIT_ROOT } from '@/paths';
 const isWindows = process.platform === 'win32';
 
 function resolvePython(): string {
-  // Mirror cron/actions/startJob.ts venv resolution.
   const venvCandidates = [
     isWindows
       ? path.join(TOOLKIT_ROOT, '.venv', 'Scripts', 'python.exe')
@@ -42,11 +41,9 @@ export async function POST(request: NextRequest) {
 
     const trainingRoot = await getTrainingFolder();
     const runId = uuidv4();
-    const runDir = path.join(trainingRoot, 'dataset_preflight', runId);
+    const runDir = path.join(trainingRoot, 'dataset_depth', runId);
     fs.mkdirSync(runDir, { recursive: true });
 
-    // Write a placeholder progress.json so the UI can poll immediately even
-    // before the Python subprocess has booted (model load takes seconds).
     fs.writeFileSync(
       path.join(runDir, 'progress.json'),
       JSON.stringify({
@@ -54,12 +51,13 @@ export async function POST(request: NextRequest) {
         message: 'Spawning Python worker...',
         done: 0, total: 0,
         dataset: datasetName,
+        use_mask: cfg.use_mask === true || cfg.use_mask === 1,
       }),
     );
 
-    const scriptPath = path.join(TOOLKIT_ROOT, 'scripts', 'preflight_subject_masks.py');
+    const scriptPath = path.join(TOOLKIT_ROOT, 'scripts', 'preflight_depth.py');
     if (!fs.existsSync(scriptPath)) {
-      return NextResponse.json({ error: 'preflight_subject_masks.py not found' }, { status: 500 });
+      return NextResponse.json({ error: 'preflight_depth.py not found' }, { status: 500 });
     }
 
     const pythonPath = resolvePython();
@@ -67,6 +65,9 @@ export async function POST(request: NextRequest) {
       scriptPath,
       '--dataset-dir', datasetDir,
       '--output-dir', runDir,
+      '--depth-model', String(cfg.depth_model ?? 'depth-anything/Depth-Anything-V2-Small-hf'),
+      '--input-size', String(cfg.input_size ?? 518),
+      '--use-mask', String(cfg.use_mask ? 1 : 0),
       '--segformer-res', String(cfg.segformer_res ?? 768),
       '--body-close-radius', String(cfg.body_close_radius ?? 2),
       '--mask-dilate-radius', String(cfg.mask_dilate_radius ?? 0),
@@ -78,8 +79,6 @@ export async function POST(request: NextRequest) {
       '--limit', String(cfg.limit ?? 0),
     ];
 
-    // Detach + ignore stdio so the run survives the request lifecycle.
-    // Python writes status/errors to {runDir}/progress.json.
     const subprocess = spawn(pythonPath, args, {
       cwd: TOOLKIT_ROOT,
       detached: true,
@@ -97,7 +96,7 @@ export async function POST(request: NextRequest) {
 
     return NextResponse.json({ runId, runDir, datasetName });
   } catch (err: any) {
-    console.error('preflight start error:', err);
+    console.error('depth start error:', err);
     return NextResponse.json({ error: err?.message || 'Internal error' }, { status: 500 });
   }
 }

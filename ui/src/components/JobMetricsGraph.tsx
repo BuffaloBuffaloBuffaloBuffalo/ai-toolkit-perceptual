@@ -195,6 +195,7 @@ export default function JobMetricsGraph({ job }: Props) {
   const [useLogScale, setUseLogScale] = useState(false);
   const [showRaw, setShowRaw] = useState(false);
   const [showSmoothed, setShowSmoothed] = useState(true);
+  const [showTrend, setShowTrend] = useState(true);
   const [smoothing, setSmoothing] = useState(90);
   const [plotStride, setPlotStride] = useState(1);
   const [windowSize, setWindowSize] = useState<number>(0);
@@ -417,6 +418,59 @@ export default function JobMetricsGraph({ job }: Props) {
     return map;
   }, [facet, activeKeys, perSeries]);
 
+  // Per-sample linear-regression trend lines (by_sample only). With ≥ 2 raw
+  // points we fit y = m*step + b by least squares; we only need the endpoints
+  // (min/max step) because Recharts draws a straight line between them.
+  // Skipped on log Y when an endpoint isn't strictly positive.
+  const trends = useMemo(() => {
+    const out: Record<
+      string,
+      { yMin: number; yMax: number; minStep: number; maxStep: number } | null
+    > = {};
+    if (facet !== 'by_sample') return out;
+    for (const key of activeKeys) {
+      const pts = perSeries[key]?.raw ?? [];
+      if (pts.length < 2) {
+        out[key] = null;
+        continue;
+      }
+      let n = 0,
+        sx = 0,
+        sy = 0,
+        sxy = 0,
+        sxx = 0;
+      let minStep = Infinity,
+        maxStep = -Infinity;
+      for (const p of pts) {
+        n++;
+        sx += p.step;
+        sy += p.value;
+        sxy += p.step * p.value;
+        sxx += p.step * p.step;
+        if (p.step < minStep) minStep = p.step;
+        if (p.step > maxStep) maxStep = p.step;
+      }
+      const denom = n * sxx - sx * sx;
+      let m: number;
+      let b: number;
+      if (denom === 0) {
+        m = 0;
+        b = sy / n;
+      } else {
+        m = (n * sxy - sx * sy) / denom;
+        b = (sy - m * sx) / n;
+      }
+      const yMin = m * minStep + b;
+      const yMax = m * maxStep + b;
+      if (useLogScale && (yMin <= 0 || yMax <= 0)) {
+        out[key] = null;
+        continue;
+      }
+      out[key] = { yMin, yMax, minStep, maxStep };
+    }
+    return out;
+  }, [facet, activeKeys, perSeries, useLogScale]);
+
   const chartData = useMemo(() => {
     const m = new Map<number, any>();
     for (const key of activeKeys) {
@@ -433,8 +487,20 @@ export default function JobMetricsGraph({ job }: Props) {
         m.set(p.step, row);
       }
     }
+    // Inject trend endpoints (by_sample only). Two rows per series — Recharts
+    // with connectNulls draws a straight line between them.
+    for (const key of activeKeys) {
+      const t = trends[key];
+      if (!t) continue;
+      const rowMin = m.get(t.minStep) ?? { step: t.minStep };
+      rowMin[`${key}__trend`] = t.yMin;
+      m.set(t.minStep, rowMin);
+      const rowMax = m.get(t.maxStep) ?? { step: t.maxStep };
+      rowMax[`${key}__trend`] = t.yMax;
+      m.set(t.maxStep, rowMax);
+    }
     return Array.from(m.values()).sort((a, b) => a.step - b.step);
-  }, [activeKeys, perSeries]);
+  }, [activeKeys, perSeries, trends]);
 
   const hasData = chartData.length > 1;
 
@@ -626,7 +692,7 @@ export default function JobMetricsGraph({ job }: Props) {
         <div className="px-4 pt-3 -mb-1 text-[11px] text-gray-500">
           {bySampleCandidates.length === 0
             ? 'No metrics in this view carry per-sample breakdowns yet. Run with the new MetricBuffer enabled to populate this facet.'
-            : `Showing per-sample values for ${activeBySampleMetric ?? '(none)'} · dots only (no connecting line — points are sparse). ` +
+            : `Showing per-sample values for ${activeBySampleMetric ?? '(none)'} · dots are observations${showTrend ? ', dashed lines are linear-regression trends' : ''}. ` +
               'Each step retains up to 16 samples per metric (top-K by deviation from the batch mean), so samples that are perfectly average may not appear at every step.'}
         </div>
       )}
@@ -671,17 +737,33 @@ export default function JobMetricsGraph({ job }: Props) {
                     const displayName = split ? split.sample : k;
                     const sampleColor = split ? strokeForKey(split.sample) : color;
                     return (
-                      <Line
-                        key={k}
-                        type="monotone"
-                        dataKey={`${k}__raw`}
-                        name={displayName}
-                        stroke={sampleColor}
-                        strokeWidth={0}
-                        dot={{ r: 3, stroke: sampleColor, strokeWidth: 1, fill: sampleColor }}
-                        activeDot={{ r: 5 }}
-                        isAnimationActive={false}
-                      />
+                      <g key={k}>
+                        {showTrend && trends[k] && (
+                          <Line
+                            type="linear"
+                            dataKey={`${k}__trend`}
+                            stroke={sampleColor}
+                            strokeWidth={1.25}
+                            strokeDasharray="4 3"
+                            strokeOpacity={0.75}
+                            dot={false}
+                            activeDot={false}
+                            isAnimationActive={false}
+                            connectNulls
+                            legendType="none"
+                          />
+                        )}
+                        <Line
+                          type="monotone"
+                          dataKey={`${k}__raw`}
+                          name={displayName}
+                          stroke={sampleColor}
+                          strokeWidth={0}
+                          dot={{ r: 3, stroke: sampleColor, strokeWidth: 1, fill: sampleColor }}
+                          activeDot={{ r: 5 }}
+                          isAnimationActive={false}
+                        />
+                      </g>
                     );
                   }
                   return (
@@ -728,6 +810,9 @@ export default function JobMetricsGraph({ job }: Props) {
               <ToggleButton checked={showSmoothed} onClick={() => setShowSmoothed(v => !v)} label="Smoothed" />
               <ToggleButton checked={showRaw} onClick={() => setShowRaw(v => !v)} label="Raw" />
               <ToggleButton checked={useLogScale} onClick={() => setUseLogScale(v => !v)} label="Log Y" />
+              {facet === 'by_sample' && (
+                <ToggleButton checked={showTrend} onClick={() => setShowTrend(v => !v)} label="Trend" />
+              )}
             </div>
           </div>
 

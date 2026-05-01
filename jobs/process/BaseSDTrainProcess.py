@@ -196,7 +196,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         self.datasets = []
                     self.datasets.append(dataset)
                 self.dataset_configs.append(dataset)
-        
+
         self.is_caching_text_embeddings = any(
             dataset.cache_text_embeddings for dataset in self.dataset_configs
         )

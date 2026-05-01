@@ -499,6 +499,12 @@ class TrainConfig:
         self.diffusion_loss_min_t: float = kwargs.get('diffusion_loss_min_t', 0.0)
         self.diffusion_loss_max_t: float = kwargs.get('diffusion_loss_max_t', 1.0)
 
+        # Diagnostic: every N steps, do a dual backward (depth-only and
+        # everything-else-only) to log per-loss gradient norms and the cosine
+        # between them. 0 disables. Costs an extra backward pass + grad clone
+        # on the firing step; rest of the training loop is unaffected.
+        self.gradient_cosine_log_every: int = int(kwargs.get('gradient_cosine_log_every', 0))
+
         # scale the prediction by this. Increase for more detail, decrease for less
         self.pred_scaler = kwargs.get('pred_scaler', 1.0)
 
@@ -991,6 +997,19 @@ class SubjectMaskConfig:
         # parsing — higher values fill blotchy gaps inside limbs/hair at the
         # cost of boundary precision. Changing this invalidates cached masks.
         self.body_close_radius: int = kwargs.get('body_close_radius', 2)
+        # True dilation radius applied to the final person mask. Closing
+        # (above) only fills holes — it doesn't grow the outer boundary,
+        # so setting body_close_radius high produces no visible change on
+        # solid SegFormer parses. ``mask_dilate_radius`` actually grows the
+        # boundary, useful for padding the masked region around the subject.
+        self.mask_dilate_radius: int = kwargs.get('mask_dilate_radius', 0)
+        # Skin-tone bias added to body-class logits (Hair/Face/arms/legs)
+        # where YCrCb-skin is detected. SegFormer-clothes frequently
+        # mislabels exposed skin (chest, midriff, thighs) as Upper-clothes
+        # or Pants; a small positive bias (1-3) flips close-call pixels
+        # back into body without affecting confidently-labelled clothing.
+        # 0 = disabled (default, preserves existing behavior).
+        self.skin_bias: float = kwargs.get('skin_bias', 0.0)
         # Phase 2 knobs — present but unused by training yet
         self.background_loss_weight: Optional[float] = kwargs.get('background_loss_weight', None)
         self.clothing_loss_weight: Optional[float] = kwargs.get('clothing_loss_weight', None)
@@ -1146,6 +1165,7 @@ class DatasetConfig:
         self.latent_perceptual_loss_weight: Union[float, None] = kwargs.get('latent_perceptual_loss_weight', None)
         self.latent_perceptual_loss_min_t: Union[float, None] = kwargs.get('latent_perceptual_loss_min_t', None)
         self.latent_perceptual_loss_max_t: Union[float, None] = kwargs.get('latent_perceptual_loss_max_t', None)
+        self.depth_loss_weight: Union[float, None] = kwargs.get('depth_loss_weight', None)
         self.depth_loss_min_t: Union[float, None] = kwargs.get('depth_loss_min_t', None)
         self.depth_loss_max_t: Union[float, None] = kwargs.get('depth_loss_max_t', None)
         # Subject mask (Phase 2) per-dataset overrides: None inherits global SubjectMaskConfig
@@ -1183,6 +1203,14 @@ class DatasetConfig:
             self.controls = [self.controls]
         # remove empty strings
         self.controls = [control for control in self.controls if control.strip() != '']
+
+        # Optional override for the depth model used when generating
+        # `_controls/{stem}.depth.jpg` images. Defaults to None — the
+        # ControlGenerator falls back to its built-in default. The
+        # auto-mirror in SDTrainer.before_dataset_load sets this on reg
+        # datasets to match `depth_consistency.model_id` so the same model
+        # used for the loss perceptor is used for the conditioning input.
+        self.depth_model_id: Optional[str] = kwargs.get('depth_model_id', None)
         
         # if true, will use a fask method to get image sizes. This can result in errors. Do not use unless you know what you are doing
         self.fast_image_size: bool = kwargs.get('fast_image_size', False)

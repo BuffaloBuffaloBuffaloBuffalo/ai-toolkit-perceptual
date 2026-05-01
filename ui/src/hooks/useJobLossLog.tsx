@@ -68,6 +68,11 @@ export const LEGACY_TO_CANONICAL: Record<string, string> = {
   depth_consistency_ssi: 'depth/ssi',
   depth_consistency_grad: 'depth/grad',
 
+  // gradient cosine diagnostic
+  grad_norm_diffusion: 'grad/norm/diffusion',
+  grad_norm_depth: 'grad/norm/depth',
+  grad_cos_diff_depth: 'grad/cos/diff_depth',
+
   // tokens
   face_token_norm: 'tokens/face/norm',
   vision_token_norm: 'tokens/vision/norm',
@@ -117,6 +122,7 @@ const _BIN_PREFIX_TO_CANONICAL: Record<string, string> = {
   bp_sim: 'body_proportion/sim',
   bsh_sim: 'body_shape/sim',
   depth_loss: 'depth/loss',
+  diffusion_loss: 'diffusion/loss',
 };
 
 /** Map a legacy or canonical key to its canonical form. Returns the input

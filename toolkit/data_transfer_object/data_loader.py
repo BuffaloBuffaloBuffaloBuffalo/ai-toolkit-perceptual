@@ -168,6 +168,7 @@ class FileItemDTO(
         self.latent_perceptual_loss_weight: Union[float, None] = self.dataset_config.latent_perceptual_loss_weight
         self.latent_perceptual_loss_min_t: Union[float, None] = self.dataset_config.latent_perceptual_loss_min_t
         self.latent_perceptual_loss_max_t: Union[float, None] = self.dataset_config.latent_perceptual_loss_max_t
+        self.depth_loss_weight: Union[float, None] = self.dataset_config.depth_loss_weight
         self.depth_loss_min_t: Union[float, None] = self.dataset_config.depth_loss_min_t
         self.depth_loss_max_t: Union[float, None] = self.dataset_config.depth_loss_max_t
         # Subject mask (Phase 2) per-dataset overrides; None = inherit global SubjectMaskConfig
@@ -372,6 +373,9 @@ class DataLoaderBatchDTO:
             ]
             self.latent_perceptual_loss_max_t_list: List[Union[float, None]] = [
                 x.latent_perceptual_loss_max_t for x in self.file_items
+            ]
+            self.depth_loss_weight_list: List[Union[float, None]] = [
+                x.depth_loss_weight for x in self.file_items
             ]
             self.depth_loss_min_t_list: List[Union[float, None]] = [
                 x.depth_loss_min_t for x in self.file_items

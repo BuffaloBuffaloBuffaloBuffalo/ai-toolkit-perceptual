@@ -588,6 +588,28 @@ export default function SimpleJob({
                     />
                   </>
                 )}
+                <NumberInput
+                  label="Min Denoising Step"
+                  className="pt-2"
+                  value={jobConfig.config.process[0].train.min_denoising_steps ?? 0}
+                  onChange={value =>
+                    setJobConfig(value, 'config.process[0].train.min_denoising_steps')
+                  }
+                  placeholder="0"
+                  min={0}
+                  max={999}
+                />
+                <NumberInput
+                  label="Max Denoising Step"
+                  className="pt-2"
+                  value={jobConfig.config.process[0].train.max_denoising_steps ?? 999}
+                  onChange={value =>
+                    setJobConfig(value, 'config.process[0].train.max_denoising_steps')
+                  }
+                  placeholder="999"
+                  min={0}
+                  max={999}
+                />
                 {/* Latent perceptual loss — experimental, hidden for now
                 <NumberInput
                   label="Latent Perceptual Loss Weight"
@@ -1326,7 +1348,7 @@ export default function SimpleJob({
                       }
                       placeholder="518 (multiple of 14)"
                       min={224}
-                      max={896}
+                      max={1400}
                     />
                     <Checkbox
                       label="Gradient Checkpointing (DA2)"
@@ -1844,6 +1866,15 @@ export default function SimpleJob({
                             <NumberInput label="Weight" value={dataset.body_proportion_loss_weight ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].body_proportion_loss_weight`)} placeholder="inherit" min={0} />
                             <NumberInput label="Min t" value={dataset.body_proportion_loss_min_t ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].body_proportion_loss_min_t`)} placeholder="inherit" min={0} max={1} />
                             <NumberInput label="Max t" value={dataset.body_proportion_loss_max_t ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].body_proportion_loss_max_t`)} placeholder="inherit" min={0} max={1} />
+                          </div>
+                        </div>
+                        {/* Depth Consistency */}
+                        <div>
+                          <div className="text-xs font-medium text-gray-400 mb-1">Depth Consistency</div>
+                          <div className="grid grid-cols-3 gap-2">
+                            <NumberInput label="Weight" value={dataset.depth_loss_weight ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].depth_loss_weight`)} placeholder="inherit" min={0} />
+                            <NumberInput label="Min t" value={dataset.depth_loss_min_t ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].depth_loss_min_t`)} placeholder="inherit" min={0} max={1} />
+                            <NumberInput label="Max t" value={dataset.depth_loss_max_t ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].depth_loss_max_t`)} placeholder="inherit" min={0} max={1} />
                           </div>
                         </div>
                         {/* Subject Mask Region Weights */}

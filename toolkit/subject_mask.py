@@ -59,6 +59,25 @@ def _fill_holes(mask: np.ndarray) -> np.ndarray:
         return mask.astype(np.uint8)
 
 
+def _skin_probability(image_rgb_u8: np.ndarray) -> np.ndarray:
+    """Soft skin-tone probability map in [0, 1] from a uint8 RGB image.
+
+    Uses the classical YCrCb thresholds (Cr ∈ [133, 173], Cb ∈ [77, 127])
+    blurred for a smooth probability. Tone-agnostic across most skin tones;
+    over-dark or over-light skin can fall outside the range. Cheap (~ms
+    per frame) and adds no model dependencies.
+    """
+    try:
+        import cv2
+        ycc = cv2.cvtColor(image_rgb_u8, cv2.COLOR_RGB2YCrCb)
+        cr = ycc[..., 1].astype(np.float32)
+        cb = ycc[..., 2].astype(np.float32)
+        m = ((cr >= 133) & (cr <= 173) & (cb >= 77) & (cb <= 127)).astype(np.float32)
+        return cv2.GaussianBlur(m, (7, 7), 0)
+    except Exception:
+        return np.zeros(image_rgb_u8.shape[:2], dtype=np.float32)
+
+
 def _smooth_mask(mask: np.ndarray, close_radius: int = 3, do_fill: bool = True) -> np.ndarray:
     """Clean stippling: morphological closing + hole fill.
 
@@ -119,9 +138,13 @@ class SubjectMaskExtractor:
         self.sam_processor = Sam2Processor.from_pretrained(sam_id)
         self.sam = Sam2Model.from_pretrained(sam_id, torch_dtype=self.dtype).to(self.device).eval()
 
-        # SegFormer-clothes (primary source of truth for body/clothing semantics)
+        # SegFormer-clothes (primary source of truth for body/clothing semantics).
+        # We do the resize ourselves (aspect-preserving, longest side =
+        # ``segformer_res``) and pass ``do_resize=False`` at call time. The
+        # processor's default ``{height,width}`` resize forces a square,
+        # which severely distorts tall/wide images at high resolutions and
+        # *decreases* mask accuracy as ``segformer_res`` grows.
         self.seg_processor = SegformerImageProcessor.from_pretrained(SEGFORMER_ID)
-        self.seg_processor.size = {"height": config.segformer_res, "width": config.segformer_res}
         self.seg = AutoModelForSemanticSegmentation.from_pretrained(
             SEGFORMER_ID, dtype=self.dtype
         ).to(self.device).eval()
@@ -155,14 +178,49 @@ class SubjectMaskExtractor:
         return boxes
 
     def _run_segformer(self, pil_image) -> np.ndarray:
-        """Return (H, W) int32 class map at original image resolution."""
-        inputs = self.seg_processor(images=pil_image, return_tensors="pt").to(self.device)
+        """Return (H, W) int32 class map at original image resolution.
+
+        Aspect-preserving: longest side resized to ``segformer_res``, the
+        other side rounded to a multiple of 32 (SegFormer's stride). Square
+        forcing produced large drops in mask coverage on tall portraits at
+        high resolutions because the horizontal upscale fed the model
+        interpolation artifacts at scales it was never trained on.
+        """
+        from PIL import Image
+
+        target = int(self.config.segformer_res)
+        W, H = pil_image.size
+        if H >= W:
+            new_h = target
+            new_w = max(32, int(round(W * target / H / 32)) * 32)
+        else:
+            new_w = target
+            new_h = max(32, int(round(H * target / W / 32)) * 32)
+        pil_in = pil_image if (new_w, new_h) == (W, H) else pil_image.resize(
+            (new_w, new_h), Image.BICUBIC
+        )
+
+        inputs = self.seg_processor(
+            images=pil_in, return_tensors="pt", do_resize=False,
+        ).to(self.device)
         inputs["pixel_values"] = inputs["pixel_values"].to(self.dtype)
         with torch.inference_mode():
             logits = self.seg(**inputs).logits
             up = F.interpolate(logits.float(),
-                               size=(pil_image.size[1], pil_image.size[0]),
+                               size=(H, W),
                                mode="bilinear", align_corners=False)
+            # Skin-tone bias: where the image looks like skin in YCrCb,
+            # add a positive bias to body-class logits so close-call
+            # clothing/body pixels tip into body. Disabled at 0 (default).
+            bias = float(getattr(self.config, "skin_bias", 0.0))
+            if bias > 0.0 and len(self._body_ids) > 0:
+                skin = _skin_probability(np.asarray(pil_image, dtype=np.uint8))
+                skin_t = torch.from_numpy(skin).to(up.device, dtype=up.dtype)
+                skin_t = skin_t.unsqueeze(0).unsqueeze(0)
+                body_idx = torch.tensor(
+                    sorted(self._body_ids), device=up.device, dtype=torch.long,
+                )
+                up[:, body_idx] = up[:, body_idx] + bias * skin_t
             class_map = up.argmax(dim=1).squeeze(0).cpu().numpy().astype(np.int32)
         return class_map
 
@@ -193,6 +251,21 @@ class SubjectMaskExtractor:
         clothing_mask = _smooth_mask(clothing_parse, close_radius=2)
         # person = body ∪ clothing (pure SegFormer), then closed + hole-filled.
         person_mask = _smooth_mask(body_mask | clothing_mask, close_radius=3)
+
+        # True dilation grows the outer boundary (closing only fills holes),
+        # so this is the knob users reach for when they want a padded mask.
+        dilate_r = int(getattr(self.config, "mask_dilate_radius", 0))
+        if dilate_r > 0:
+            try:
+                from scipy.ndimage import (binary_dilation,
+                                            generate_binary_structure,
+                                            iterate_structure)
+                struct = iterate_structure(
+                    generate_binary_structure(2, 2), dilate_r,
+                )
+                person_mask = binary_dilation(person_mask, structure=struct)
+            except Exception:
+                pass
 
         return {
             "person": person_mask.astype(np.bool_),

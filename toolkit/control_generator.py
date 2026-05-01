@@ -28,7 +28,9 @@ img_ext_list = ['.jpg', '.jpeg', '.png', '.webp']
 
 
 class ControlGenerator:
-    def __init__(self, device, sd=None):
+    DEFAULT_DEPTH_MODEL_ID = "depth-anything/Depth-Anything-V2-Large-hf"
+
+    def __init__(self, device, sd=None, depth_model_id: str = None):
         self.device = device
         self.sd = sd  # optional. It will unload the model if not None
         self.has_unloaded = False
@@ -38,6 +40,11 @@ class ControlGenerator:
         self.control_bg_remover = None
         self.debug = False
         self.regen = False
+        # Per-instance depth model override; falls back to DA2-Large.
+        # Callers (e.g. `setup_controls`) can pass `depth_consistency.model_id`
+        # so the conditioning depth comes from the same model as the loss
+        # perceptor.
+        self.depth_model_id: str = depth_model_id or self.DEFAULT_DEPTH_MODEL_ID
 
     def get_control_path(self, img_path, control_type: ControlTypes):
         if self.regen:
@@ -95,7 +102,7 @@ class ControlGenerator:
                 from transformers import pipeline
                 self.control_depth_model = pipeline(
                     task="depth-estimation",
-                    model="depth-anything/Depth-Anything-V2-Large-hf",
+                    model=self.depth_model_id,
                     device=device,
                     torch_dtype=torch.float16
                 )

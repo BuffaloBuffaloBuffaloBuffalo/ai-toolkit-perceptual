@@ -1877,6 +1877,19 @@ export default function SimpleJob({
                             <NumberInput label="Max t" value={dataset.depth_loss_max_t ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].depth_loss_max_t`)} placeholder="inherit" min={0} max={1} />
                           </div>
                         </div>
+                        {/* Loss Alternation: alternate diffusion / depth per optimizer step */}
+                        <div>
+                          <div className="text-xs font-medium text-gray-400 mb-1">Loss Alternation</div>
+                          <SelectInput
+                            label="Loss Split"
+                            value={dataset.loss_split ?? ''}
+                            onChange={value => setJobConfig(value === '' ? null : value, `config.process[0].datasets[${i}].loss_split`)}
+                            options={[
+                              { value: '', label: 'None (all losses fire)' },
+                              { value: 'diffusion_depth', label: 'Diffusion / Depth alternating' },
+                            ]}
+                          />
+                        </div>
                         {/* Subject Mask Region Weights */}
                         {jobConfig.config.process[0].subject_mask?.enabled && (
                           <div>

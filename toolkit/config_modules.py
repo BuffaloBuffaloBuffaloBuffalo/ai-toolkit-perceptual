@@ -1168,6 +1168,19 @@ class DatasetConfig:
         self.depth_loss_weight: Union[float, None] = kwargs.get('depth_loss_weight', None)
         self.depth_loss_min_t: Union[float, None] = kwargs.get('depth_loss_min_t', None)
         self.depth_loss_max_t: Union[float, None] = kwargs.get('depth_loss_max_t', None)
+        # Per-optimizer-step alternation between diffusion and depth losses
+        # for this dataset's samples. None = both fire as normal. The gating
+        # keys on self.step_num (advanced after each full accumulation
+        # window) so all microbatches in one optimizer step see the same
+        # active loss — Adam integrates clean single-objective gradients.
+        # Other auxiliaries (identity, body_*, normal, vae_anchor, latent
+        # perceptual) are unaffected and fire as their own gating allows.
+        self.loss_split: Union[str, None] = kwargs.get('loss_split', None)
+        if self.loss_split is not None and self.loss_split not in ('diffusion_depth',):
+            raise ValueError(
+                f"Unknown loss_split value: {self.loss_split!r}. "
+                "Allowed: None, 'diffusion_depth'"
+            )
         # Subject mask (Phase 2) per-dataset overrides: None inherits global SubjectMaskConfig
         self.background_loss_weight: Union[float, None] = kwargs.get('background_loss_weight', None)
         self.clothing_loss_weight: Union[float, None] = kwargs.get('clothing_loss_weight', None)

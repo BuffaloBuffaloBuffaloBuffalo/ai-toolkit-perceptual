@@ -171,6 +171,7 @@ class FileItemDTO(
         self.depth_loss_weight: Union[float, None] = self.dataset_config.depth_loss_weight
         self.depth_loss_min_t: Union[float, None] = self.dataset_config.depth_loss_min_t
         self.depth_loss_max_t: Union[float, None] = self.dataset_config.depth_loss_max_t
+        self.loss_split: Union[str, None] = self.dataset_config.loss_split
         # Subject mask (Phase 2) per-dataset overrides; None = inherit global SubjectMaskConfig
         self.background_loss_weight: Union[float, None] = self.dataset_config.background_loss_weight
         self.clothing_loss_weight: Union[float, None] = self.dataset_config.clothing_loss_weight
@@ -382,6 +383,9 @@ class DataLoaderBatchDTO:
             ]
             self.depth_loss_max_t_list: List[Union[float, None]] = [
                 x.depth_loss_max_t for x in self.file_items
+            ]
+            self.loss_split_list: List[Union[str, None]] = [
+                x.loss_split for x in self.file_items
             ]
             self.landmark_loss_weight_list: List[Union[float, None]] = [
                 x.landmark_loss_weight for x in self.file_items

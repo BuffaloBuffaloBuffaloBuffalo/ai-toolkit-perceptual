@@ -1689,6 +1689,19 @@ class SDTrainer(BaseSDTrainProcess):
             [bool(v) for v in is_reg_list],
             device=self.device_torch, dtype=torch.bool,
         )
+        # Per-sample loss-split flag — see DatasetConfig.loss_split. When
+        # set to 'diffusion_depth', the dataset alternates which big loss
+        # fires per optimizer step (not per microbatch — gating keys on
+        # self.step_num, which only advances after the full accumulation
+        # window completes, so all microbatches in one optimizer step see
+        # the same active loss). Even step_num: diffusion only; odd: depth
+        # only. Other auxiliaries fire as their own gating allows on both.
+        _split_list = getattr(batch, 'loss_split_list', None) or [None] * is_reg_per_sample.shape[0]
+        loss_split_diff_depth = torch.tensor(
+            [s == 'diffusion_depth' for s in _split_list],
+            device=self.device_torch, dtype=torch.bool,
+        )
+        _step_is_diffusion = (self.step_num % 2 == 0)
         additional_loss = 0.0
         # Reset every microbatch so a step where depth doesn't contribute
         # leaves the dual-backward block with no tensor to act on.
@@ -2117,6 +2130,15 @@ class SDTrainer(BaseSDTrainProcess):
 
         # apply per-sample diffusion loss weight overrides
         per_sample_diff_w = batch.diffusion_loss_weight_list
+        # Loss-split gate: on depth steps, force per-sample diff weight to 0
+        # for samples whose dataset has loss_split='diffusion_depth'. The
+        # zero-weight samples are then excluded from active_count below
+        # (mirrors the depth_loss_weight=0 short-circuit at the depth path).
+        if loss_split_diff_depth.any() and not _step_is_diffusion:
+            per_sample_diff_w = list(per_sample_diff_w)
+            for _i in range(len(per_sample_diff_w)):
+                if loss_split_diff_depth[_i]:
+                    per_sample_diff_w[_i] = 0.0
         if any(w is not None for w in per_sample_diff_w):
             global_diff_w = self.train_config.diffusion_loss_weight
             diff_weights = torch.tensor(
@@ -3281,6 +3303,12 @@ class SDTrainer(BaseSDTrainProcess):
                 [w if w is not None else _dc_cfg.loss_weight for w in _dc_w_list],
                 device=_dc_t.device, dtype=_dc_t.dtype,
             )
+            # Loss-split gate: zero depth weight for split samples on
+            # diffusion steps. The _dc_active filter below then drops them
+            # so the depth perceptor forward is also skipped.
+            if loss_split_diff_depth.any() and _step_is_diffusion:
+                _split_mask = loss_split_diff_depth.to(_dc_eff_w.device, dtype=_dc_eff_w.dtype)
+                _dc_eff_w = _dc_eff_w * (1.0 - _split_mask)
             _dc_active = _dc_active & (_dc_eff_w > 0)
 
             if _dc_active.any():
@@ -3470,6 +3498,10 @@ class SDTrainer(BaseSDTrainProcess):
                 [w if w is not None else _dc_cfg.loss_weight for w in _dc_w_list],
                 device=_dc_t.device, dtype=_dc_t.dtype,
             )
+            # Loss-split gate (see image path).
+            if loss_split_diff_depth.any() and _step_is_diffusion:
+                _split_mask = loss_split_diff_depth.to(_dc_eff_w.device, dtype=_dc_eff_w.dtype)
+                _dc_eff_w = _dc_eff_w * (1.0 - _split_mask)
             _dc_active = _dc_active & (_dc_eff_w > 0)
 
             if _dc_active.any():

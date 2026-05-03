@@ -171,6 +171,57 @@ All three run as non-blocking background jobs. Start them and come back when the
 
 The `scripts/sample_dataset.py` utility builds a smaller dataset directory by sampling N random images (with their captions) from a larger source. Useful for building reg sets, running ablations, or making smoke-test datasets without copying everything.
 
+## Example: Handsome Squidward (single-image LoRA)
+
+A worked example of depth-anchored fine-tuning on a character that isn't well represented in the base model, with a **one-image dataset**.
+
+**The setup.** Handsome Squidward is a side character from a single 2009 SpongeBob SquarePants episode. Flux 2 Klein 9B doesn't reliably reproduce him out of the box; prompts default to regular Squidward or a confused human-squid hybrid. We trained a LoRA on a single official illustration to teach the model what he looks like, then tested whether the trained LoRA could generalize to angles and contexts that don't exist anywhere in the source material.
+
+**The dataset.** One image, one caption. That's it.
+
+```
+examples/squidward/dataset/
+├── 1.webp     # single training image
+└── 1.txt      # caption
+```
+
+The caption: *"a cartoon illustration of handsome squidward. he is standing confidently with his arms flared and his tentacle-hands on his hips. he is wearing a tight yellow shirt with a brown belt and gold buckle. he has four legs, two on each side close together. his legs are spread apart. there is a logo at the bottom of the frame."*
+
+**The config.** [`examples/squidward/config.yaml`](examples/squidward/config.yaml) is the full training config. Key settings:
+
+- **Network:** LoKr, linear/alpha 32, conv/alpha 16, full-rank, factor 8.
+- **Steps:** 1200, batch size 1, gradient accumulation 2.
+- **Dataset:** 1 image, `num_repeats: 50`.
+- **Depth anchor:** `loss_weight: 0.005`, `model_id: depth-anything/Depth-Anything-V2-Large-hf`, `input_size: 1400`. The lower weight matches the larger perceptor's higher gradient magnitude (see the depth-anchor section above).
+- **Loss splitting:** `loss_split: diffusion_depth` on the dataset, so depth and diffusion fire on alternating optimizer steps.
+- **Mask source: none.** Single-character cartoon images don't need masking.
+- **No identity / body-proportion anchors.** Handsome Squidward isn't a face ArcFace recognizes, and ViTPose doesn't apply to a squid body.
+
+**Watching the depth anchor work.** Each preview tile shows (GT RGB | GT depth | Pred RGB | Pred depth) side by side. At the start of training the predicted depth is unstructured noise; by the end it tracks the GT depth closely.
+
+| Early (step 21) | Late (step 1199) |
+|:---:|:---:|
+| ![Early preview](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/releases/download/examples-squidward-v1/preview_early.jpg) | ![Late preview](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/releases/download/examples-squidward-v1/preview_late.jpg) |
+| `depth_consistency_loss: 26.6` | `depth_consistency_loss: 1.6` |
+
+**Generalizing past the dataset.** The training image is a confident front-three-quarter pose. Generations from the trained LoRA hold the character identity in poses, framings, and contexts that don't exist in the source material:
+
+| | |
+|:---:|:---:|
+| ![Output 1](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/releases/download/examples-squidward-v1/output_1.png) | ![Output 2](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/releases/download/examples-squidward-v1/output_2.png) |
+
+The first output is a near-direct front view, and there is no front-view reference anywhere in the source material, let alone the dataset. Both outputs maintain the character's distinctive identity (chiseled face, squid morphology, the specific drawn-on aesthetic) while placing him in contexts the LoRA wasn't trained on.
+
+**Why it works.** From a single image, per-pixel diffusion MSE alone would just memorize the training photo. The depth anchor adds a structural objective that gets reinforced on the same one image, so the LoRA picks up a 3D-ish understanding of the character's shape that lets it interpolate to unseen angles. Loss splitting keeps the diffusion and depth gradients from interfering with each other, which dramatically reduces the texture burn-in that's the typical failure mode of one-shot LoRAs.
+
+**To reproduce:**
+
+```bash
+python run.py examples/squidward/config.yaml
+```
+
+Edit `model.name_or_path` in the config to point at your local Flux 2 Klein checkpoint before running.
+
 ## Configuration Reference
 
 Every fork-specific config option, grouped by the YAML block it lives in. Defaults shown match what you get if you omit the option entirely.

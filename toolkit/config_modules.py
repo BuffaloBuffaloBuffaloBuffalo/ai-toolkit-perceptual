@@ -944,8 +944,12 @@ class DepthConsistencyConfig:
     """
 
     def __init__(self, **kwargs):
-        # Enable by setting loss_weight > 0
-        self.loss_weight: float = kwargs.get('loss_weight', 0.0)
+        # Enable by setting loss_weight > 0. Default 0.1 is calibrated for
+        # DA2-Small. If you switch to DA2-Large, drop this to ~0.001 — the
+        # larger perceptor produces much higher-magnitude gradients and
+        # 0.1 will overpower the diffusion loss. If you see washed-out or
+        # over-smoothed outputs, halve the weight and retry.
+        self.loss_weight: float = kwargs.get('loss_weight', 0.1)
         self.loss_min_t: float = kwargs.get('loss_min_t', 0.0)
         self.loss_max_t: float = kwargs.get('loss_max_t', 1.0)
         # Frozen perceptor

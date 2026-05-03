@@ -1236,11 +1236,11 @@ export default function SimpleJob({
                   label="Depth Consistency Loss Weight"
                   docKey="depth_consistency.loss_weight"
                   className="pt-4"
-                  value={jobConfig.config.process[0].depth_consistency?.loss_weight ?? 0.0}
+                  value={jobConfig.config.process[0].depth_consistency?.loss_weight ?? 0.1}
                   onChange={value =>
                     setJobConfig(value, 'config.process[0].depth_consistency.loss_weight')
                   }
-                  placeholder="0 = disabled"
+                  placeholder="0.1 (Small) / 0.001 (Large); 0 = disabled"
                   min={0}
                 />
                 {(jobConfig.config.process[0].depth_consistency?.loss_weight ?? 0) > 0 && (

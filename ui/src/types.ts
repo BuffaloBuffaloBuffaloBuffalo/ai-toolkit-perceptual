@@ -134,6 +134,11 @@ export interface DatasetConfig {
   latent_perceptual_loss_weight?: number;
   latent_perceptual_loss_min_t?: number;
   latent_perceptual_loss_max_t?: number;
+  // Subject mask per-dataset overrides (undefined = inherit global subject_mask config)
+  background_loss_weight?: number;
+  clothing_loss_weight?: number;
+  body_loss_weight?: number;
+  perceptual_restrict_to_body?: boolean;
 }
 
 export interface EMAConfig {
@@ -301,6 +306,45 @@ export interface BodyIDConfig {
   init_scale: number;
 }
 
+export interface SubjectMaskConfig {
+  enabled: boolean;
+  yolo_ckpt?: string;
+  yolo_conf?: number;
+  primary_only?: boolean;
+  sam_size?: 'tiny' | 'small' | 'base_plus' | 'large';
+  segformer_res?: number;
+  cache_resolution?: number;
+  dtype?: 'fp16' | 'bf16' | 'fp32';
+  // Region loss-weight knobs — undefined = no-op (no weighting applied)
+  background_loss_weight?: number;
+  clothing_loss_weight?: number;
+  body_loss_weight?: number;
+  perceptual_restrict_to_body?: boolean;
+  // Debug: when true, cache_subject_masks writes a 5-panel tile.png per image
+  // to _face_id_cache/_previews/ for visual inspection
+  save_debug_previews?: boolean;
+}
+
+export interface DepthConsistencyConfig {
+  // Enable by setting loss_weight > 0
+  loss_weight?: number;
+  loss_min_t?: number;
+  loss_max_t?: number;
+  // Frozen Depth-Anything-V2 perceptor
+  model_id?: string;
+  input_size?: number;
+  // Loss composition (MiDaS formulation)
+  ssi_weight?: number;
+  grad_weight?: number;
+  grad_scales?: number;
+  // Spatial mask source
+  mask_source?: 'none' | 'subject' | 'body';
+  // Memory controls
+  grad_checkpoint?: boolean;
+  // Preview cadence (steps); 0 disables
+  preview_every?: number;
+}
+
 export interface ProcessConfig {
   type: string;
   sqlite_db_path?: string;
@@ -312,6 +356,8 @@ export interface ProcessConfig {
   slider?: SliderConfig;
   face_id?: FaceIDConfig;
   body_id?: BodyIDConfig;
+  subject_mask?: SubjectMaskConfig;
+  depth_consistency?: DepthConsistencyConfig;
   save: SaveConfig;
   datasets: DatasetConfig[];
   train: TrainConfig;

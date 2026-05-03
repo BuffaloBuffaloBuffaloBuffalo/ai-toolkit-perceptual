@@ -551,6 +551,255 @@ const docs: { [key: string]: ConfigDoc } = {
       </>
     ),
   },
+  'subject_mask.enabled': {
+    title: 'Subject Masking',
+    description: (
+      <>
+        Caches per-image person/body/clothing masks (YOLO person detection → SAM 2 silhouette →
+        SegFormer-clothes semantic parse). Masks are stored once per image in <code>_face_id_cache/</code>
+        alongside face embeddings, then used at training time to weight the diffusion loss by region.
+        <br /><br />
+        Enabling this alone has no effect on training — you must also set one of the region loss weights
+        (Background / Clothing / Body) or enable <i>Restrict Perceptual Losses to Body</i>.
+      </>
+    ),
+  },
+  'subject_mask.sam_size': {
+    title: 'SAM 2 Size',
+    description: (
+      <>
+        Model size for the SAM 2 silhouette stage. On an RTX 4090 at fp16, timings per image are roughly:
+        tiny ~15 ms, small ~15 ms, base_plus ~27 ms, large ~55 ms. Quality is nearly identical for
+        portraits — <b>small</b> is the recommended default.
+        <br /><br />
+        This only runs at cache time (once per image), so training-time cost is zero regardless of size.
+      </>
+    ),
+  },
+  'subject_mask.yolo_conf': {
+    title: 'YOLO Confidence Threshold',
+    description: (
+      <>
+        Minimum confidence for a detected person to be kept. 0.25 is a sensible default for COCO-trained
+        YOLO; raise it if you see spurious detections, lower it if detections are missed.
+      </>
+    ),
+  },
+  'subject_mask.primary_only': {
+    title: 'Primary Person Only',
+    description: (
+      <>
+        When enabled, only the largest detected person is masked — background strangers are dropped.
+        Recommended for identity LoRA training where you don't want loss signal from other people in
+        the frame. Disable if you're training a multi-person concept.
+      </>
+    ),
+  },
+  'subject_mask.segformer_res': {
+    title: 'SegFormer Resolution',
+    description: (
+      <>
+        Input resolution for the SegFormer-clothes parser. 768 is the recommended default. Higher values
+        (1024, 1280) produce cleaner class boundaries but are slower at cache time. Output is always
+        upsampled to the original image resolution before mask smoothing.
+      </>
+    ),
+  },
+  'subject_mask.cache_resolution': {
+    title: 'Cache Resolution',
+    description: (
+      <>
+        Size (in pixels) at which masks are stored on disk. 256 is sufficient for latent-space loss
+        weighting and keeps cache files tiny (~200 KB per image). Raise to 512 if you need finer
+        boundaries for perceptual losses, at roughly 4× storage cost.
+      </>
+    ),
+  },
+  'subject_mask.background_loss_weight': {
+    title: 'Background Loss Weight',
+    description: (
+      <>
+        Multiplier applied to the diffusion loss in the <i>background</i> region (pixels outside the person
+        silhouette). Leave empty for no change (default training). Set to <b>0</b> to completely ignore
+        the background, or a small value like 0.1 to de-emphasize it while still training on it.
+        <br /><br />
+        Per-dataset overrides take priority over this global value.
+      </>
+    ),
+  },
+  'subject_mask.clothing_loss_weight': {
+    title: 'Clothing Loss Weight',
+    description: (
+      <>
+        Multiplier applied to the diffusion loss on <i>clothing</i> pixels (dresses, pants, shirts, shoes,
+        bags, etc). Set below 1 to reduce the model's tendency to memorize specific garments while still
+        training faces and body.
+        <br /><br />
+        Per-dataset overrides take priority over this global value.
+      </>
+    ),
+  },
+  'subject_mask.body_loss_weight': {
+    title: 'Body Loss Weight',
+    description: (
+      <>
+        Multiplier applied to the diffusion loss on <i>body</i> pixels (hair, face, arms, legs — the
+        identity-relevant parts). Set above 1 to boost the loss signal for identity, or combine with
+        background/clothing weights to concentrate training on the subject's body.
+        <br /><br />
+        Per-dataset overrides take priority over this global value.
+      </>
+    ),
+  },
+  'subject_mask.perceptual_restrict_to_body': {
+    title: 'Restrict Perceptual Losses to Body',
+    description: (
+      <>
+        When enabled, per-pixel perceptual losses (currently the Sapiens normal loss) are masked to the
+        body region so they focus on identity-relevant surfaces (hair, skin) instead of clothing or
+        background. Items that haven't opted in keep their original perceptual loss unchanged.
+      </>
+    ),
+  },
+  'subject_mask.save_debug_previews': {
+    title: 'Save Debug Preview Tiles',
+    description: (
+      <>
+        When enabled, writes a 5-panel PNG per image to the job's output folder at
+        <code> &lt;training_folder&gt;/&lt;name&gt;/subject_mask_previews/&lt;stem&gt;.png</code> during mask caching:
+        original image, person overlay, body overlay, clothing overlay, and full SegFormer parse colormap.
+        Useful for spot-checking mask quality on new datasets before training.
+        <br /><br />
+        Previews live in the job output folder, not alongside the dataset, so they can't be picked up as
+        training images. Only runs during the first-time cache pass (cache-hit path is unaffected). Disable
+        after initial validation to avoid disk clutter — tiles are ~500 KB each.
+      </>
+    ),
+  },
+  'depth_consistency.loss_weight': {
+    title: 'Depth Consistency Loss Weight',
+    description: (
+      <>
+        Weight for a frozen Depth-Anything-V2 perceptor that encourages the generated image's depth map
+        to match the ground-truth image's depth map. Uses MiDaS's scale-and-shift-invariant L1 plus a
+        multi-scale gradient-matching term — both differentiable through DA2 back to the predicted pixels.
+        <br /><br />
+        Helps preserve body silhouette, limb separation, and subject-vs-background depth structure when
+        identity training tends to flatten or smear the composition. Start with 0.05–0.10. Set to 0 to
+        disable. DA2-Small (~25M params, ~50 MB in bf16) is loaded once; with gradient checkpointing it
+        adds ~300 MB peak VRAM and ~100 ms per training step.
+        <br /><br />
+        Requires the first-time pass to cache GT depth maps to <code>_face_id_cache/</code> next to face
+        embeddings — similar timing to face caching.
+      </>
+    ),
+  },
+  'depth_consistency.loss_min_t': {
+    title: 'Depth Min Timestep',
+    description: (
+      <>
+        Minimum noise timestep ratio (0–1) at which to apply the depth loss. Below this, x0_pred is too
+        noisy for DA2 to produce a stable depth map. Default 0.0 (all timesteps).
+      </>
+    ),
+  },
+  'depth_consistency.loss_max_t': {
+    title: 'Depth Max Timestep',
+    description: (
+      <>
+        Maximum noise timestep ratio (0–1) at which to apply the depth loss. Default 1.0. Consider capping
+        at 0.9 so the loss contributes only where x0_pred has enough structure for DA2 to latch onto.
+      </>
+    ),
+  },
+  'depth_consistency.mask_source': {
+    title: 'Depth Mask Source',
+    description: (
+      <>
+        Where to pull the spatial weighting mask from:
+        <ul>
+          <li><b>none</b> — full-image depth loss; penalizes background depth drift too.</li>
+          <li><b>subject</b> — uses the cached person/subject mask (requires Subject Masking enabled).</li>
+          <li><b>body</b> — uses the cached identity-only body mask (hair, skin, limbs).</li>
+        </ul>
+        <b>subject</b> is the usual choice: the model still has freedom over background composition while
+        depth structure on the subject is anchored. If Subject Masking is not enabled, falls back to full-
+        image loss regardless of this setting.
+      </>
+    ),
+  },
+  'depth_consistency.ssi_weight': {
+    title: 'SSI L1 Weight',
+    description: (
+      <>
+        Weight on the scale-and-shift-invariant L1 term (MiDaS / Ranftl et al.). This solves for the
+        optimal per-sample linear fit between predicted and GT depth in closed form, then L1s the residual
+        — absorbing global scale/offset differences so only depth <i>structure</i> is penalized. Default 1.0.
+      </>
+    ),
+  },
+  'depth_consistency.grad_weight': {
+    title: 'Gradient Matching Weight',
+    description: (
+      <>
+        Weight on the multi-scale gradient-matching L1 term (MiDaS). Penalizes disagreement in local depth
+        edges / contours across multiple resolutions. The single biggest contributor to sharp subject
+        silhouettes in the original MiDaS paper. Default 0.5.
+      </>
+    ),
+  },
+  'depth_consistency.grad_scales': {
+    title: 'Gradient Scales',
+    description: (
+      <>
+        Number of resolution levels for the gradient-matching term (avg-pool halving each step). Default 4.
+        More scales = smoother coarse structure; fewer = faster, more local-detail focused.
+      </>
+    ),
+  },
+  'depth_consistency.preview_every': {
+    title: 'Preview Every (steps)',
+    description: (
+      <>
+        Save a 4-panel composite <code>[GT RGB | GT depth | Pred RGB | Pred depth]</code> every N steps to
+        <code> &lt;training_folder&gt;/&lt;name&gt;/depth_previews/</code>. Useful for visually checking whether
+        the predicted depth structure is actually tracking the ground truth, beyond the scalar loss values.
+        <br /><br />
+        0 disables. Files are ~100–200 KB each; at every-100 cadence over 3,000 steps this writes ~30 files.
+      </>
+    ),
+  },
+  'depth_consistency.model_id': {
+    title: 'DA2 Model ID',
+    description: (
+      <>
+        HuggingFace ID of the Depth-Anything-V2 checkpoint to use as a frozen perceptor. Default
+        <code> depth-anything/Depth-Anything-V2-Small-hf</code> (~25M params). Other options:
+        <code> -Base-hf</code> (~98M, ~4–6 GB activations) and <code>-Large-hf</code> (~335M, 10+ GB — likely
+        OOMs alongside the main model). Keep to Small unless you have verified you have the VRAM headroom.
+      </>
+    ),
+  },
+  'depth_consistency.input_size': {
+    title: 'DA2 Input Size',
+    description: (
+      <>
+        Long-side input resolution for the DA2 perceptor. Must be a multiple of 14 (ViT patch size).
+        Default 518 — DA2's native training resolution. 392 is a cheaper option that still produces useful
+        depth structure; sizes above 518 waste compute without quality gains.
+      </>
+    ),
+  },
+  'depth_consistency.grad_checkpoint': {
+    title: 'Gradient Checkpointing (DA2)',
+    description: (
+      <>
+        Trades a small amount of compute for a large VRAM reduction during backward through DA2. Keep this
+        on unless you have verified extra VRAM to spare — roughly 3× activation memory savings at a ~20–30%
+        fwd+bwd time cost on the perceptor.
+      </>
+    ),
+  },
 };
 
 export const getDoc = (key: string | null | undefined): ConfigDoc | null => {

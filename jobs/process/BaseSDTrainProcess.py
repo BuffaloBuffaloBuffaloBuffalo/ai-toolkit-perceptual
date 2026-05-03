@@ -118,6 +118,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self._bp_loss_epoch_sum = 0.0
         self._bp_loss_epoch_count = 0
         self._pending_bp_loss_epoch_avg = None
+        # depth consistency loss epoch accumulation
+        self._dc_loss_epoch_sum = 0.0
+        self._dc_loss_epoch_count = 0
+        self._pending_dc_loss_epoch_avg = None
         # start at 1 so we can do a sample at the start
         self.grad_accumulation_step = 1
         # if true, then we do not do an optimizer step. We are accumulating gradients
@@ -192,7 +196,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         self.datasets = []
                     self.datasets.append(dataset)
                 self.dataset_configs.append(dataset)
-        
+
         self.is_caching_text_embeddings = any(
             dataset.cache_text_embeddings for dataset in self.dataset_configs
         )
@@ -513,6 +517,46 @@ class BaseSDTrainProcess(BaseTrainProcess):
     
     def end_step_hook(self):
         pass
+
+    def _log_pending_epoch_avgs(self):
+        """Emit any pending epoch-average scalars to the logger and clear
+        them. Each metric is dual-written under both its legacy key (for
+        back-compat with existing dashboards) and its canonical
+        ``subsystem/kind/variant`` key (consumed by the new metrics tab).
+        """
+        # Lazy-import to avoid a top-of-file dependency on the SDTrainer
+        # extension when this base class is reused by other trainers.
+        try:
+            from extensions_built_in.sd_trainer.metric_naming import (
+                CANONICAL_RENAMES,
+            )
+        except Exception:  # noqa: BLE001
+            CANONICAL_RENAMES = {}
+
+        def _emit(legacy_key, value):
+            self.logger.log({legacy_key: value})
+            canonical = CANONICAL_RENAMES.get(legacy_key)
+            if canonical is not None and canonical != legacy_key:
+                self.logger.log({canonical: value})
+
+        if self._pending_epoch_avg is not None:
+            _emit('loss/epoch_avg', self._pending_epoch_avg)
+            self._pending_epoch_avg = None
+        if self._pending_id_loss_epoch_avg is not None:
+            _emit('loss/identity_loss_epoch_avg', self._pending_id_loss_epoch_avg)
+            self._pending_id_loss_epoch_avg = None
+        if self._pending_diff_loss_epoch_avg is not None:
+            _emit('loss/diffusion_loss_epoch_avg', self._pending_diff_loss_epoch_avg)
+            self._pending_diff_loss_epoch_avg = None
+        if self._pending_id_sim_epoch_avg is not None:
+            _emit('id_sim_epoch_avg', self._pending_id_sim_epoch_avg)
+            self._pending_id_sim_epoch_avg = None
+        if self._pending_bp_loss_epoch_avg is not None:
+            _emit('loss/body_proportion_loss_epoch_avg', self._pending_bp_loss_epoch_avg)
+            self._pending_bp_loss_epoch_avg = None
+        if self._pending_dc_loss_epoch_avg is not None:
+            _emit('loss/depth_consistency_loss_epoch_avg', self._pending_dc_loss_epoch_avg)
+            self._pending_dc_loss_epoch_avg = None
 
     def save(self, step=None):
         if not self.accelerator.is_main_process:
@@ -2242,6 +2286,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
                                     self._pending_bp_loss_epoch_avg = self._bp_loss_epoch_sum / self._bp_loss_epoch_count
                                     self._bp_loss_epoch_sum = 0.0
                                     self._bp_loss_epoch_count = 0
+                                if self._dc_loss_epoch_count > 0:
+                                    self._pending_dc_loss_epoch_avg = self._dc_loss_epoch_sum / self._dc_loss_epoch_count
+                                    self._dc_loss_epoch_sum = 0.0
+                                    self._dc_loss_epoch_count = 0
                                 if self.train_config.gradient_accumulation_steps == -1:
                                     # if we are accumulating for an entire epoch, trigger a step
                                     self.is_grad_accumulation_step = False
@@ -2349,6 +2397,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     if 'body_proportion_loss' in loss_dict:
                         self._bp_loss_epoch_sum += loss_dict['body_proportion_loss']
                         self._bp_loss_epoch_count += 1
+                    if 'depth_consistency_loss' in loss_dict:
+                        self._dc_loss_epoch_sum += loss_dict['depth_consistency_loss']
+                        self._dc_loss_epoch_count += 1
 
                     prog_bar_string = f"lr: {learning_rate:.1e}"
                     for key, value in loss_dict.items():
@@ -2420,6 +2471,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                                         self.writer.add_scalar("id_sim_epoch_avg", self._pending_id_sim_epoch_avg, self.step_num)
                                     if self._pending_bp_loss_epoch_avg is not None:
                                         self.writer.add_scalar("body_proportion_loss_epoch_avg", self._pending_bp_loss_epoch_avg, self.step_num)
+                                    if self._pending_dc_loss_epoch_avg is not None:
+                                        self.writer.add_scalar("depth_consistency_loss_epoch_avg", self._pending_dc_loss_epoch_avg, self.step_num)
                                 if self.progress_bar is not None:
                                     self.progress_bar.unpause()
 
@@ -2429,26 +2482,15 @@ class BaseSDTrainProcess(BaseTrainProcess):
                                 'learning_rate': learning_rate,
                             })
                             if loss_dict is not None:
+                                # Step 4: keys are now fully qualified by
+                                # SDTrainer.hook_train_loop's `apply_dual_write`
+                                # call — both legacy snake_case and canonical
+                                # `subsystem/kind/variant` siblings are present.
+                                # No more conditional `loss/` prefix; just log
+                                # whatever the trainer emits.
                                 for key, value in loss_dict.items():
-                                    if key == 'loss' or key.startswith('loss'):
-                                        self.logger.log({f'loss/{key}': value})
-                                    else:
-                                        self.logger.log({key: value})
-                            if self._pending_epoch_avg is not None:
-                                self.logger.log({'loss/epoch_avg': self._pending_epoch_avg})
-                                self._pending_epoch_avg = None
-                            if self._pending_id_loss_epoch_avg is not None:
-                                self.logger.log({'loss/identity_loss_epoch_avg': self._pending_id_loss_epoch_avg})
-                                self._pending_id_loss_epoch_avg = None
-                            if self._pending_diff_loss_epoch_avg is not None:
-                                self.logger.log({'loss/diffusion_loss_epoch_avg': self._pending_diff_loss_epoch_avg})
-                                self._pending_diff_loss_epoch_avg = None
-                            if self._pending_id_sim_epoch_avg is not None:
-                                self.logger.log({'id_sim_epoch_avg': self._pending_id_sim_epoch_avg})
-                                self._pending_id_sim_epoch_avg = None
-                            if self._pending_bp_loss_epoch_avg is not None:
-                                self.logger.log({'loss/body_proportion_loss_epoch_avg': self._pending_bp_loss_epoch_avg})
-                                self._pending_bp_loss_epoch_avg = None
+                                    self.logger.log({key: value})
+                            self._log_pending_epoch_avgs()
                     elif self.logging_config.log_every is None:
                         if self.accelerator.is_main_process:
                             # log every step
@@ -2456,25 +2498,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                                 'learning_rate': learning_rate,
                             })
                             for key, value in loss_dict.items():
-                                if key == 'loss' or key.startswith('loss'):
-                                    self.logger.log({f'loss/{key}': value})
-                                else:
-                                    self.logger.log({key: value})
-                            if self._pending_epoch_avg is not None:
-                                self.logger.log({'loss/epoch_avg': self._pending_epoch_avg})
-                                self._pending_epoch_avg = None
-                            if self._pending_id_loss_epoch_avg is not None:
-                                self.logger.log({'loss/identity_loss_epoch_avg': self._pending_id_loss_epoch_avg})
-                                self._pending_id_loss_epoch_avg = None
-                            if self._pending_diff_loss_epoch_avg is not None:
-                                self.logger.log({'loss/diffusion_loss_epoch_avg': self._pending_diff_loss_epoch_avg})
-                                self._pending_diff_loss_epoch_avg = None
-                            if self._pending_id_sim_epoch_avg is not None:
-                                self.logger.log({'id_sim_epoch_avg': self._pending_id_sim_epoch_avg})
-                                self._pending_id_sim_epoch_avg = None
-                            if self._pending_bp_loss_epoch_avg is not None:
-                                self.logger.log({'loss/body_proportion_loss_epoch_avg': self._pending_bp_loss_epoch_avg})
-                                self._pending_bp_loss_epoch_avg = None
+                                self.logger.log({key: value})
+                            self._log_pending_epoch_avgs()
 
 
                     if self.performance_log_every > 0 and self.step_num % self.performance_log_every == 0:
@@ -2491,9 +2516,16 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     with self.timer('commit_logger'):
                         self.logger.commit(step=self.step_num)
 
-                # sets progress bar to match out step
+                # Sets progress bar to "completed N steps" semantics so
+                # tqdm's "X/total" display matches the sqlite step that
+                # was just logged for this iteration. Pre-fix, after iter
+                # 0 the bar still read 0/total even though sqlite already
+                # had a row at step=1 (off-by-one — confused users
+                # comparing the tqdm log line to the chart). Verified no
+                # other code reads `progress_bar.n`, so this is purely a
+                # display fix.
                 if self.progress_bar is not None:
-                    self.progress_bar.update(step - self.progress_bar.n)
+                    self.progress_bar.update(step + 1 - self.progress_bar.n)
 
                 #############################
                 # End of step

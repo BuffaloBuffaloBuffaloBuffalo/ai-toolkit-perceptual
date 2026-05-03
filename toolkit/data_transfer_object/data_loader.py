@@ -168,6 +168,10 @@ class FileItemDTO(
         self.latent_perceptual_loss_weight: Union[float, None] = self.dataset_config.latent_perceptual_loss_weight
         self.latent_perceptual_loss_min_t: Union[float, None] = self.dataset_config.latent_perceptual_loss_min_t
         self.latent_perceptual_loss_max_t: Union[float, None] = self.dataset_config.latent_perceptual_loss_max_t
+        self.depth_loss_weight: Union[float, None] = self.dataset_config.depth_loss_weight
+        self.depth_loss_min_t: Union[float, None] = self.dataset_config.depth_loss_min_t
+        self.depth_loss_max_t: Union[float, None] = self.dataset_config.depth_loss_max_t
+        self.loss_split: Union[str, None] = self.dataset_config.loss_split
         # Subject mask (Phase 2) per-dataset overrides; None = inherit global SubjectMaskConfig
         self.background_loss_weight: Union[float, None] = self.dataset_config.background_loss_weight
         self.clothing_loss_weight: Union[float, None] = self.dataset_config.clothing_loss_weight
@@ -238,6 +242,10 @@ class DataLoaderBatchDTO:
             self.landmark_embedding: Union[torch.Tensor, None] = None
             self.body_proportion_embedding: Union[torch.Tensor, None] = None
             self.body_shape_embedding: Union[torch.Tensor, None] = None
+            # Depth consistency loss: per-image GT depth maps (variable shape)
+            self.depth_gt_list: Union[list, None] = None
+            # Depth consistency loss (video): per-video GT depth cubes, (T, H, W)
+            self.depth_gt_video_list: Union[list, None] = None
             self.normal_embedding: Union[torch.Tensor, None] = None
             self.vae_anchor_features: Union[Dict, None] = None  # per-level VAE encoder features
             self.face_bboxes: Union[List, None] = None  # per-item face bboxes in original image coords
@@ -366,6 +374,18 @@ class DataLoaderBatchDTO:
             ]
             self.latent_perceptual_loss_max_t_list: List[Union[float, None]] = [
                 x.latent_perceptual_loss_max_t for x in self.file_items
+            ]
+            self.depth_loss_weight_list: List[Union[float, None]] = [
+                x.depth_loss_weight for x in self.file_items
+            ]
+            self.depth_loss_min_t_list: List[Union[float, None]] = [
+                x.depth_loss_min_t for x in self.file_items
+            ]
+            self.depth_loss_max_t_list: List[Union[float, None]] = [
+                x.depth_loss_max_t for x in self.file_items
+            ]
+            self.loss_split_list: List[Union[str, None]] = [
+                x.loss_split for x in self.file_items
             ]
             self.landmark_loss_weight_list: List[Union[float, None]] = [
                 x.landmark_loss_weight for x in self.file_items
@@ -630,6 +650,18 @@ class DataLoaderBatchDTO:
                         bs_embeds.append(torch.zeros(1, 10))
                 self.body_shape_embedding = torch.cat(bs_embeds, dim=0)
 
+            # collect GT depth maps (variable per-image shape — kept as list)
+            if any([getattr(x, 'depth_gt', None) is not None for x in self.file_items]):
+                self.depth_gt_list = [
+                    getattr(x, 'depth_gt', None) for x in self.file_items
+                ]
+
+            # collect GT depth cubes for video items (T, H, W) float16 — list
+            if any([getattr(x, 'depth_gt_video', None) is not None for x in self.file_items]):
+                self.depth_gt_video_list = [
+                    getattr(x, 'depth_gt_video', None) for x in self.file_items
+                ]
+
             # collect normal embeddings (Sapiens normal maps, for normal loss)
             if any([getattr(x, 'normal_embedding', None) is not None for x in self.file_items]):
                 nm_embeds = []
@@ -759,6 +791,8 @@ class DataLoaderBatchDTO:
         del self.landmark_embedding
         del self.body_proportion_embedding
         del self.body_shape_embedding
+        del self.depth_gt_list
+        del self.depth_gt_video_list
         del self.normal_embedding
         del self.vae_anchor_features
         del self.face_bboxes

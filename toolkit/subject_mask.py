@@ -43,7 +43,7 @@ BODY_CLASSES = {"Hair", "Face", "Left-arm", "Right-arm", "Left-leg", "Right-leg"
 CLOTHING_CLASSES = {"Hat", "Sunglasses", "Upper-clothes", "Skirt", "Pants",
                     "Dress", "Belt", "Left-shoe", "Right-shoe", "Bag", "Scarf"}
 
-CACHE_VERSION_KEY = "subject_mask_v1"
+CACHE_VERSION_KEY = "subject_mask_v2"  # v2: cached from dataloader-transformed pixels (flip+scale+crop), not raw file
 
 
 # ============================================================
@@ -57,6 +57,25 @@ def _fill_holes(mask: np.ndarray) -> np.ndarray:
         return binary_fill_holes(mask.astype(bool)).astype(np.uint8)
     except Exception:
         return mask.astype(np.uint8)
+
+
+def _skin_probability(image_rgb_u8: np.ndarray) -> np.ndarray:
+    """Soft skin-tone probability map in [0, 1] from a uint8 RGB image.
+
+    Uses the classical YCrCb thresholds (Cr ∈ [133, 173], Cb ∈ [77, 127])
+    blurred for a smooth probability. Tone-agnostic across most skin tones;
+    over-dark or over-light skin can fall outside the range. Cheap (~ms
+    per frame) and adds no model dependencies.
+    """
+    try:
+        import cv2
+        ycc = cv2.cvtColor(image_rgb_u8, cv2.COLOR_RGB2YCrCb)
+        cr = ycc[..., 1].astype(np.float32)
+        cb = ycc[..., 2].astype(np.float32)
+        m = ((cr >= 133) & (cr <= 173) & (cb >= 77) & (cb <= 127)).astype(np.float32)
+        return cv2.GaussianBlur(m, (7, 7), 0)
+    except Exception:
+        return np.zeros(image_rgb_u8.shape[:2], dtype=np.float32)
 
 
 def _smooth_mask(mask: np.ndarray, close_radius: int = 3, do_fill: bool = True) -> np.ndarray:
@@ -119,9 +138,13 @@ class SubjectMaskExtractor:
         self.sam_processor = Sam2Processor.from_pretrained(sam_id)
         self.sam = Sam2Model.from_pretrained(sam_id, torch_dtype=self.dtype).to(self.device).eval()
 
-        # SegFormer-clothes (primary source of truth for body/clothing semantics)
+        # SegFormer-clothes (primary source of truth for body/clothing semantics).
+        # We do the resize ourselves (aspect-preserving, longest side =
+        # ``segformer_res``) and pass ``do_resize=False`` at call time. The
+        # processor's default ``{height,width}`` resize forces a square,
+        # which severely distorts tall/wide images at high resolutions and
+        # *decreases* mask accuracy as ``segformer_res`` grows.
         self.seg_processor = SegformerImageProcessor.from_pretrained(SEGFORMER_ID)
-        self.seg_processor.size = {"height": config.segformer_res, "width": config.segformer_res}
         self.seg = AutoModelForSemanticSegmentation.from_pretrained(
             SEGFORMER_ID, dtype=self.dtype
         ).to(self.device).eval()
@@ -155,14 +178,49 @@ class SubjectMaskExtractor:
         return boxes
 
     def _run_segformer(self, pil_image) -> np.ndarray:
-        """Return (H, W) int32 class map at original image resolution."""
-        inputs = self.seg_processor(images=pil_image, return_tensors="pt").to(self.device)
+        """Return (H, W) int32 class map at original image resolution.
+
+        Aspect-preserving: longest side resized to ``segformer_res``, the
+        other side rounded to a multiple of 32 (SegFormer's stride). Square
+        forcing produced large drops in mask coverage on tall portraits at
+        high resolutions because the horizontal upscale fed the model
+        interpolation artifacts at scales it was never trained on.
+        """
+        from PIL import Image
+
+        target = int(self.config.segformer_res)
+        W, H = pil_image.size
+        if H >= W:
+            new_h = target
+            new_w = max(32, int(round(W * target / H / 32)) * 32)
+        else:
+            new_w = target
+            new_h = max(32, int(round(H * target / W / 32)) * 32)
+        pil_in = pil_image if (new_w, new_h) == (W, H) else pil_image.resize(
+            (new_w, new_h), Image.BICUBIC
+        )
+
+        inputs = self.seg_processor(
+            images=pil_in, return_tensors="pt", do_resize=False,
+        ).to(self.device)
         inputs["pixel_values"] = inputs["pixel_values"].to(self.dtype)
         with torch.inference_mode():
             logits = self.seg(**inputs).logits
             up = F.interpolate(logits.float(),
-                               size=(pil_image.size[1], pil_image.size[0]),
+                               size=(H, W),
                                mode="bilinear", align_corners=False)
+            # Skin-tone bias: where the image looks like skin in YCrCb,
+            # add a positive bias to body-class logits so close-call
+            # clothing/body pixels tip into body. Disabled at 0 (default).
+            bias = float(getattr(self.config, "skin_bias", 0.0))
+            if bias > 0.0 and len(self._body_ids) > 0:
+                skin = _skin_probability(np.asarray(pil_image, dtype=np.uint8))
+                skin_t = torch.from_numpy(skin).to(up.device, dtype=up.dtype)
+                skin_t = skin_t.unsqueeze(0).unsqueeze(0)
+                body_idx = torch.tensor(
+                    sorted(self._body_ids), device=up.device, dtype=torch.long,
+                )
+                up[:, body_idx] = up[:, body_idx] + bias * skin_t
             class_map = up.argmax(dim=1).squeeze(0).cpu().numpy().astype(np.int32)
         return class_map
 
@@ -172,6 +230,10 @@ class SubjectMaskExtractor:
 
     def extract(self, pil_image) -> Dict[str, np.ndarray]:
         """Extract {person, body, clothing} bool masks at original resolution.
+
+        Also returns the raw SegFormer ``class_map`` (int32 class ids) and the
+        list of YOLO ``boxes`` so callers (e.g. debug preview rendering) can
+        visualize detector inputs alongside masks.
 
         SAM is run (for debug / reference) but NOT intersected into the final
         masks — SegFormer is primary source of truth.
@@ -185,19 +247,32 @@ class SubjectMaskExtractor:
         body_parse = np.isin(class_map, list(self._body_ids))
         clothing_parse = np.isin(class_map, list(self._clothing_ids))
 
-        body_mask = _smooth_mask(body_parse, close_radius=2)
+        body_mask = _smooth_mask(body_parse, close_radius=int(self.config.body_close_radius))
         clothing_mask = _smooth_mask(clothing_parse, close_radius=2)
         # person = body ∪ clothing (pure SegFormer), then closed + hole-filled.
         person_mask = _smooth_mask(body_mask | clothing_mask, close_radius=3)
 
-        # If YOLO found nothing, we keep the SegFormer-derived masks as-is — an
-        # empty mask is a warning, not an error (mirrors cache_face_embeddings).
-        _ = boxes  # intentional: kept available if we want to intersect later
+        # True dilation grows the outer boundary (closing only fills holes),
+        # so this is the knob users reach for when they want a padded mask.
+        dilate_r = int(getattr(self.config, "mask_dilate_radius", 0))
+        if dilate_r > 0:
+            try:
+                from scipy.ndimage import (binary_dilation,
+                                            generate_binary_structure,
+                                            iterate_structure)
+                struct = iterate_structure(
+                    generate_binary_structure(2, 2), dilate_r,
+                )
+                person_mask = binary_dilation(person_mask, structure=struct)
+            except Exception:
+                pass
 
         return {
             "person": person_mask.astype(np.bool_),
             "body": body_mask.astype(np.bool_),
             "clothing": clothing_mask.astype(np.bool_),
+            "class_map": class_map.astype(np.int32),
+            "boxes": boxes,
         }
 
     def cleanup(self):
@@ -221,6 +296,142 @@ class SubjectMaskExtractor:
 
 
 # ============================================================
+# Debug preview rendering
+# ============================================================
+
+
+def _overlay_mask(image_rgb: np.ndarray, mask: np.ndarray, color, alpha: float = 0.55) -> np.ndarray:
+    """Blend a binary mask onto an RGB image with a solid color + yellow outline."""
+    out = image_rgb.astype(np.float32).copy()
+    m = mask[..., None].astype(np.float32)
+    color_layer = np.array(color, dtype=np.float32)
+    out = out * (1 - alpha * m) + color_layer * alpha * m
+    try:
+        from scipy.ndimage import binary_dilation
+        border = binary_dilation(mask.astype(bool), iterations=2) & (~mask.astype(bool))
+        out[border] = np.array([255, 255, 0])
+    except Exception:
+        pass
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def _colormap_from_classes(class_map: np.ndarray, n_classes: int) -> np.ndarray:
+    """Render a class map to an RGB color image using a deterministic palette."""
+    rng = np.random.RandomState(7)
+    pal = np.zeros((n_classes, 3), dtype=np.uint8)
+    for i in range(1, n_classes):
+        pal[i] = rng.randint(40, 230, 3)
+    return pal[class_map.astype(np.int32)]
+
+
+def _render_preview_tile_from_cache(
+    pil_image,
+    person_t: torch.Tensor,
+    body_t: torch.Tensor,
+    clothing_t: torch.Tensor,
+    col_width: int = 380,
+):
+    """4-panel tile from cached bool masks: image | person | body | clothing.
+
+    Used for upfront QC previews on cache hit, where the SegFormer ``class_map``
+    isn't stored. Mirrors :func:`_render_preview_tile` minus the parse colormap.
+    """
+    from PIL import Image, ImageDraw, ImageFont
+    img_np = np.array(pil_image)
+    H, W = img_np.shape[:2]
+
+    def _bool_to_np(t: torch.Tensor) -> np.ndarray:
+        # _overlay_mask expects 0/1 (it does alpha*m); 0/255 saturates the blend.
+        m = t.detach().cpu().to(torch.uint8).numpy()
+        if m.shape != (H, W):
+            # Resize via 0/255 so PIL.NEAREST works on visible values, then rebinarize.
+            m255 = (m * 255)
+            m = np.array(Image.fromarray(m255).resize((W, H), Image.NEAREST))
+            m = (m > 127).astype(np.uint8)
+        return m
+
+    person = _bool_to_np(person_t)
+    body = _bool_to_np(body_t)
+    clothing = _bool_to_np(clothing_t)
+
+    ov_person = _overlay_mask(img_np, person, (100, 180, 255))
+    ov_body = _overlay_mask(img_np, body, (255, 120, 80))
+    ov_clothing = _overlay_mask(img_np, clothing, (120, 255, 120))
+
+    panels = [img_np, ov_person, ov_body, ov_clothing]
+    labels = ["Original", "Person", "Body (hair+face+limbs)", "Clothing"]
+
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 14)
+    except Exception:
+        font = ImageFont.load_default()
+
+    resized = []
+    for a in panels:
+        r = col_width / a.shape[1]
+        new_h = int(a.shape[0] * r)
+        resized.append(np.array(Image.fromarray(a).resize((col_width, new_h), Image.BILINEAR)))
+    h_max = max(a.shape[0] for a in resized)
+    label_h = 26
+    canvas = Image.new("RGB", (col_width * len(panels) + 8 * (len(panels) - 1),
+                               h_max + label_h), (20, 20, 20))
+    draw = ImageDraw.Draw(canvas)
+    x = 0
+    for a, lbl in zip(resized, labels):
+        canvas.paste(Image.fromarray(a), (x, label_h))
+        draw.text((x + 6, 6), lbl, fill=(230, 230, 230), font=font)
+        x += col_width + 8
+    return canvas
+
+
+def _render_preview_tile(pil_image, masks: Dict[str, np.ndarray], n_classes: int,
+                         col_width: int = 380):
+    """5-panel tile: image | person | body | clothing | parse colormap.
+
+    Returns a PIL Image ready to save.
+    """
+    from PIL import Image, ImageDraw, ImageFont
+    img_np = np.array(pil_image)
+
+    person = masks["person"].astype(np.uint8)
+    body = masks["body"].astype(np.uint8)
+    clothing = masks["clothing"].astype(np.uint8)
+    class_map = masks["class_map"]
+
+    ov_person = _overlay_mask(img_np, person, (100, 180, 255))
+    ov_body = _overlay_mask(img_np, body, (255, 120, 80))
+    ov_clothing = _overlay_mask(img_np, clothing, (120, 255, 120))
+    color_map = _colormap_from_classes(class_map, n_classes)
+    parse_blend = (img_np.astype(np.float32) * 0.5 + color_map.astype(np.float32) * 0.5)
+    parse_blend = np.clip(parse_blend, 0, 255).astype(np.uint8)
+
+    panels = [img_np, ov_person, ov_body, ov_clothing, parse_blend]
+    labels = ["Original", "Person", "Body (hair+face+limbs)", "Clothing", "Parse colormap"]
+
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 14)
+    except Exception:
+        font = ImageFont.load_default()
+
+    resized = []
+    for a in panels:
+        r = col_width / a.shape[1]
+        new_h = int(a.shape[0] * r)
+        resized.append(np.array(Image.fromarray(a).resize((col_width, new_h), Image.BILINEAR)))
+    h_max = max(a.shape[0] for a in resized)
+    label_h = 26
+    canvas = Image.new("RGB", (col_width * len(panels) + 8 * (len(panels) - 1),
+                               h_max + label_h), (20, 20, 20))
+    draw = ImageDraw.Draw(canvas)
+    x = 0
+    for a, lbl in zip(resized, labels):
+        canvas.paste(Image.fromarray(a), (x, label_h))
+        draw.text((x + 6, 6), lbl, fill=(230, 230, 230), font=font)
+        x += col_width + 8
+    return canvas
+
+
+# ============================================================
 # Cache helper
 # ============================================================
 
@@ -237,9 +448,66 @@ def _downsample_bool(mask: np.ndarray, target_hw: int) -> torch.Tensor:
     return (t.squeeze(0).squeeze(0) > 0.5).to(torch.bool)
 
 
+def _resize_bool(mask: np.ndarray, out_h: int, out_w: int) -> torch.Tensor:
+    """Nearest-neighbor resize a bool mask to (out_h, out_w). CPU torch.bool."""
+    t = torch.from_numpy(mask.astype(np.uint8)).float().unsqueeze(0).unsqueeze(0)
+    t = F.interpolate(t, size=(out_h, out_w), mode="nearest")
+    return (t.squeeze(0).squeeze(0) > 0.5).to(torch.bool)
+
+
+def _apply_dataloader_transform(
+    img,  # PIL.Image.Image in RGB
+    file_item: 'FileItemDTO',
+):
+    """Mirror of dataloader_mixins.load_and_process_image lines 774-793.
+
+    Applies deterministic flips + bucket resize + crop. Falls back to the
+    input image unchanged if bucket params aren't attached (non-bucketing
+    datasets or pre-setup_buckets invocations).
+    """
+    from PIL import Image as _Image
+
+    # Per-file deterministic flips (if configured via dataset augments).
+    if getattr(file_item, 'flip_x', False):
+        img = img.transpose(_Image.FLIP_LEFT_RIGHT)
+    if getattr(file_item, 'flip_y', False):
+        img = img.transpose(_Image.FLIP_TOP_BOTTOM)
+
+    stw = getattr(file_item, 'scale_to_width', None)
+    sth = getattr(file_item, 'scale_to_height', None)
+    cx = getattr(file_item, 'crop_x', None)
+    cy = getattr(file_item, 'crop_y', None)
+    cw = getattr(file_item, 'crop_width', None)
+    ch = getattr(file_item, 'crop_height', None)
+
+    if None in (stw, sth, cx, cy, cw, ch):
+        # No bucket params — use raw. Caller will downsample to a square.
+        return img
+
+    img = img.resize((int(stw), int(sth)), _Image.BICUBIC)
+    img = img.crop((int(cx), int(cy), int(cx) + int(cw), int(cy) + int(ch)))
+    return img
+
+
+def _mask_output_hw(file_item: 'FileItemDTO', fallback_hw: int) -> tuple:
+    """Preferred output (H, W) for the cached mask.
+
+    If bucket crop dims are known, cache at (crop_h, crop_w) so the mask
+    matches the training-tensor aspect ratio and F.interpolate to the latent
+    grid at training time is a straight resize. Falls back to a square
+    (fallback_hw, fallback_hw) when bucket params are absent.
+    """
+    cw = getattr(file_item, 'crop_width', None)
+    ch = getattr(file_item, 'crop_height', None)
+    if cw is not None and ch is not None:
+        return int(ch), int(cw)
+    return int(fallback_hw), int(fallback_hw)
+
+
 def cache_subject_masks(
     file_items: List['FileItemDTO'],
     config: 'SubjectMaskConfig',
+    preview_dir: Optional[str] = None,
 ) -> None:
     """Extract and cache subject masks for all file items.
 
@@ -257,6 +525,14 @@ def cache_subject_masks(
     where (H_c, W_c) == (cache_resolution, cache_resolution).
 
     Skips extraction if cache exists and has the matching version key.
+
+    Args:
+        preview_dir: If provided AND ``config.save_debug_previews`` is True, a
+            5-panel ``{stem}.png`` tile is written here for each extracted image.
+            Callers (SDTrainer) should pass the job output folder
+            (``save_root/subject_mask_previews``) so previews don't end up
+            inside the image dataset itself. If None, previews are skipped even
+            when the flag is on.
     """
     from PIL import Image
     from PIL.ImageOps import exif_transpose
@@ -281,25 +557,52 @@ def cache_subject_masks(
                 data = {}
             has_keys = all(k in data for k in ('person', 'body', 'clothing'))
             has_version = CACHE_VERSION_KEY in data
-            if has_keys and has_version:
+            # Body smoothing radius is baked into the cached masks — invalidate
+            # when the config value changes so users can iterate on it.
+            cached_bcr = int(data['body_close_radius'].item()) if 'body_close_radius' in data else 2
+            radius_match = cached_bcr == int(config.body_close_radius)
+            if has_keys and has_version and radius_match:
                 person = (data['person'].clone() > 127).to(torch.bool)
                 body = (data['body'].clone() > 127).to(torch.bool)
                 clothing = (data['clothing'].clone() > 127).to(torch.bool)
                 file_item.subject_mask = person
                 file_item.body_mask = body
                 file_item.clothing_mask = clothing
+
+                # Upfront QC preview: render from cache if missing on disk.
+                # Skips when the .png already exists so re-runs are free.
+                if getattr(config, 'save_debug_previews', False) and preview_dir:
+                    os.makedirs(preview_dir, exist_ok=True)
+                    preview_path = os.path.join(preview_dir, f'{stem}.png')
+                    if not os.path.exists(preview_path):
+                        try:
+                            raw_pil = exif_transpose(Image.open(file_item.path)).convert('RGB')
+                            pil_image = _apply_dataloader_transform(raw_pil, file_item)
+                            tile = _render_preview_tile_from_cache(pil_image, person, body, clothing)
+                            tile.save(preview_path)
+                        except Exception as e:
+                            print(f"  -  Warning: failed to render preview for {stem}: {e}")
                 continue  # cache hit — no need to run models
 
         # ------------------------------------------------------------- cache miss
         if extractor is None:
             extractor = SubjectMaskExtractor(config)
 
-        pil_image = exif_transpose(Image.open(file_item.path)).convert('RGB')
+        # v2: extract masks from the *dataloader-transformed* pixels so cached
+        # masks align with the training tensor (and thus latent grid). Applies
+        # the same flip → resize → crop chain as
+        # toolkit/dataloader_mixins.load_and_process_image (lines 774-793).
+        raw_pil = exif_transpose(Image.open(file_item.path)).convert('RGB')
+        pil_image = _apply_dataloader_transform(raw_pil, file_item)
         masks = extractor.extract(pil_image)
 
-        person_t = _downsample_bool(masks['person'], target_hw)
-        body_t = _downsample_bool(masks['body'], target_hw)
-        clothing_t = _downsample_bool(masks['clothing'], target_hw)
+        # Cache at training-tensor dimensions (crop_w, crop_h) when known.
+        # No square downsample — preserves aspect ratio so F.interpolate to
+        # the latent grid at training time is a straight resize.
+        out_h, out_w = _mask_output_hw(file_item, fallback_hw=target_hw)
+        person_t = _resize_bool(masks['person'], out_h, out_w)
+        body_t = _resize_bool(masks['body'], out_h, out_w)
+        clothing_t = _resize_bool(masks['clothing'], out_h, out_w)
 
         if not person_t.any():
             empty_count += 1
@@ -313,9 +616,27 @@ def cache_subject_masks(
             'person': (person_t.to(torch.uint8) * 255),
             'body': (body_t.to(torch.uint8) * 255),
             'clothing': (clothing_t.to(torch.uint8) * 255),
+            'body_close_radius': torch.tensor([float(config.body_close_radius)]),
             CACHE_VERSION_KEY: torch.ones(1),
         }
         save_file(save_data, cache_path)
+
+        # Optional: write a 5-panel preview tile for visual inspection.
+        # Only if both the flag is on AND a target directory was provided —
+        # we never write inside the image dataset, so the caller must decide
+        # where previews live.
+        if getattr(config, 'save_debug_previews', False) and preview_dir:
+            os.makedirs(preview_dir, exist_ok=True)
+            preview_path = os.path.join(preview_dir, f'{stem}.png')
+            try:
+                tile = _render_preview_tile(
+                    pil_image, masks,
+                    n_classes=extractor.seg_cfg.num_labels,
+                )
+                tile.save(preview_path)
+            except Exception as e:
+                # Preview failures are non-fatal — the cache is the real artifact.
+                print(f"  -  Warning: failed to render preview for {stem}: {e}")
 
     # Free VRAM held by models (only loaded if we had cache misses)
     if extractor is not None:

@@ -86,11 +86,38 @@ export async function GET(request: NextRequest, { params }: { params: { jobID: s
     return NextResponse.json({
       key,
       keys,
-      points: points.map((p) => ({
-        step: p.step,
-        wall_time: p.wall_time,
-        value: p.value ?? (p.value_text ? Number(p.value_text) : null),
-      })),
+      points: points.map((p) => {
+        // value_text now carries either a stringified scalar (legacy
+        // fallback) or a JSON breakdown payload from the metrics-overhaul
+        // MetricBuffer, of shape:
+        //   {"samples": [...], "n": ..., "mean": ..., "std": ...}
+        // We expose it as `breakdown` whenever it parses as an object so
+        // the chart tooltip can render the per-sample drill-down.
+        let breakdown: Record<string, unknown> | null = null;
+        let fallbackValue: number | null = p.value;
+        if (p.value_text != null) {
+          const trimmed = p.value_text.trim();
+          if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+            try {
+              const parsed = JSON.parse(trimmed);
+              if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+                breakdown = parsed as Record<string, unknown>;
+              }
+            } catch {
+              breakdown = null;
+            }
+          } else if (fallbackValue == null) {
+            const asNum = Number(trimmed);
+            if (!Number.isNaN(asNum)) fallbackValue = asNum;
+          }
+        }
+        return {
+          step: p.step,
+          wall_time: p.wall_time,
+          value: fallbackValue,
+          ...(breakdown != null ? { breakdown } : {}),
+        };
+      }),
     });
   } finally {
     await closeDb(db);

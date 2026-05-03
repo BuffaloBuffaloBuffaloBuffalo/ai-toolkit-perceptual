@@ -22,6 +22,31 @@ if TYPE_CHECKING:
     from toolkit.data_transfer_object.data_loader import FileItemDTO
     from toolkit.config_modules import FaceIDConfig
 
+
+def _apply_dataloader_transform(img, file_item):
+    """PIL → PIL: mirror dataloader_mixins.load_and_process_image 774-793.
+
+    Applies flip_x/y + bucket resize + crop when the file_item has the
+    bucket params attached (post-setup_buckets); returns the input image
+    unchanged when they aren't.
+    """
+    from PIL import Image as _PILImage
+    if getattr(file_item, 'flip_x', False):
+        img = img.transpose(_PILImage.FLIP_LEFT_RIGHT)
+    if getattr(file_item, 'flip_y', False):
+        img = img.transpose(_PILImage.FLIP_TOP_BOTTOM)
+    stw = getattr(file_item, 'scale_to_width', None)
+    sth = getattr(file_item, 'scale_to_height', None)
+    cx = getattr(file_item, 'crop_x', None)
+    cy = getattr(file_item, 'crop_y', None)
+    cw = getattr(file_item, 'crop_width', None)
+    ch = getattr(file_item, 'crop_height', None)
+    if None in (stw, sth, cx, cy, cw, ch):
+        return img
+    img = img.resize((int(stw), int(sth)), _PILImage.BICUBIC)
+    img = img.crop((int(cx), int(cy), int(cx) + int(cw), int(cy) + int(ch)))
+    return img
+
 # Feature extraction points in the Flux 2 VAE encoder.
 # The encoder has 4 resolution levels with ch_mult = [1, 2, 4, 4].
 # ch=128, so channels per level: 128, 256, 512, 512.
@@ -368,7 +393,7 @@ def cache_vae_anchor_features(
     from PIL import Image
     from PIL.ImageOps import exif_transpose
 
-    CACHE_VERSION_KEY = 'vae_anchor_v3'
+    CACHE_VERSION_KEY = 'vae_anchor_v4'  # v4: cached from dataloader-transformed pixels
 
     encoder = VAEAnchorEncoder(vae_path=face_id_config.vae_anchor_model_path)
     encoder.load(device=torch.device('cuda'), dtype=torch.float32)
@@ -397,9 +422,16 @@ def cache_vae_anchor_features(
                 cached_count += 1
                 continue
 
-        # Load image and encode at dataset resolution
-        pil_image = exif_transpose(Image.open(file_item.path)).convert('RGB')
-        target_size = file_item.dataset_config.resolution if file_item.dataset_config else 512
+        # v4: encode the dataloader-transformed pixels so cached features
+        # share spatial geometry with the training tensor. Apply the same
+        # flip + bucket-resize + crop the dataloader uses.
+        raw_pil = exif_transpose(Image.open(file_item.path)).convert('RGB')
+        pil_image = _apply_dataloader_transform(raw_pil, file_item)
+
+        # target_size chosen so encode_reference_features doesn't re-resize —
+        # set it equal to the shortest side of the already-transformed PIL.
+        w, h = pil_image.size
+        target_size = min(w, h)
         features = encode_reference_features(encoder, pil_image, target_size=target_size)
 
         file_item.vae_anchor_features = features

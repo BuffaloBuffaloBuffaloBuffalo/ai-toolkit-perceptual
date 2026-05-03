@@ -499,6 +499,12 @@ class TrainConfig:
         self.diffusion_loss_min_t: float = kwargs.get('diffusion_loss_min_t', 0.0)
         self.diffusion_loss_max_t: float = kwargs.get('diffusion_loss_max_t', 1.0)
 
+        # Diagnostic: every N steps, do a dual backward (depth-only and
+        # everything-else-only) to log per-loss gradient norms and the cosine
+        # between them. 0 disables. Costs an extra backward pass + grad clone
+        # on the firing step; rest of the training loop is unaffected.
+        self.gradient_cosine_log_every: int = int(kwargs.get('gradient_cosine_log_every', 0))
+
         # scale the prediction by this. Increase for more detail, decrease for less
         self.pred_scaler = kwargs.get('pred_scaler', 1.0)
 
@@ -920,6 +926,58 @@ class BodyIDConfig:
         self.init_scale: float = kwargs.get('init_scale', 0.01)
 
 
+class DepthConsistencyConfig:
+    """Depth-consistency auxiliary loss via a frozen Depth-Anything-V2 perceptor.
+
+    Enabled by setting ``loss_weight > 0`` (same convention as identity and
+    body-proportion losses).  The loss compares the generated image's depth
+    map (from x0_pred decoded to pixels) against the ground-truth depth map
+    (cached per image at dataset-prep time) using MiDaS's scale-and-shift-
+    invariant L1 plus a multi-scale gradient-matching term.
+
+    Note on spatial alignment: the GT depth is cached from the original
+    image; at loss time it's resized to match x0_pixels.  If the dataset
+    uses aggressive augmentation crops, cached GT depth will be slightly
+    misaligned with x0_pixels.  For typical LoRA training with modest
+    augmentation this is acceptable because SSI alignment absorbs any
+    global offset and the gradient loss operates on local structure.
+    """
+
+    def __init__(self, **kwargs):
+        # Enable by setting loss_weight > 0. Default 0.1 is calibrated for
+        # DA2-Small. If you switch to DA2-Large, drop this to ~0.001 — the
+        # larger perceptor produces much higher-magnitude gradients and
+        # 0.1 will overpower the diffusion loss. If you see washed-out or
+        # over-smoothed outputs, halve the weight and retry.
+        self.loss_weight: float = kwargs.get('loss_weight', 0.1)
+        self.loss_min_t: float = kwargs.get('loss_min_t', 0.0)
+        self.loss_max_t: float = kwargs.get('loss_max_t', 1.0)
+        # Frozen perceptor
+        self.model_id: str = kwargs.get(
+            'model_id', 'depth-anything/Depth-Anything-V2-Small-hf'
+        )
+        self.input_size: int = kwargs.get('input_size', 518)
+        # Loss composition (MiDaS formulation)
+        self.ssi_weight: float = kwargs.get('ssi_weight', 1.0)
+        self.grad_weight: float = kwargs.get('grad_weight', 0.5)
+        self.grad_scales: int = kwargs.get('grad_scales', 4)
+        # Spatial masking
+        #   'none'      - full-image loss
+        #   'subject'   - use cached person/subject mask (default)
+        #   'body'      - use cached body-only mask
+        self.mask_source: str = kwargs.get('mask_source', 'subject')
+        # Memory controls
+        self.grad_checkpoint: bool = kwargs.get('grad_checkpoint', True)
+        # Preview cadence — save a (GT RGB | GT depth | Pred RGB | Pred depth)
+        # tile every N steps to save_root/depth_previews/.  0 disables.
+        self.preview_every: int = kwargs.get('preview_every', 100)
+        # Preview only for steps whose t-ratio is >= this value (video path).
+        self.preview_min_t: float = kwargs.get('preview_min_t', 0.0)
+        # Video path only: frames per DA2 chunk during x0→depth backward. Keeps
+        # peak activation memory bounded regardless of the video's total T.
+        self.frames_per_chunk: int = kwargs.get('frames_per_chunk', 8)
+
+
 class SubjectMaskConfig:
     """Configuration for auto-masking via YOLO + SAM 2 + SegFormer-clothes.
 
@@ -939,11 +997,31 @@ class SubjectMaskConfig:
         self.segformer_res: int = kwargs.get('segformer_res', 768)
         self.cache_resolution: int = kwargs.get('cache_resolution', 256)
         self.dtype: str = kwargs.get('dtype', 'fp16')
+        # Morphological close radius applied to the body mask after SegFormer
+        # parsing — higher values fill blotchy gaps inside limbs/hair at the
+        # cost of boundary precision. Changing this invalidates cached masks.
+        self.body_close_radius: int = kwargs.get('body_close_radius', 2)
+        # True dilation radius applied to the final person mask. Closing
+        # (above) only fills holes — it doesn't grow the outer boundary,
+        # so setting body_close_radius high produces no visible change on
+        # solid SegFormer parses. ``mask_dilate_radius`` actually grows the
+        # boundary, useful for padding the masked region around the subject.
+        self.mask_dilate_radius: int = kwargs.get('mask_dilate_radius', 0)
+        # Skin-tone bias added to body-class logits (Hair/Face/arms/legs)
+        # where YCrCb-skin is detected. SegFormer-clothes frequently
+        # mislabels exposed skin (chest, midriff, thighs) as Upper-clothes
+        # or Pants; a small positive bias (1-3) flips close-call pixels
+        # back into body without affecting confidently-labelled clothing.
+        # 0 = disabled (default, preserves existing behavior).
+        self.skin_bias: float = kwargs.get('skin_bias', 0.0)
         # Phase 2 knobs — present but unused by training yet
         self.background_loss_weight: Optional[float] = kwargs.get('background_loss_weight', None)
         self.clothing_loss_weight: Optional[float] = kwargs.get('clothing_loss_weight', None)
         self.body_loss_weight: Optional[float] = kwargs.get('body_loss_weight', None)
         self.perceptual_restrict_to_body: bool = kwargs.get('perceptual_restrict_to_body', False)
+        # Debug previews — when True, cache_subject_masks writes a 5-panel tile.png
+        # per image to {img_dir}/_face_id_cache/_previews/{stem}.png for visual QA.
+        self.save_debug_previews: bool = kwargs.get('save_debug_previews', False)
 
 
 class DatasetConfig:
@@ -1091,6 +1169,22 @@ class DatasetConfig:
         self.latent_perceptual_loss_weight: Union[float, None] = kwargs.get('latent_perceptual_loss_weight', None)
         self.latent_perceptual_loss_min_t: Union[float, None] = kwargs.get('latent_perceptual_loss_min_t', None)
         self.latent_perceptual_loss_max_t: Union[float, None] = kwargs.get('latent_perceptual_loss_max_t', None)
+        self.depth_loss_weight: Union[float, None] = kwargs.get('depth_loss_weight', None)
+        self.depth_loss_min_t: Union[float, None] = kwargs.get('depth_loss_min_t', None)
+        self.depth_loss_max_t: Union[float, None] = kwargs.get('depth_loss_max_t', None)
+        # Per-optimizer-step alternation between diffusion and depth losses
+        # for this dataset's samples. None = both fire as normal. The gating
+        # keys on self.step_num (advanced after each full accumulation
+        # window) so all microbatches in one optimizer step see the same
+        # active loss — Adam integrates clean single-objective gradients.
+        # Other auxiliaries (identity, body_*, normal, vae_anchor, latent
+        # perceptual) are unaffected and fire as their own gating allows.
+        self.loss_split: Union[str, None] = kwargs.get('loss_split', None)
+        if self.loss_split is not None and self.loss_split not in ('diffusion_depth',):
+            raise ValueError(
+                f"Unknown loss_split value: {self.loss_split!r}. "
+                "Allowed: None, 'diffusion_depth'"
+            )
         # Subject mask (Phase 2) per-dataset overrides: None inherits global SubjectMaskConfig
         self.background_loss_weight: Union[float, None] = kwargs.get('background_loss_weight', None)
         self.clothing_loss_weight: Union[float, None] = kwargs.get('clothing_loss_weight', None)
@@ -1126,6 +1220,14 @@ class DatasetConfig:
             self.controls = [self.controls]
         # remove empty strings
         self.controls = [control for control in self.controls if control.strip() != '']
+
+        # Optional override for the depth model used when generating
+        # `_controls/{stem}.depth.jpg` images. Defaults to None — the
+        # ControlGenerator falls back to its built-in default. The
+        # auto-mirror in SDTrainer.before_dataset_load sets this on reg
+        # datasets to match `depth_consistency.model_id` so the same model
+        # used for the loss perceptor is used for the conditioning input.
+        self.depth_model_id: Optional[str] = kwargs.get('depth_model_id', None)
         
         # if true, will use a fask method to get image sizes. This can result in errors. Do not use unless you know what you are doing
         self.fast_image_size: bool = kwargs.get('fast_image_size', False)

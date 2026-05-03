@@ -2238,6 +2238,7 @@ class ControlCachingMixin:
             self.control_generator = ControlGenerator(
                 device=device,
                 sd=self.sd,
+                depth_model_id=getattr(self.dataset_config, 'depth_model_id', None),
             )
 
             # use tqdm to show progress

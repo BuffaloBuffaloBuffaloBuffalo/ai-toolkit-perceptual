@@ -1,0 +1,88 @@
+# Tier 2 dry-run: depth-consistency pipeline end-to-end on /test_data/cartwheel.
+#
+# Goal is NOT to learn anything — only to exercise the full job path:
+#   - GT depth cube caching via cv2 + DA2 (check _face_id_cache/*.safetensors)
+#   - TAEHV tiny decoder lazy-loads on first step
+#   - x0 decode → chunked DA2 under gradient checkpointing
+#   - per-frame SSI + multi-scale gradient loss back through the graph
+#   - animated webp preview written to save_root/depth_previews/
+#
+# Only 2 steps, save + preview every step, so the entire pipeline completes
+# in a few minutes. If any of the above is broken, this job will fail fast.
+#
+# Assumptions verified at Tier 0:
+#   - toolkit/taehv/taew2_1.pth is present (22MB, gitignored)
+#   - /test_data/cartwheel/ contains 3 short .avi clips
+#   - no .txt captions in that folder → default_caption is used
+---
+job: extension
+config:
+  name: "depth_consistency_cartwheel_smoke"
+  process:
+    - type: 'sd_trainer'
+      training_folder: "output"
+      device: cuda:0
+      network:
+        type: "lora"
+        linear: 8
+        linear_alpha: 8
+      save:
+        dtype: float16
+        save_every: 1
+        max_step_saves_to_keep: 1
+      datasets:
+        - folder_path: "/home/z/Documents/repos/ai-toolkit/test_data/cartwheel"
+          default_caption: "a person doing a cartwheel"
+          caption_dropout_rate: 0.0
+          cache_latents_to_disk: true
+          resolution: [ 256 ]
+          num_frames: 41           # (41-1)/4+1 = 11 latent frames
+          shrink_video_to_frames: true
+      train:
+        batch_size: 1
+        steps: 2
+        gradient_accumulation: 1
+        train_unet: true
+        train_text_encoder: false
+        gradient_checkpointing: true
+        noise_scheduler: "flowmatch"
+        timestep_type: 'sigmoid'
+        optimizer: "adamw8bit"
+        lr: 1e-4
+        optimizer_params:
+          weight_decay: 1e-4
+        skip_first_sample: true
+        dtype: bf16
+      model:
+        name_or_path: "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
+        arch: 'wan21'
+        quantize_te: true
+      depth_consistency:
+        loss_weight: 0.05
+        loss_min_t: 0.0
+        loss_max_t: 0.9
+        ssi_weight: 1.0
+        grad_weight: 0.5
+        grad_scales: 4
+        mask_source: none
+        grad_checkpoint: true
+        frames_per_chunk: 8
+        preview_every: 1           # preview on every step so we catch webp failures fast
+        preview_min_t: 0.0
+      sample:
+        sample_every: 10000        # effectively off — we only care about the loss path here
+        sampler: "flowmatch"
+        width: 256
+        height: 256
+        num_frames: 41
+        fps: 15
+        prompts:
+          - "a person doing a cartwheel"
+        neg: ""
+        seed: 42
+        walk_seed: true
+        guidance_scale: 5
+        sample_steps: 20
+meta:
+  name: "[name]"
+  version: '1.0'

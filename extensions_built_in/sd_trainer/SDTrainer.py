@@ -39,13 +39,22 @@ from toolkit.models.diffusion_feature_extraction import DiffusionFeatureExtracto
 from toolkit.util.losses import wavelet_loss, stepped_loss
 import torch.nn.functional as F
 from toolkit.unloader import unload_text_encoder
-from toolkit.config_modules import FaceIDConfig, BodyIDConfig, SubjectMaskConfig
+from toolkit.config_modules import FaceIDConfig, BodyIDConfig, SubjectMaskConfig, DepthConsistencyConfig
 from toolkit.face_id import FaceIDProjector, VisionFaceProjector, DifferentiableFaceEncoder, DifferentiableLandmarkEncoder, cache_face_embeddings
 from toolkit.body_id import BodyIDProjector, DifferentiableBodyProportionEncoder, cache_body_embeddings, cache_body_proportion_embeddings
 from toolkit.body_shape import DifferentiableBodyShapeEncoder, cache_body_shape_embeddings
 from toolkit.normal_id import DifferentiableNormalEncoder, cache_normal_embeddings
 from toolkit.vae_anchor import VAEAnchorEncoder, cache_vae_anchor_features
 from toolkit.subject_mask import cache_subject_masks
+from toolkit.depth_consistency import (
+    DifferentiableDepthEncoder,
+    compute_depth_consistency_loss,
+    cache_depth_gt_embeddings,
+    cache_video_depth_gt_embeddings,
+    load_taehv_wan21,
+    decode_wan_x0_to_frames,
+    save_video_depth_preview,
+)
 from PIL import Image
 from torchvision.transforms import functional as TF
 
@@ -126,6 +135,14 @@ class SDTrainer(BaseSDTrainProcess):
             self.subject_mask_config = SubjectMaskConfig(**subject_mask_raw)
         else:
             self.subject_mask_config = None
+
+        # Depth-consistency loss (MiDaS SSI + multi-scale gradient via DA2)
+        depth_consistency_raw = self.get_conf('depth_consistency', None)
+        if depth_consistency_raw is not None:
+            self.depth_consistency_config = DepthConsistencyConfig(**depth_consistency_raw)
+        else:
+            self.depth_consistency_config = None
+
         self.face_id_projector: Optional[FaceIDProjector] = None
         self.vision_face_projector: Optional[VisionFaceProjector] = None
         self.id_loss_model: Optional[DifferentiableFaceEncoder] = None
@@ -135,6 +152,15 @@ class SDTrainer(BaseSDTrainProcess):
         self.normal_model: Optional[DifferentiableNormalEncoder] = None
         self.vae_anchor_encoder: Optional[VAEAnchorEncoder] = None
         self.vae_anchor_projector = None
+        self.depth_encoder: Optional[DifferentiableDepthEncoder] = None
+        # Wan 2.1 video path: TAEHV tiny decoder for x0 → frames. Lazy-loaded
+        # the first time a 5D noise_pred arrives through the depth block.
+        self._wan_depth_decoder = None
+        self._last_depth_consistency_loss: Optional[float] = None
+        self._last_depth_consistency_loss_applied: Optional[float] = None
+        self._last_depth_consistency_ssi: Optional[float] = None
+        self._last_depth_consistency_grad: Optional[float] = None
+        self._last_depth_loss_bins: Optional[dict] = None
         self._last_identity_loss: Optional[float] = None
         self._last_landmark_loss: Optional[float] = None
         self._last_body_proportion_loss: Optional[float] = None
@@ -154,16 +180,90 @@ class SDTrainer(BaseSDTrainProcess):
         self._last_vae_anchor_per_level: Optional[dict] = None
         self._last_diffusion_loss: Optional[float] = None
         self._last_diffusion_loss_applied: Optional[float] = None
+        self._last_diffusion_loss_bins: Optional[dict] = None
+        # Gradient cosine diagnostic: norms of the depth-only and
+        # everything-else-only gradients at the LoRA params, plus their
+        # cosine. Populated by the dual-backward path in
+        # `train_single_accumulation` only when
+        # `train_config.gradient_cosine_log_every > 0` and the step matches.
+        # Note: norms reported are AMP-scaled (matches what the grad scaler
+        # produces); the cosine is scale-invariant and the ratio of the two
+        # norms is preserved, so all three are still meaningful as diagnostics.
+        self._last_grad_norm_diffusion: Optional[float] = None
+        self._last_grad_norm_depth: Optional[float] = None
+        self._last_grad_cos_diff_depth: Optional[float] = None
+        # Set by `calculate_loss` to the depth-applied loss tensor (pre-detach)
+        # whenever the depth-consistency loss contributes this microbatch.
+        # Read by the dual-backward block; reset to None each microbatch.
+        self._dc_applied_for_grad = None
         self._last_identity_loss_applied: Optional[float] = None
         self._last_landmark_loss_applied: Optional[float] = None
         self._last_timestep: Optional[float] = None
         self._last_id_sim: Optional[float] = None
         self._last_id_sim_bins: Optional[dict] = None
         self._last_id_clean_target: Optional[float] = None
-        self._last_id_shortfall: Optional[float] = None
+        self._last_id_clean_delta: Optional[float] = None
         self._last_pure_noise_cos: Optional[float] = None
         self._id_face_detector = None  # SCRFD detector for x0 quality gating
         self._last_shape_sim_bins: Optional[dict] = None
+
+        # Bin dicts above hold a running-mean accumulator per t-band:
+        #   {bin_key: {'sum': float, 'count': int}}.
+        # See `_bin_update` for the per-sample writer and `_bin_finalize` for
+        # the flush-time mean. Bins are reset at the start of every optimizer
+        # step in `hook_train_loop` so that:
+        #   - same-bin samples within a microbatch don't overwrite each other,
+        #   - cross-microbatch (gradient_accumulation_steps>1) samples merge,
+        #   - bins from a prior optimizer step never bleed into the next one.
+
+        # MetricBuffer accumulates *every* metric scalar across all
+        # microbatches in one optimizer step (fixes the
+        # gradient_accumulation_steps > 1 overwrite bug, where every metric
+        # except `loss` reflected only the final microbatch). We snapshot
+        # every existing `self._last_*` value into the buffer at the end of
+        # `train_single_accumulation`; `get_loss_metrics` then prefers the
+        # buffer's cross-microbatch mean over the single-microbatch shim.
+        # The buffer is *display-only* — it never touches the loss tensor.
+        from extensions_built_in.sd_trainer.metric_buffer import MetricBuffer
+        self._metric_buffer: MetricBuffer = MetricBuffer(per_sample_cap=16)
+        # Mirror map: `_last_<attr>` → metric name in `loss_dict`. Keep in
+        # sync with the loss_dict construction at the bottom of
+        # `hook_train_loop` so the buffer's keys align with what users see.
+        self._last_to_metric: dict = {
+            '_last_face_token_norm': 'face_token_norm',
+            '_last_vision_token_norm': 'vision_token_norm',
+            '_last_body_token_norm': 'body_token_norm',
+            '_last_identity_loss': 'identity_loss',
+            '_last_landmark_loss': 'landmark_loss',
+            '_last_pure_noise_cos': 'pure_noise_cos',
+            '_last_diffusion_loss': 'diffusion_loss',
+            '_last_diffusion_loss_applied': 'diffusion_loss_applied',
+            '_last_identity_loss_applied': 'identity_loss_applied',
+            '_last_landmark_loss_applied': 'landmark_loss_applied',
+            '_last_body_proportion_loss': 'body_proportion_loss',
+            '_last_body_proportion_loss_applied': 'body_proportion_loss_applied',
+            '_last_body_shape_loss': 'body_shape_loss',
+            '_last_body_shape_loss_applied': 'body_shape_loss_applied',
+            '_last_body_shape_cos': 'body_shape_cos',
+            '_last_body_shape_l1': 'body_shape_l1',
+            '_last_body_shape_gated_pct': 'body_shape_gated_pct',
+            '_last_normal_loss': 'normal_loss',
+            '_last_normal_loss_applied': 'normal_loss_applied',
+            '_last_normal_cos': 'normal_cos',
+            '_last_vae_anchor_loss': 'vae_anchor_loss',
+            '_last_vae_anchor_loss_applied': 'vae_anchor_loss_applied',
+            '_last_depth_consistency_loss': 'depth_consistency_loss',
+            '_last_depth_consistency_loss_applied': 'depth_consistency_loss_applied',
+            '_last_depth_consistency_ssi': 'depth_consistency_ssi',
+            '_last_depth_consistency_grad': 'depth_consistency_grad',
+            '_last_grad_norm_diffusion': 'grad_norm_diffusion',
+            '_last_grad_norm_depth': 'grad_norm_depth',
+            '_last_grad_cos_diff_depth': 'grad_cos_diff_depth',
+            '_last_timestep': 'timestep',
+            '_last_id_sim': 'id_sim',
+            '_last_id_clean_target': 'id_clean_target',
+            '_last_id_clean_delta': 'id_clean_delta',
+        }
 
         # E-LatentLPIPS perceptual loss
         self.latent_perceptual_model = None
@@ -189,6 +289,188 @@ class SDTrainer(BaseSDTrainProcess):
         else:
             raise ValueError(f"Unknown guidance loss target type {type(self.train_config.guidance_loss_target)}")
 
+
+    # -------------------------------------------------------------
+    # Per-t-band running mean helpers (display-only metrics)
+    #
+    # Bin storage shape: {bin_key: {'sum': float, 'count': int}}.
+    # `_bin_update` writes; `_bin_finalize` collapses to {key: mean}.
+    # These ONLY touch metric scalars; they never participate in the
+    # loss tensor or its gradient.
+    # -------------------------------------------------------------
+    @staticmethod
+    def _bin_update(bins: dict, bin_key: str, value: float) -> None:
+        slot = bins.get(bin_key)
+        if slot is None:
+            bins[bin_key] = {'sum': float(value), 'count': 1}
+        else:
+            slot['sum'] += float(value)
+            slot['count'] += 1
+
+    @staticmethod
+    def _bin_finalize(bins: Optional[dict]) -> dict:
+        if not bins:
+            return {}
+        out: dict = {}
+        for k, slot in bins.items():
+            cnt = slot.get('count', 0) if isinstance(slot, dict) else 0
+            if cnt > 0:
+                out[k] = slot['sum'] / cnt
+        return out
+
+    def _reset_step_bins(self) -> None:
+        """Reset all per-t-band bin accumulators at the start of a fresh
+        optimizer step. Called from `hook_train_loop` so that bins span a
+        full optimizer step (all gradient-accumulation microbatches), then
+        flush cleanly via `get_loss_metrics`."""
+        self._last_id_sim_bins = None
+        self._last_shape_sim_bins = None
+        self._last_bp_sim_bins = None
+        self._last_bsh_sim_bins = None
+        self._last_depth_loss_bins = None
+        self._last_diffusion_loss_bins = None
+
+    def _record_sample(
+        self,
+        metric_name: str,
+        value: float,
+        t: Optional[float] = None,
+        idx: Optional[int] = None,
+        batch=None,
+    ) -> None:
+        """Record one sample's value into the per-sample breakdown buffer.
+
+        ``idx`` + ``batch`` are used to derive the human-readable sample tag
+        (basename of the source image / video). Both are optional —
+        callers without batch metadata can pass just ``metric_name``,
+        ``value`` and ``t``.
+
+        Display-only; never participates in the loss tensor.
+        """
+        if not hasattr(self, '_metric_buffer'):
+            return
+        sample_tag = None
+        if batch is not None and idx is not None:
+            try:
+                file_items = getattr(batch, 'file_items', None)
+                if file_items is not None and idx < len(file_items):
+                    fi = file_items[idx]
+                    path = getattr(fi, 'path', None)
+                    if path:
+                        # Use parent_dir/basename so identical filenames in
+                        # different dataset folders don't collapse into one
+                        # synthetic series in the by_sample chart.
+                        parent = os.path.basename(os.path.dirname(str(path)))
+                        base = os.path.basename(str(path))
+                        sample_tag = f'{parent}/{base}' if parent else base
+                        # Append bucket dims so the same file processed at
+                        # two resolutions (multi-bucket runs) stays distinct.
+                        ch = getattr(fi, 'crop_height', None)
+                        cw = getattr(fi, 'crop_width', None)
+                        if isinstance(ch, int) and isinstance(cw, int) and ch > 0 and cw > 0:
+                            sample_tag = f'{sample_tag}@{ch}x{cw}'
+            except Exception:
+                sample_tag = None
+        self._metric_buffer.add_per_sample(
+            metric_name, value, t=t, sample_tag=sample_tag,
+        )
+
+    def _iter_trainable_params(self):
+        """Yield the flat list of trainable parameter tensors.
+
+        ``self.params`` is either a flat list of tensors or a list of
+        param-group dicts (each with a ``'params'`` list). Yields only
+        tensors so callers can call ``.grad`` / ``autograd.grad`` directly.
+        """
+        params = getattr(self, 'params', None)
+        if not params:
+            return
+        for entry in params:
+            if isinstance(entry, dict):
+                for p in entry.get('params', []):
+                    yield p
+            else:
+                yield entry
+
+    def _record_grad_cosine(self, trainable_params, dc_grads, pre_existing_grads) -> None:
+        """Compute per-loss gradient norms + cosine and stash on `_last_*`.
+
+        Computes the gradient contribution of THIS microbatch by
+        subtracting any grad accumulated by earlier microbatches in the
+        current optimizer step:
+            g_full_this_mb = p.grad - pre_existing
+            g_diff_this_mb = g_full_this_mb - g_dc_this_mb
+        Display-only; never modifies ``p.grad``.
+        """
+        norm_dc_sq = 0.0
+        norm_diff_sq = 0.0
+        dot = 0.0
+        if pre_existing_grads is None:
+            pre_existing_grads = [None] * len(trainable_params)
+        for p, g_dc, g_pre in zip(trainable_params, dc_grads, pre_existing_grads):
+            g_now = p.grad
+            # Per-microbatch full grad = current p.grad minus what was
+            # already there from prior microbatches.
+            if g_now is None:
+                g_full = None
+            elif g_pre is None:
+                g_full = g_now.detach().float()
+            else:
+                g_full = g_now.detach().float() - g_pre.float()
+            g_dc_f = g_dc.detach().float() if g_dc is not None else None
+
+            if g_full is None and g_dc_f is None:
+                continue
+            if g_full is None:
+                _ndc = float((g_dc_f * g_dc_f).sum())
+                norm_dc_sq += _ndc
+                norm_diff_sq += _ndc
+                dot += -_ndc
+                continue
+            if g_dc_f is None:
+                norm_diff_sq += float((g_full * g_full).sum())
+                continue
+            gdiff = g_full - g_dc_f
+            norm_dc_sq += float((g_dc_f * g_dc_f).sum())
+            norm_diff_sq += float((gdiff * gdiff).sum())
+            dot += float((gdiff * g_dc_f).sum())
+
+        norm_dc = norm_dc_sq ** 0.5
+        norm_diff = norm_diff_sq ** 0.5
+        denom = norm_dc * norm_diff
+        cos = (dot / denom) if denom > 1e-12 else 0.0
+        self._last_grad_norm_diffusion = norm_diff
+        self._last_grad_norm_depth = norm_dc
+        self._last_grad_cos_diff_depth = cos
+
+    def _snapshot_metrics_to_buffer(self) -> None:
+        """Mirror every freshly-written ``self._last_<attr>`` scalar into
+        ``self._metric_buffer`` so cross-microbatch means are correct under
+        ``gradient_accumulation_steps > 1``.
+
+        Called once at the end of every ``train_single_accumulation`` call.
+        Each mapped ``_last_<attr>`` is read, mirrored into the buffer with
+        weight=1.0 (one observation per microbatch), and then **reset to
+        None**. The reset prevents a stale value from microbatch N from
+        being double-counted in microbatch N+1 when the metric's gating
+        conditions don't fire.
+
+        The trade-off: the existing flush block at the bottom of
+        ``hook_train_loop`` will see ``None`` for these attrs and skip
+        them; the buffer-flush merge a few lines later then writes the
+        cross-microbatch mean back into ``loss_dict`` under the same key.
+
+        Display-only; never touches loss tensors.
+        """
+        if not hasattr(self, '_metric_buffer'):
+            return
+        buf = self._metric_buffer
+        for attr, metric_name in self._last_to_metric.items():
+            val = getattr(self, attr, None)
+            if val is None:
+                continue
+            buf.add_scalar(metric_name, val, weight=1.0)
+            setattr(self, attr, None)
 
     def before_model_load(self):
         pass
@@ -287,6 +569,36 @@ class SDTrainer(BaseSDTrainProcess):
         
 
     def before_dataset_load(self):
+        # Auto-mirror depth conditioning onto reg datasets when the train
+        # side uses it. Without this, reg samples train without depth input
+        # while train samples have it — defeating the prior-preservation
+        # role of reg under depth-conditioned LoRA. Skipped when the user
+        # explicitly configured `controls` or `control_path` on the reg
+        # dataset (their setting wins).
+        if self.datasets is not None and self.datasets_reg is not None:
+            train_has_depth = any(
+                'depth' in (ds.controls or []) for ds in self.datasets
+            )
+            if train_has_depth:
+                # Inherit the loss perceptor's model_id so reg conditioning
+                # depth comes from the same model the user picked in the UI.
+                _depth_model_id = None
+                if self.depth_consistency_config is not None:
+                    _depth_model_id = getattr(
+                        self.depth_consistency_config, 'model_id', None,
+                    )
+                for reg_ds in self.datasets_reg:
+                    if reg_ds.controls or reg_ds.control_path is not None:
+                        continue
+                    reg_ds.controls = ['depth']
+                    if _depth_model_id and reg_ds.depth_model_id is None:
+                        reg_ds.depth_model_id = _depth_model_id
+                    print_acc(
+                        f"  reg dataset '{reg_ds.folder_path}': "
+                        f"auto-enabling controls=['depth'] (depth_model_id={reg_ds.depth_model_id or 'default'}) "
+                        "to mirror train-side depth conditioning"
+                    )
+
         self.assistant_adapter = None
         # get adapter assistant if one is set
         if self.train_config.adapter_assist_name_or_path is not None:
@@ -461,6 +773,7 @@ class SDTrainer(BaseSDTrainProcess):
         _ds_body_shape = _any_dataset_overrides('body_shape_loss_weight')
         _ds_normal = _any_dataset_overrides('normal_loss_weight')
         _ds_vae_anchor = _any_dataset_overrides('vae_anchor_loss_weight')
+        _ds_depth = _any_dataset_overrides('depth_loss_weight')
         _vae_anchor_enabled = (self.face_id_config is not None
                                and (self.face_id_config.vae_anchor_loss_weight > 0 or _ds_vae_anchor))
 
@@ -579,19 +892,32 @@ class SDTrainer(BaseSDTrainProcess):
                 for dataset in datasets:
                     cache_normal_embeddings(dataset.file_list, self.face_id_config)
 
+        # NOTE: depth consistency GT caching is deferred until after the TAEF2
+        # decoder is loaded (further below) so the cache can run pixels through
+        # the same encode + decode chain training will use, giving the loss a
+        # true zero-floor target.
+
         # Auto-masking (YOLO + SAM 2 + SegFormer-clothes): cache person/body/clothing
-        # masks for future region-aware losses. Phase 1 is caching only — masks are
-        # attached to file_items but no loss reads them yet.
+        # masks for region-aware loss weighting. Debug preview tiles (when enabled)
+        # are written to save_root/subject_mask_previews/ — NOT inside the dataset
+        # folder — so they can't accidentally be picked up as training images.
         if self.subject_mask_config is not None and self.subject_mask_config.enabled:
             print_acc("Auto-masking: Extracting and caching subject masks...")
+            _sm_preview_dir = os.path.join(self.save_root, 'subject_mask_previews')
             if self.data_loader is not None:
                 datasets = get_dataloader_datasets(self.data_loader)
                 for dataset in datasets:
-                    cache_subject_masks(dataset.file_list, self.subject_mask_config)
+                    cache_subject_masks(
+                        dataset.file_list, self.subject_mask_config,
+                        preview_dir=_sm_preview_dir,
+                    )
             if self.data_loader_reg is not None:
                 datasets = get_dataloader_datasets(self.data_loader_reg)
                 for dataset in datasets:
-                    cache_subject_masks(dataset.file_list, self.subject_mask_config)
+                    cache_subject_masks(
+                        dataset.file_list, self.subject_mask_config,
+                        preview_dir=_sm_preview_dir,
+                    )
 
         # VAE anchor features: cache multi-scale VAE encoder features for perceptual anchor loss
         if _vae_anchor_enabled:
@@ -644,7 +970,10 @@ class SDTrainer(BaseSDTrainProcess):
                 if nonzero:
                     self._avg_body_embedding = torch.stack(nonzero).mean(dim=0)
 
-        # Determine if any face loss needs a latent decoder (TAESD)
+        # Determine if any loss needs a latent decoder (TAESD / TAEF2).
+        # Depth-consistency also decodes x0 to pixels, so it shares the same
+        # decoder path — critical for Flux-2 where the base VAE has no
+        # diffusers-style `.config` / `.scaling_factor` attributes.
         _need_face_decoder = (
             self.face_id_config is not None
             and (self.face_id_config.identity_loss_weight > 0
@@ -655,6 +984,9 @@ class SDTrainer(BaseSDTrainProcess):
                  or _vae_anchor_enabled
                  or self.face_id_config.identity_metrics
                  or _ds_identity or _ds_landmark or _ds_body_prop or _ds_body_shape or _ds_normal)
+        ) or (
+            self.depth_consistency_config is not None
+            and (self.depth_consistency_config.loss_weight > 0 or _ds_depth)
         )
 
         # Load identity loss model (ArcFace + TAESD) if enabled
@@ -740,6 +1072,17 @@ class SDTrainer(BaseSDTrainProcess):
             print_acc("LoRA+ID: Loading normal loss model (Sapiens 0.3B)...")
             self.normal_model = DifferentiableNormalEncoder()
             self.normal_model.to(self.device_torch)
+
+        # Load Depth-Anything-V2 perceptor for depth consistency loss if enabled
+        if (self.depth_consistency_config is not None
+                and (self.depth_consistency_config.loss_weight > 0 or _ds_depth)):
+            print_acc("DepthConsistency: Loading Depth-Anything-V2 perceptor...")
+            self.depth_encoder = DifferentiableDepthEncoder(
+                model_id=self.depth_consistency_config.model_id,
+                input_size=self.depth_consistency_config.input_size,
+                grad_checkpoint=self.depth_consistency_config.grad_checkpoint,
+                device=self.device_torch,
+            )
 
         # Load E-LatentLPIPS model if latent perceptual loss is enabled
         if self.train_config.latent_perceptual_loss_weight > 0:
@@ -859,6 +1202,82 @@ class SDTrainer(BaseSDTrainProcess):
                 self.taesd.to(dtype=get_torch_dtype(self.train_config.dtype), device=self.device_torch)
                 self.taesd.eval()
                 self.taesd.requires_grad_(False)
+
+        # Depth consistency: cache GT depth maps (DA2 output) for all datasets.
+        # v3 caches GT from VAE-encode → trainer-decoder pixels so the live
+        # depth loss has a true zero-floor target (the cleanest the trainer
+        # can produce). Mirrors SDTrainer.py:2865-2890 decode dispatch.
+        if (self.depth_consistency_config is not None
+                and (self.depth_consistency_config.loss_weight > 0 or _ds_depth)):
+            print_acc("DepthConsistency: Extracting and caching GT depth maps...")
+
+            # Pull VAE scaling once; all VAEs we hit (Flux 2, SD, SDXL) expose these.
+            _vae_cfg = getattr(self.sd.vae, 'config', {}) or {}
+            _vae_scale = float(_vae_cfg.get('scaling_factor', 1.0)) if hasattr(_vae_cfg, 'get') else 1.0
+            _vae_shift = float(_vae_cfg.get('shift_factor', 0.0) or 0.0) if hasattr(_vae_cfg, 'get') else 0.0
+            _vae_dtype = self.sd.vae.dtype
+
+            def _vae_roundtrip_for_depth(arr: torch.Tensor) -> torch.Tensor:
+                """[0,1] pixels → VAE encode → trainer decoder → [0,1] pixels."""
+                if next(self.sd.vae.parameters()).device != self.device_torch:
+                    self.sd.vae.to(self.device_torch)
+                arr_norm = (arr * 2.0 - 1.0).to(_vae_dtype)
+                posterior = self.sd.vae.encode(arr_norm)
+                # Flux 2's VAE.encode returns a Tensor directly; standard
+                # diffusers VAEs return an object with `.latent_dist`. Cover both.
+                if hasattr(posterior, 'latent_dist'):
+                    raw_latent = posterior.latent_dist.mode()  # deterministic, batched
+                elif isinstance(posterior, torch.Tensor):
+                    raw_latent = posterior
+                elif hasattr(posterior, 'sample') and callable(getattr(posterior, 'sample')):
+                    raw_latent = posterior.sample()
+                else:
+                    raw_latent = posterior[0]
+                # Match dataloader's encode_images: scaling_factor * (latent - shift_factor)
+                scaled = _vae_scale * (raw_latent - _vae_shift)
+                if getattr(self, '_taef2_decoder', None) is not None:
+                    # TAEF2 expects 32-ch unpacked latents; Flux 2 VAE encoder
+                    # outputs 128-ch packed (same as model output). Mirror the
+                    # rearrange used in the depth loss decode path.
+                    if scaled.shape[1] != 32:
+                        scaled = rearrange(
+                            scaled,
+                            "b (c p1 p2) h w -> b c (h p1) (w p2)",
+                            c=32, p1=2, p2=2,
+                        )
+                    dec_dtype = next(self._taef2_decoder.parameters()).dtype
+                    pixels = self._taef2_decoder(scaled.to(dec_dtype)).float()
+                elif self.taesd is not None:
+                    td = next(self.taesd.parameters()).dtype
+                    pixels = self.taesd.decode(scaled.to(td)).sample.float()
+                    pixels = (pixels + 1.0) * 0.5
+                else:
+                    unscaled = scaled / _vae_scale
+                    if _vae_shift:
+                        unscaled = unscaled + _vae_shift
+                    pixels = self.sd.vae.decode(unscaled.to(_vae_dtype)).sample.float()
+                    pixels = (pixels + 1.0) * 0.5
+                return pixels.clamp(0, 1)
+
+            def _cache_dataset_depth(ds):
+                cache_depth_gt_embeddings(
+                    ds.file_list, self.depth_consistency_config,
+                    device=self.device_torch,
+                    vae_roundtrip_fn=_vae_roundtrip_for_depth,
+                )
+                if getattr(ds, 'num_frames', 1) > 1:
+                    cache_video_depth_gt_embeddings(
+                        ds.file_list, self.depth_consistency_config,
+                        device=self.device_torch,
+                        num_frames=ds.num_frames,
+                    )
+
+            if self.data_loader is not None:
+                for dataset in get_dataloader_datasets(self.data_loader):
+                    _cache_dataset_depth(dataset)
+            if self.data_loader_reg is not None:
+                for dataset in get_dataloader_datasets(self.data_loader_reg):
+                    _cache_dataset_depth(dataset)
 
         if self.is_caching_text_embeddings:
             # make sure model is on cpu for this part so we don't oom.
@@ -1261,8 +1680,32 @@ class SDTrainer(BaseSDTrainProcess):
             **kwargs
     ):
         loss_target = self.train_config.loss_target
-        is_reg = any(batch.get_is_reg_list())
+        is_reg_list = batch.get_is_reg_list()
+        is_reg = any(is_reg_list)
+        # Per-sample reg flag tensor (B,), used to gate every auxiliary
+        # (non-diffusion) loss off for reg samples. Diffusion loss has its
+        # own `loss_multiplier * reg_weight` scaling and is unaffected.
+        is_reg_per_sample = torch.tensor(
+            [bool(v) for v in is_reg_list],
+            device=self.device_torch, dtype=torch.bool,
+        )
+        # Per-sample loss-split flag — see DatasetConfig.loss_split. When
+        # set to 'diffusion_depth', the dataset alternates which big loss
+        # fires per optimizer step (not per microbatch — gating keys on
+        # self.step_num, which only advances after the full accumulation
+        # window completes, so all microbatches in one optimizer step see
+        # the same active loss). Even step_num: diffusion only; odd: depth
+        # only. Other auxiliaries fire as their own gating allows on both.
+        _split_list = getattr(batch, 'loss_split_list', None) or [None] * is_reg_per_sample.shape[0]
+        loss_split_diff_depth = torch.tensor(
+            [s == 'diffusion_depth' for s in _split_list],
+            device=self.device_torch, dtype=torch.bool,
+        )
+        _step_is_diffusion = (self.step_num % 2 == 0)
         additional_loss = 0.0
+        # Reset every microbatch so a step where depth doesn't contribute
+        # leaves the dual-backward block with no tensor to act on.
+        self._dc_applied_for_grad = None
 
         # log timestep ratio for distribution visualization
         with torch.no_grad():
@@ -1648,6 +2091,36 @@ class SDTrainer(BaseSDTrainProcess):
         with torch.no_grad():
             raw_diffusion_loss = loss.mean().detach()
 
+            # Per-sample diffusion loss binned by timestep (0.1 bands) —
+            # mirrors depth_loss_t00..t90 so the dashboard shows diffusion
+            # loss evolution per noise level. Display-only; never feeds back
+            # into the loss tensor.
+            if loss.dim() == 1 and loss.shape[0] > 0:
+                if self._last_diffusion_loss_bins is None:
+                    self._last_diffusion_loss_bins = {}
+                _diff_per_sample = loss.detach().float().cpu()
+                _diff_t = (timesteps.float() / num_train_ts).detach()
+                if _diff_t.dim() == 0:
+                    _diff_t = _diff_t.expand(_diff_per_sample.shape[0])
+                _diff_t_cpu = _diff_t.float().cpu().flatten()
+                for _diff_i in range(_diff_per_sample.shape[0]):
+                    _t_i = float(
+                        _diff_t_cpu[_diff_i]
+                        if _diff_i < _diff_t_cpu.numel()
+                        else _diff_t_cpu[0]
+                    )
+                    _bin_start = int(_t_i * 10) / 10.0
+                    _bin_key = f'diffusion_loss_t{int(_bin_start*100):02d}'
+                    self._bin_update(
+                        self._last_diffusion_loss_bins,
+                        _bin_key,
+                        float(_diff_per_sample[_diff_i]),
+                    )
+                    self._record_sample(
+                        'diffusion_loss', float(_diff_per_sample[_diff_i]),
+                        t=_t_i, idx=_diff_i, batch=batch,
+                    )
+
         # apply diffusion loss timestep gating (per-sample, before .mean())
         if self.train_config.diffusion_loss_min_t > 0.0 or self.train_config.diffusion_loss_max_t < 1.0:
             t_ratio = timesteps.float() / num_train_ts
@@ -1657,6 +2130,15 @@ class SDTrainer(BaseSDTrainProcess):
 
         # apply per-sample diffusion loss weight overrides
         per_sample_diff_w = batch.diffusion_loss_weight_list
+        # Loss-split gate: on depth steps, force per-sample diff weight to 0
+        # for samples whose dataset has loss_split='diffusion_depth'. The
+        # zero-weight samples are then excluded from active_count below
+        # (mirrors the depth_loss_weight=0 short-circuit at the depth path).
+        if loss_split_diff_depth.any() and not _step_is_diffusion:
+            per_sample_diff_w = list(per_sample_diff_w)
+            for _i in range(len(per_sample_diff_w)):
+                if loss_split_diff_depth[_i]:
+                    per_sample_diff_w[_i] = 0.0
         if any(w is not None for w in per_sample_diff_w):
             global_diff_w = self.train_config.diffusion_loss_weight
             diff_weights = torch.tensor(
@@ -1717,7 +2199,13 @@ class SDTrainer(BaseSDTrainProcess):
 
             # Build per-sample timestep masks (per-dataset overrides fall back to global)
             def _per_sample_mask(batch_min_list, batch_max_list, global_min, global_max):
-                """Build (B,) bool mask using per-sample min/max_t with global fallback."""
+                """Build (B,) bool mask using per-sample min/max_t with global fallback.
+
+                Reg samples are unconditionally excluded — auxiliary losses
+                shouldn't fire on samples used for prior preservation. The
+                diffusion loss handles reg via `loss_multiplier * reg_weight`
+                separately and is unaffected by this gate.
+                """
                 min_vals = torch.tensor(
                     [v if v is not None else global_min for v in batch_min_list],
                     device=t_ratio.device, dtype=t_ratio.dtype,
@@ -1726,7 +2214,8 @@ class SDTrainer(BaseSDTrainProcess):
                     [v if v is not None else global_max for v in batch_max_list],
                     device=t_ratio.device, dtype=t_ratio.dtype,
                 )
-                return (t_ratio > min_vals) & (t_ratio < max_vals)
+                t_mask = (t_ratio > min_vals) & (t_ratio < max_vals)
+                return t_mask & (~is_reg_per_sample.to(t_mask.device))
 
             # Face losses (identity + landmark) use their own timestep window
             high_noise_mask = _per_sample_mask(
@@ -1829,6 +2318,14 @@ class SDTrainer(BaseSDTrainProcess):
                             orig_w = float(fi.width)
                             orig_h = float(fi.height)
                             bx1, by1, bx2, by2 = raw_bbox.float()
+
+                            # Dataloader applies deterministic flips before
+                            # scale+crop; mirror that here in raw coords so the
+                            # bbox lands in the correct half of the training tensor.
+                            if getattr(fi, 'flip_x', False):
+                                bx1, bx2 = orig_w - bx2, orig_w - bx1
+                            if getattr(fi, 'flip_y', False):
+                                by1, by2 = orig_h - by2, orig_h - by1
 
                             stw = float(getattr(fi, 'scale_to_width', None) or orig_w)
                             sth = float(getattr(fi, 'scale_to_height', None) or orig_h)
@@ -1949,18 +2446,22 @@ class SDTrainer(BaseSDTrainProcess):
                             cos_sim = F.cosine_similarity(gen_centered, ref_centered, dim=-1)  # (B,)
 
                         # Metric mask: valid face, gated by timestep window unless identity_metrics
+                        # is on (then all timesteps log so id_sim_tNN bins fill across t).
                         ref_valid = ref_embedding.abs().sum(dim=-1) > 0
                         if _id_metrics_always:
                             metric_mask = ref_valid  # all timesteps for logging
                         else:
                             metric_mask = ref_valid & high_noise_mask
-                        # Loss mask: also gate by per-sample cosine threshold to prevent hallucination
+                        # Loss mask: ALWAYS respects identity_loss_min_t/max_t even when
+                        # identity_metrics drops the t-window from metric_mask, plus the
+                        # per-sample cosine threshold to prevent pushing on hallucinated faces.
                         cos_threshold = torch.tensor(
                             [v if v is not None else self.face_id_config.identity_loss_min_cos
                              for v in batch.identity_loss_min_cos_list],
                             device=cos_sim.device, dtype=cos_sim.dtype,
                         )
-                        loss_mask = metric_mask & (cos_sim.detach() > cos_threshold) & _face_detected
+                        loss_mask = (ref_valid & high_noise_mask
+                                     & (cos_sim.detach() > cos_threshold) & _face_detected)
 
                         # Build per-sample identity weights early — gate loss_mask so
                         # zero-weight samples are fully excluded from loss computation
@@ -2017,8 +2518,8 @@ class SDTrainer(BaseSDTrainProcess):
                             if _has_clean_targets:
                                 valid_clean = clean_cos * valid_mask.float()
                                 self._last_id_clean_target = (valid_clean.sum() / raw_count).item()
-                                raw_shortfall = torch.clamp(clean_cos - cos_sim, min=0.0) * valid_mask.float()
-                                self._last_id_shortfall = (raw_shortfall.sum() / raw_count).item()
+                                raw_delta = (cos_sim - clean_cos) * valid_mask.float()
+                                self._last_id_clean_delta = (raw_delta.sum() / raw_count).item()
                             if self._last_id_sim_bins is None:
                                 self._last_id_sim_bins = {}
                             for idx in range(cos_sim.shape[0]):
@@ -2026,7 +2527,17 @@ class SDTrainer(BaseSDTrainProcess):
                                     t_val = t_ratio[idx].item()
                                     bin_start = int(t_val * 10) / 10.0
                                     bin_key = f'id_sim_t{int(bin_start*100):02d}'
-                                    self._last_id_sim_bins[bin_key] = cos_sim[idx].item()
+                                    cs_val = cos_sim[idx].item()
+                                    self._bin_update(
+                                        self._last_id_sim_bins,
+                                        bin_key,
+                                        cs_val,
+                                    )
+                                    # Per-sample breakdown for the tooltip.
+                                    self._record_sample(
+                                        'id_sim', cs_val,
+                                        t=t_val, idx=idx, batch=batch,
+                                    )
                         # save decoded x0 predictions + ArcFace crops to visualize identity pipeline
                         if valid_mask.any():
                             id_preview_dir = os.path.join(self.save_root, 'id_previews')
@@ -2169,7 +2680,16 @@ class SDTrainer(BaseSDTrainProcess):
                                     t_val = t_ratio[idx].item()
                                     bin_start = int(t_val * 10) / 10.0
                                     bin_key = f'shape_sim_t{int(bin_start*100):02d}'
-                                    self._last_shape_sim_bins[bin_key] = lm_loss_per_sample[idx].item()
+                                    lm_val = lm_loss_per_sample[idx].item()
+                                    self._bin_update(
+                                        self._last_shape_sim_bins,
+                                        bin_key,
+                                        lm_val,
+                                    )
+                                    self._record_sample(
+                                        'landmark_loss', lm_val,
+                                        t=t_val, idx=idx, batch=batch,
+                                    )
 
                 # --- Body proportion loss (ViTPose bone-length ratio matching) ---
                 if _need_body_proportion_loss:
@@ -2193,6 +2713,11 @@ class SDTrainer(BaseSDTrainProcess):
                                 orig_w = float(fi.width)
                                 orig_h = float(fi.height)
                                 pbx1, pby1, pbx2, pby2 = raw_bbox.float()
+
+                                if getattr(fi, 'flip_x', False):
+                                    pbx1, pbx2 = orig_w - pbx2, orig_w - pbx1
+                                if getattr(fi, 'flip_y', False):
+                                    pby1, pby2 = orig_h - pby2, orig_h - pby1
 
                                 stw = float(getattr(fi, 'scale_to_width', None) or orig_w)
                                 sth = float(getattr(fi, 'scale_to_height', None) or orig_h)
@@ -2283,7 +2808,16 @@ class SDTrainer(BaseSDTrainProcess):
                                     t_val = t_ratio[idx].item()
                                     bin_start = int(t_val * 10) / 10.0
                                     bin_key = f'bp_sim_t{int(bin_start*100):02d}'
-                                    self._last_bp_sim_bins[bin_key] = 1.0 - bp_loss_per_sample[idx].item()
+                                    bp_val = bp_loss_per_sample[idx].item()
+                                    self._bin_update(
+                                        self._last_bp_sim_bins,
+                                        bin_key,
+                                        1.0 - bp_val,
+                                    )
+                                    self._record_sample(
+                                        'body_proportion_loss', bp_val,
+                                        t=t_val, idx=idx, batch=batch,
+                                    )
 
                             # Save skeleton preview images (prediction + reference side-by-side)
                             from toolkit.body_id import draw_skeleton_overlay
@@ -2383,6 +2917,10 @@ class SDTrainer(BaseSDTrainProcess):
                                 fi = batch.file_items[idx]
                                 orig_w, orig_h = float(fi.width), float(fi.height)
                                 pbx1, pby1, pbx2, pby2 = raw_pb.float()
+                                if getattr(fi, 'flip_x', False):
+                                    pbx1, pbx2 = orig_w - pbx2, orig_w - pbx1
+                                if getattr(fi, 'flip_y', False):
+                                    pby1, pby2 = orig_h - pby2, orig_h - pby1
                                 stw = float(getattr(fi, 'scale_to_width', None) or orig_w)
                                 sth = float(getattr(fi, 'scale_to_height', None) or orig_h)
                                 pbx1 = pbx1 * (stw / orig_w)
@@ -2479,7 +3017,16 @@ class SDTrainer(BaseSDTrainProcess):
                                     t_val = t_ratio[idx].item()
                                     bin_start = int(t_val * 10) / 10.0
                                     bin_key = f'bsh_sim_t{int(bin_start*100):02d}'
-                                    self._last_bsh_sim_bins[bin_key] = bsh_cos[idx].item()
+                                    bsh_val = bsh_cos[idx].item()
+                                    self._bin_update(
+                                        self._last_bsh_sim_bins,
+                                        bin_key,
+                                        bsh_val,
+                                    )
+                                    self._record_sample(
+                                        'body_shape_cos', bsh_val,
+                                        t=t_val, idx=idx, batch=batch,
+                                    )
 
                 # --- Normal map loss (Sapiens surface normal matching) ---
                 if _need_normal_loss and nrm_noise_mask.any():
@@ -2722,6 +3269,405 @@ class SDTrainer(BaseSDTrainProcess):
                             level_str = ' '.join(f'{k}={v:.4f}' for k, v in va_per_level.items())
                             print(f"  [VAE anchor] step={self.step_num} total={(va_loss_per_sample.sum() / va_active_count).item():.4f} {level_str}")
 
+        # === Depth consistency loss (MiDaS SSI + multi-scale gradient via DA2) ===
+        # Independent of face_id_config; does its own x0 decode and per-sample loop.
+        # 4D (image) path — 5D (video) is handled by a separate block below.
+        if (self.depth_encoder is not None
+                and len(noise_pred.shape) == 4
+                and getattr(batch, 'depth_gt_list', None) is not None):
+            _dc_cfg = self.depth_consistency_config
+            _dc_nt = float(self.sd.noise_scheduler.config.num_train_timesteps)
+            _dc_t = timesteps.float() / _dc_nt
+            # Per-sample t-band — matches identity-loss pattern: per-item
+            # overrides from the batch fall back to the global config.
+            _dc_min_list = getattr(batch, 'depth_loss_min_t_list', None) or [None] * _dc_t.shape[0]
+            _dc_max_list = getattr(batch, 'depth_loss_max_t_list', None) or [None] * _dc_t.shape[0]
+            _dc_min = torch.tensor(
+                [v if v is not None else _dc_cfg.loss_min_t for v in _dc_min_list],
+                device=_dc_t.device, dtype=_dc_t.dtype,
+            )
+            _dc_max = torch.tensor(
+                [v if v is not None else _dc_cfg.loss_max_t for v in _dc_max_list],
+                device=_dc_t.device, dtype=_dc_t.dtype,
+            )
+            _dc_active = (_dc_t > _dc_min) & (_dc_t < _dc_max)
+            # Reg samples don't contribute to depth-consistency loss
+            # (they're for prior preservation; their conditioning is
+            # stripped, so structural matching to GT is meaningless).
+            _dc_active = _dc_active & (~is_reg_per_sample.to(_dc_active.device))
+            # Per-sample loss-weight override (None inherits global). Samples
+            # with effective weight <= 0 are gated out of the active set so
+            # they don't waste compute on the depth perceptor.
+            _dc_w_list = getattr(batch, 'depth_loss_weight_list', None) or [None] * _dc_t.shape[0]
+            _dc_eff_w = torch.tensor(
+                [w if w is not None else _dc_cfg.loss_weight for w in _dc_w_list],
+                device=_dc_t.device, dtype=_dc_t.dtype,
+            )
+            # Loss-split gate: zero depth weight for split samples on
+            # diffusion steps. The _dc_active filter below then drops them
+            # so the depth perceptor forward is also skipped.
+            if loss_split_diff_depth.any() and _step_is_diffusion:
+                _split_mask = loss_split_diff_depth.to(_dc_eff_w.device, dtype=_dc_eff_w.dtype)
+                _dc_eff_w = _dc_eff_w * (1.0 - _split_mask)
+            _dc_active = _dc_active & (_dc_eff_w > 0)
+
+            if _dc_active.any():
+                # Recover x0 prediction from model output (same math as the
+                # face-losses block — we duplicate it so depth can run with
+                # no face_id config present).
+                if self.sd.is_flow_matching:
+                    _dc_sigma = _dc_t.view(-1, 1, 1, 1)
+                    _dc_x0_pred = noisy_latents - _dc_sigma * noise_pred
+                else:
+                    _dc_ab = self.sd.noise_scheduler.alphas_cumprod.to(
+                        device=timesteps.device, dtype=noisy_latents.dtype
+                    )[timesteps.long()].view(-1, 1, 1, 1)
+                    _dc_sa = _dc_ab.sqrt()
+                    _dc_s1ma = (1.0 - _dc_ab).sqrt()
+                    if self.sd.prediction_type == 'v_prediction':
+                        _dc_x0_pred = _dc_sa * noisy_latents - _dc_s1ma * noise_pred
+                    else:
+                        _dc_x0_pred = (noisy_latents - _dc_s1ma * noise_pred) / _dc_sa.clamp(min=1e-8)
+
+                # Decode x0 to pixel space (same path the face-losses block uses).
+                if hasattr(self, '_taef2_decoder') and self._taef2_decoder is not None:
+                    _dc_for_dec = _dc_x0_pred
+                    if _dc_for_dec.shape[1] != 32:
+                        _dc_for_dec = rearrange(
+                            _dc_for_dec,
+                            "b (c p1 p2) h w -> b c (h p1) (w p2)",
+                            c=32, p1=2, p2=2,
+                        )
+                    _dc_dd = next(self._taef2_decoder.parameters()).dtype
+                    _dc_pixels = self._taef2_decoder(_dc_for_dec.to(_dc_dd)).float().clamp(0, 1)
+                elif self.taesd is not None:
+                    _dc_td = next(self.taesd.parameters()).dtype
+                    _dc_pixels = self.taesd.decode(_dc_x0_pred.to(_dc_td)).sample.float()
+                    _dc_pixels = (_dc_pixels + 1.0) * 0.5
+                else:
+                    # VAE may be offloaded to CPU when latents are cached
+                    # (see hook_before_train_loop). Ensure it is on the
+                    # training device before decoding.
+                    if next(self.sd.vae.parameters()).device != self.device_torch:
+                        self.sd.vae.to(self.device_torch)
+                    _dc_vd = self.sd.vae.dtype
+                    _dc_us = _dc_x0_pred / self.sd.vae.config['scaling_factor']
+                    if 'shift_factor' in self.sd.vae.config and self.sd.vae.config['shift_factor']:
+                        _dc_us = _dc_us + self.sd.vae.config['shift_factor']
+                    _dc_pixels = self.sd.vae.decode(_dc_us.to(_dc_vd)).sample
+                    _dc_pixels = (_dc_pixels.float() + 1.0) * 0.5
+                _dc_pixels = _dc_pixels.clamp(0, 1)
+
+                # Spatial mask source
+                _dc_masks = None
+                if _dc_cfg.mask_source == 'subject':
+                    _dc_masks = getattr(batch, 'subject_masks', None)
+                elif _dc_cfg.mask_source == 'body':
+                    _dc_masks = getattr(batch, 'body_masks', None)
+
+                # Iterate per-sample (cached GT depths have per-image shapes).
+                # _dc_total is the raw (unweighted) sum used for the metric.
+                # _dc_weighted_total carries the per-sample-weighted sum used
+                # for the actual gradient contribution (back-prop target).
+                _dc_total = _dc_pixels.new_zeros(())
+                _dc_weighted_total = _dc_pixels.new_zeros(())
+                _dc_ssi_sum = 0.0
+                _dc_grad_sum = 0.0
+                _dc_n = 0
+                for _dc_i in range(_dc_pixels.shape[0]):
+                    if not _dc_active[_dc_i]:
+                        continue
+                    _dc_gt_i = batch.depth_gt_list[_dc_i] if _dc_i < len(batch.depth_gt_list) else None
+                    if _dc_gt_i is None:
+                        continue
+                    _dc_gt_t = _dc_gt_i.to(_dc_pixels.device, dtype=torch.float32)
+                    if _dc_gt_t.dim() == 2:
+                        _dc_gt_t = _dc_gt_t.unsqueeze(0)
+                    _dc_mask_t = None
+                    if _dc_masks is not None and _dc_i < _dc_masks.shape[0]:
+                        _dc_mask_t = _dc_masks[_dc_i].float().to(_dc_pixels.device)
+                        if _dc_mask_t.dim() == 3:
+                            _dc_mask_t = _dc_mask_t.squeeze(0)
+                    _dc_loss_i, _dc_ssi_i, _dc_grad_i, _dc_dpred_i, _dc_dgt_i = compute_depth_consistency_loss(
+                        self.depth_encoder,
+                        _dc_pixels[_dc_i:_dc_i + 1],
+                        _dc_gt_t,
+                        _dc_mask_t,
+                        ssi_weight=_dc_cfg.ssi_weight,
+                        grad_weight=_dc_cfg.grad_weight,
+                        grad_scales=_dc_cfg.grad_scales,
+                    )
+                    _dc_total = _dc_total + _dc_loss_i
+                    _dc_weighted_total = _dc_weighted_total + _dc_loss_i * _dc_eff_w[_dc_i]
+                    _dc_ssi_sum += float(_dc_ssi_i)
+                    _dc_grad_sum += float(_dc_grad_i)
+                    _dc_n += 1
+
+                    # Per-sample depth loss binned by timestep (0.1 bands) —
+                    # mirrors identity's id_sim_t00..t90 so the dashboard shows
+                    # depth loss evolution per noise level.
+                    if self._last_depth_loss_bins is None:
+                        self._last_depth_loss_bins = {}
+                    _dc_t_val = _dc_t[_dc_i].item()
+                    _dc_bin_start = int(_dc_t_val * 10) / 10.0
+                    _dc_bin_key = f'depth_loss_t{int(_dc_bin_start*100):02d}'
+                    self._bin_update(
+                        self._last_depth_loss_bins,
+                        _dc_bin_key,
+                        float(_dc_loss_i),
+                    )
+                    self._record_sample(
+                        'depth_consistency_loss', float(_dc_loss_i),
+                        t=_dc_t_val, idx=_dc_i, batch=batch,
+                    )
+
+                    # Preview: save [GT RGB | GT depth | Pred RGB | Pred depth] every N steps.
+                    if (_dc_cfg.preview_every > 0
+                            and self.step_num % _dc_cfg.preview_every == 0
+                            and _dc_i < len(batch.file_items)):
+                        try:
+                            from toolkit.depth_consistency import render_depth_preview
+                            from PIL import Image as _PILImage
+                            from PIL.ImageOps import exif_transpose as _exif_transpose
+                            pred_rgb = _dc_pixels[_dc_i].detach().clamp(0, 1).cpu()
+                            pred_pil = TF.to_pil_image(pred_rgb)
+                            ref_path = batch.file_items[_dc_i].path
+                            ref_pil = _exif_transpose(_PILImage.open(ref_path)).convert('RGB')
+                            combo = render_depth_preview(
+                                pred_pil, ref_pil,
+                                _dc_dpred_i.squeeze(0) if _dc_dpred_i.dim() == 3 else _dc_dpred_i,
+                                _dc_dgt_i.squeeze(0) if _dc_dgt_i.dim() == 3 else _dc_dgt_i,
+                                mask=_dc_mask_t,
+                            )
+                            dc_preview_dir = os.path.join(self.save_root, 'depth_previews')
+                            os.makedirs(dc_preview_dir, exist_ok=True)
+                            _t_val = _dc_t[_dc_i].item()
+                            _dc_val = float(_dc_loss_i)
+                            src_name = os.path.splitext(os.path.basename(ref_path))[0]
+                            combo.save(os.path.join(
+                                dc_preview_dir,
+                                f'{src_name}_step{self.step_num:06d}_t{_t_val:.2f}_dc{_dc_val:.4f}.jpg'
+                            ))
+                        except Exception as e:  # noqa: BLE001
+                            print_acc(f"  depth preview failed: {e}")
+
+                if _dc_n > 0:
+                    _dc_avg = _dc_total / _dc_n
+                    # Per-sample weights are already baked into _dc_weighted_total,
+                    # so the applied loss is just its mean — no further global
+                    # multiply. When all per-sample weights inherit the global
+                    # (the default), this is identical to `global * mean(loss)`.
+                    _dc_applied = _dc_weighted_total / _dc_n
+                    # Stash the depth-applied tensor (pre-detach) so the
+                    # dual-backward block can split the combined loss into
+                    # (depth-only) and (everything-else) components.
+                    self._dc_applied_for_grad = _dc_applied
+                    loss = loss + _dc_applied
+                    self._last_depth_consistency_loss = _dc_avg.detach().item()
+                    self._last_depth_consistency_loss_applied = _dc_applied.detach().item()
+                    self._last_depth_consistency_ssi = _dc_ssi_sum / _dc_n
+                    self._last_depth_consistency_grad = _dc_grad_sum / _dc_n
+
+        # === Depth consistency loss — 5D video path (Wan 2.1) ===
+        # Decodes x0 with TAEHV (tiny, 11M params) for the full frame count,
+        # runs the DA2 perceptor on flattened (B*T, 3, H, W) frames in chunks
+        # under gradient checkpointing, then computes per-frame SSI + multi-scale
+        # gradient loss against a cached per-frame GT cube.
+        if (self.depth_encoder is not None
+                and len(noise_pred.shape) == 5
+                and getattr(batch, 'depth_gt_video_list', None) is not None):
+            _dc_cfg = self.depth_consistency_config
+            _dc_nt = float(self.sd.noise_scheduler.config.num_train_timesteps)
+            _dc_t = timesteps.float() / _dc_nt
+            _dc_min_list = getattr(batch, 'depth_loss_min_t_list', None) or [None] * _dc_t.shape[0]
+            _dc_max_list = getattr(batch, 'depth_loss_max_t_list', None) or [None] * _dc_t.shape[0]
+            _dc_min = torch.tensor(
+                [v if v is not None else _dc_cfg.loss_min_t for v in _dc_min_list],
+                device=_dc_t.device, dtype=_dc_t.dtype,
+            )
+            _dc_max = torch.tensor(
+                [v if v is not None else _dc_cfg.loss_max_t for v in _dc_max_list],
+                device=_dc_t.device, dtype=_dc_t.dtype,
+            )
+            _dc_active = (_dc_t > _dc_min) & (_dc_t < _dc_max)
+            # Reg samples are excluded from the depth loss (see image path).
+            _dc_active = _dc_active & (~is_reg_per_sample.to(_dc_active.device))
+            # Per-sample loss-weight override (see image path).
+            _dc_w_list = getattr(batch, 'depth_loss_weight_list', None) or [None] * _dc_t.shape[0]
+            _dc_eff_w = torch.tensor(
+                [w if w is not None else _dc_cfg.loss_weight for w in _dc_w_list],
+                device=_dc_t.device, dtype=_dc_t.dtype,
+            )
+            # Loss-split gate (see image path).
+            if loss_split_diff_depth.any() and _step_is_diffusion:
+                _split_mask = loss_split_diff_depth.to(_dc_eff_w.device, dtype=_dc_eff_w.dtype)
+                _dc_eff_w = _dc_eff_w * (1.0 - _split_mask)
+            _dc_active = _dc_active & (_dc_eff_w > 0)
+
+            if _dc_active.any():
+                # Lazy-load TAEHV on first video step — keeps image-only runs lean.
+                if self._wan_depth_decoder is None:
+                    print_acc("DepthConsistency (video): loading TAEHV tiny decoder...")
+                    self._wan_depth_decoder = load_taehv_wan21(
+                        device=self.device_torch,
+                        dtype=get_torch_dtype(self.train_config.dtype),
+                    )
+
+                # x0 recovery (flow-matching only — Wan 2.1 uses flowmatch).
+                if self.sd.is_flow_matching:
+                    _dc_sigma = _dc_t.view(-1, 1, 1, 1, 1)
+                    _dc_x0_pred = noisy_latents - _dc_sigma * noise_pred
+                else:
+                    # Non-flow video is unusual; skip cleanly if it ever happens.
+                    _dc_x0_pred = None
+
+                if _dc_x0_pred is not None:
+                    # Decode to (B, 3, T, H, W) in [0, 1].
+                    _dc_frames = decode_wan_x0_to_frames(
+                        _dc_x0_pred, self._wan_depth_decoder
+                    )
+                    B_vid, _, T_out, H_out, W_out = _dc_frames.shape
+                    # (B, 3, T, H, W) → (B, T, 3, H, W) → (B*T, 3, H, W).
+                    _dc_flat = _dc_frames.permute(0, 2, 1, 3, 4).reshape(
+                        B_vid * T_out, 3, H_out, W_out
+                    )
+
+                    # Run DA2 on chunks with gradient checkpointing to cap peak
+                    # memory. Chunk size keeps activations bounded regardless of
+                    # video length; grad-ckpt frees them across the wrapping
+                    # VAE+transformer backward.
+                    from torch.utils.checkpoint import checkpoint as _ckpt
+                    _dc_chunk = int(getattr(_dc_cfg, 'frames_per_chunk', 8))
+
+                    def _enc_fn(x):
+                        return self.depth_encoder(x)
+
+                    _dc_depth_chunks = []
+                    for _c in _dc_flat.split(_dc_chunk, dim=0):
+                        _dc_depth_chunks.append(
+                            _ckpt(_enc_fn, _c, use_reentrant=False)
+                        )
+                    _dc_depth_flat = torch.cat(_dc_depth_chunks, dim=0)
+                    # (B*T, H, W) or (B*T, 1, H, W) — normalize to (B*T, H, W).
+                    if _dc_depth_flat.dim() == 4:
+                        _dc_depth_flat = _dc_depth_flat.squeeze(1)
+                    _dc_depth = _dc_depth_flat.reshape(B_vid, T_out, *_dc_depth_flat.shape[1:])
+
+                    _dc_total = _dc_frames.new_zeros(())
+                    _dc_weighted_total = _dc_frames.new_zeros(())
+                    _dc_ssi_sum = 0.0
+                    _dc_grad_sum = 0.0
+                    _dc_n = 0
+                    _dc_preview_b = None
+
+                    for _b in range(B_vid):
+                        if not _dc_active[_b]:
+                            continue
+                        _gt_cube = (batch.depth_gt_video_list[_b]
+                                    if _b < len(batch.depth_gt_video_list) else None)
+                        if _gt_cube is None:
+                            continue
+                        _gt_cube = _gt_cube.to(_dc_frames.device, dtype=torch.float32)
+                        # Align GT T to generated T (should already match when the
+                        # cache was built with the dataset's num_frames).
+                        T_g = _gt_cube.shape[0]
+                        if T_g != T_out:
+                            ix = torch.linspace(0, T_g - 1, T_out, device=_gt_cube.device).long()
+                            _gt_cube = _gt_cube[ix]
+
+                        # Resize GT depth map to match generated depth spatial size
+                        # (DA2 output size may differ if source video had a
+                        # different aspect than x0 decode output).
+                        if _gt_cube.shape[-2:] != _dc_depth.shape[-2:]:
+                            _gt_cube = F.interpolate(
+                                _gt_cube.unsqueeze(1),  # (T, 1, H, W)
+                                size=_dc_depth.shape[-2:],
+                                mode='bilinear',
+                                align_corners=False,
+                            ).squeeze(1)
+
+                        # Per-frame SSI + multi-scale gradient loss. We feed the
+                        # already-extracted generated depth directly via a small
+                        # helper below; compute_depth_consistency_loss re-runs
+                        # the encoder which would double-compute.
+                        from toolkit.depth_consistency import ssi_l1, multiscale_grad_loss
+                        gen_d = _dc_depth[_b]  # (T, H, W)
+                        # Per-frame scalar loss, then mean over T.
+                        ssi_per = []
+                        grad_per = []
+                        for _t in range(T_out):
+                            _s, _, _ = ssi_l1(gen_d[_t], _gt_cube[_t])
+                            ssi_per.append(_s)
+                            grad_per.append(multiscale_grad_loss(
+                                gen_d[_t], _gt_cube[_t], scales=_dc_cfg.grad_scales
+                            ))
+                        ssi_mean = torch.stack(ssi_per).mean()
+                        grad_mean = torch.stack(grad_per).mean()
+                        loss_b = _dc_cfg.ssi_weight * ssi_mean + _dc_cfg.grad_weight * grad_mean
+
+                        _dc_total = _dc_total + loss_b
+                        _dc_weighted_total = _dc_weighted_total + loss_b * _dc_eff_w[_b]
+                        _dc_ssi_sum += float(ssi_mean.detach())
+                        _dc_grad_sum += float(grad_mean.detach())
+                        _dc_n += 1
+
+                        # Per-sample depth loss binned by timestep (0.1 bands).
+                        if self._last_depth_loss_bins is None:
+                            self._last_depth_loss_bins = {}
+                        _dc_b_t_val = _dc_t[_b].item()
+                        _dc_bin_start = int(_dc_b_t_val * 10) / 10.0
+                        _dc_bin_key = f'depth_loss_t{int(_dc_bin_start*100):02d}'
+                        self._bin_update(
+                            self._last_depth_loss_bins,
+                            _dc_bin_key,
+                            float(loss_b.detach()),
+                        )
+                        self._record_sample(
+                            'depth_consistency_loss', float(loss_b.detach()),
+                            t=_dc_b_t_val, idx=_b, batch=batch,
+                        )
+                        if _dc_preview_b is None:
+                            _dc_preview_b = _b
+
+                    if _dc_n > 0:
+                        _dc_avg = _dc_total / _dc_n
+                        # Per-sample weights are baked into _dc_weighted_total.
+                        _dc_applied = _dc_weighted_total / _dc_n
+                        # Stash for the dual-backward gradient cosine block.
+                        self._dc_applied_for_grad = _dc_applied
+                        loss = loss + _dc_applied
+                        self._last_depth_consistency_loss = _dc_avg.detach().item()
+                        self._last_depth_consistency_loss_applied = _dc_applied.detach().item()
+                        self._last_depth_consistency_ssi = _dc_ssi_sum / _dc_n
+                        self._last_depth_consistency_grad = _dc_grad_sum / _dc_n
+
+                        # Preview: animated webp [gen_rgb | gen_depth | gt_depth].
+                        _dc_preview_min_t = float(getattr(_dc_cfg, 'preview_min_t', 0.0))
+                        if (_dc_cfg.preview_every > 0
+                                and self.step_num % _dc_cfg.preview_every == 0
+                                and _dc_preview_b is not None
+                                and _dc_t[_dc_preview_b].item() >= _dc_preview_min_t):
+                            try:
+                                _gt_cube_p = batch.depth_gt_video_list[_dc_preview_b].to(
+                                    dtype=torch.float32
+                                )
+                                dc_preview_dir = os.path.join(self.save_root, 'depth_previews')
+                                os.makedirs(dc_preview_dir, exist_ok=True)
+                                _t_val = _dc_t[_dc_preview_b].item()
+                                out_path = os.path.join(
+                                    dc_preview_dir,
+                                    f'step{self.step_num:06d}_t{_t_val:.2f}.webp'
+                                )
+                                save_video_depth_preview(
+                                    out_path,
+                                    gen_rgb=_dc_frames[_dc_preview_b].permute(1, 0, 2, 3).detach(),
+                                    gen_depth=_dc_depth[_dc_preview_b].detach(),
+                                    gt_depth=_gt_cube_p,
+                                    fps=16,
+                                )
+                            except Exception as e:  # noqa: BLE001
+                                print_acc(f"  video depth preview failed: {e}")
+
         # E-LatentLPIPS perceptual loss in latent space
         if self.latent_perceptual_model is not None:
             try:
@@ -2765,6 +3711,13 @@ class SDTrainer(BaseSDTrainProcess):
             device=t_01.device, dtype=t_01.dtype,
         )
         t_mask = ((t_01 >= min_vals) & (t_01 <= max_vals)).float()
+        # Reg samples don't contribute (auxiliary loss; conditioning is
+        # stripped, so a perceptual match is meaningless).
+        _is_reg_lp = torch.tensor(
+            [bool(v) for v in batch.get_is_reg_list()],
+            device=t_01.device, dtype=torch.bool,
+        )
+        t_mask = t_mask * (~_is_reg_lp).float()
 
         # Per-dataset weight overrides
         global_weight = self.train_config.latent_perceptual_loss_weight
@@ -3352,6 +4305,11 @@ class SDTrainer(BaseSDTrainProcess):
                         orig_w = float(fi.width)
                         orig_h = float(fi.height)
                         bx1, by1, bx2, by2 = [float(v) for v in raw_bbox]
+                        # Apply dataloader flips in raw coords before scale+crop.
+                        if getattr(fi, 'flip_x', False):
+                            bx1, bx2 = orig_w - bx2, orig_w - bx1
+                        if getattr(fi, 'flip_y', False):
+                            by1, by2 = orig_h - by2, orig_h - by1
                         # scale to resized coords
                         stw = float(getattr(fi, 'scale_to_width', None) or orig_w)
                         sth = float(getattr(fi, 'scale_to_height', None) or orig_h)
@@ -4257,7 +5215,8 @@ class SDTrainer(BaseSDTrainProcess):
 
                 with self.timer('backward'):
                     # todo we have multiplier seperated. works for now as res are not in same batch, but need to change
-                    loss = loss * loss_multiplier.mean()
+                    lm_scalar = loss_multiplier.mean()
+                    loss = loss * lm_scalar
                     # IMPORTANT if gradient checkpointing do not leave with network when doing backward
                     # it will destroy the gradients. This is because the network is a context manager
                     # and will change the multipliers back to 0.0 when exiting. They will be
@@ -4267,12 +5226,94 @@ class SDTrainer(BaseSDTrainProcess):
                     # if self.is_bfloat:
                     # loss.backward()
                     # else:
+
+                    # Gradient cosine diagnostic (display-only). When fired,
+                    # we use `autograd.grad` for the depth-only gradient
+                    # (doesn't touch p.grad), then the standard backward
+                    # populates p.grad with the full gradient. The diffusion
+                    # contribution is recovered by linearity:
+                    #   g_diff = g_full - g_dc.
+                    # Cost: one extra backward pass via the retained graph.
+                    _grad_cos_every = int(getattr(
+                        self.train_config, 'gradient_cosine_log_every', 0,
+                    ) or 0)
+                    _do_grad_cos = (
+                        _grad_cos_every > 0
+                        and self._dc_applied_for_grad is not None
+                        and (self.step_num % _grad_cos_every == 0)
+                    )
+
+                    _dc_grads_snapshot = None
+                    _pre_existing_grads = None
+                    _trainable_params_snapshot = None
+                    if _do_grad_cos:
+                        try:
+                            _trainable_params_snapshot = [
+                                p for p in self._iter_trainable_params()
+                                if p.requires_grad
+                            ]
+                            if _trainable_params_snapshot:
+                                # Snapshot any grad accumulated by earlier
+                                # microbatches in this optimizer step. We
+                                # subtract this off after the new backward
+                                # so the cosine measures THIS microbatch's
+                                # contribution alone (not the running sum).
+                                _pre_existing_grads = [
+                                    p.grad.detach().clone() if p.grad is not None else None
+                                    for p in _trainable_params_snapshot
+                                ]
+                                _dc_for_grad = self._dc_applied_for_grad * lm_scalar
+                                _dc_grads_snapshot = torch.autograd.grad(
+                                    _dc_for_grad,
+                                    _trainable_params_snapshot,
+                                    retain_graph=True,
+                                    allow_unused=True,
+                                )
+                        except Exception as _gc_err:  # noqa: BLE001
+                            print_acc(
+                                f"  gradient cosine: depth-only autograd.grad failed: {_gc_err}"
+                            )
+                            _dc_grads_snapshot = None
+                            _pre_existing_grads = None
+                            _trainable_params_snapshot = None
+
                     self.accelerator.backward(loss)
 
+                    if _dc_grads_snapshot is not None and _trainable_params_snapshot is not None:
+                        try:
+                            self._record_grad_cosine(
+                                _trainable_params_snapshot,
+                                _dc_grads_snapshot,
+                                _pre_existing_grads,
+                            )
+                        except Exception as _gc_err:  # noqa: BLE001
+                            print_acc(
+                                f"  gradient cosine: norm/cosine compute failed: {_gc_err}"
+                            )
+
+        # Mirror this microbatch's metric scalars into the buffer so that
+        # `hook_train_loop` can flush a real cross-microbatch mean. Pure
+        # bookkeeping — no loss tensor reference is read here, the loss has
+        # already been backpropped above.
+        self._snapshot_metrics_to_buffer()
         return loss.detach()
         # flush()
 
     def hook_train_loop(self, batch: Union[DataLoaderBatchDTO, List[DataLoaderBatchDTO]]):
+        # Reset display-only per-t-band bin accumulators at the start of every
+        # optimizer step so that:
+        #   (a) same-bin samples within a microbatch accumulate (running mean)
+        #       instead of overwriting each other,
+        #   (b) cross-microbatch (gradient_accumulation_steps > 1) samples
+        #       merge into one mean per bin,
+        #   (c) bins from prior optimizer steps don't leak into the next step.
+        # This is purely metric bookkeeping — no loss tensor is touched.
+        self._reset_step_bins()
+        # Same reasoning for the cross-microbatch metric buffer: clear it at
+        # the very top of every optimizer step so the next step's
+        # `_snapshot_metrics_to_buffer` calls accumulate from zero.
+        if hasattr(self, '_metric_buffer'):
+            self._metric_buffer.reset()
         if isinstance(batch, list):
             batch_list = batch
         else:
@@ -4379,6 +5420,17 @@ class SDTrainer(BaseSDTrainProcess):
         if self._last_diffusion_loss_applied is not None:
             loss_dict['diffusion_loss_applied'] = self._last_diffusion_loss_applied
             self._last_diffusion_loss_applied = None
+        # Gradient cosine diagnostic (only populated on firing steps when
+        # `gradient_cosine_log_every > 0`).
+        if self._last_grad_norm_diffusion is not None:
+            loss_dict['grad_norm_diffusion'] = self._last_grad_norm_diffusion
+            self._last_grad_norm_diffusion = None
+        if self._last_grad_norm_depth is not None:
+            loss_dict['grad_norm_depth'] = self._last_grad_norm_depth
+            self._last_grad_norm_depth = None
+        if self._last_grad_cos_diff_depth is not None:
+            loss_dict['grad_cos_diff_depth'] = self._last_grad_cos_diff_depth
+            self._last_grad_cos_diff_depth = None
         if self._last_identity_loss_applied is not None:
             loss_dict['identity_loss_applied'] = self._last_identity_loss_applied
             self._last_identity_loss_applied = None
@@ -4393,7 +5445,7 @@ class SDTrainer(BaseSDTrainProcess):
             loss_dict['body_proportion_loss_applied'] = self._last_body_proportion_loss_applied
             self._last_body_proportion_loss_applied = None
         if self._last_bp_sim_bins is not None:
-            for bin_key, sim_val in self._last_bp_sim_bins.items():
+            for bin_key, sim_val in self._bin_finalize(self._last_bp_sim_bins).items():
                 loss_dict[bin_key] = sim_val
             self._last_bp_sim_bins = None
         # Body shape loss (HybrIK SMPL betas)
@@ -4413,7 +5465,7 @@ class SDTrainer(BaseSDTrainProcess):
             loss_dict['body_shape_gated_pct'] = self._last_body_shape_gated_pct
             self._last_body_shape_gated_pct = None
         if self._last_bsh_sim_bins is not None:
-            for bin_key, sim_val in self._last_bsh_sim_bins.items():
+            for bin_key, sim_val in self._bin_finalize(self._last_bsh_sim_bins).items():
                 loss_dict[bin_key] = sim_val
             self._last_bsh_sim_bins = None
         # Normal loss (Sapiens surface normals)
@@ -4437,6 +5489,27 @@ class SDTrainer(BaseSDTrainProcess):
             for level_name, level_val in self._last_vae_anchor_per_level.items():
                 loss_dict[f'va_{level_name}'] = level_val
             self._last_vae_anchor_per_level = None
+        # Depth consistency loss (MiDaS SSI + multi-scale gradient via DA2)
+        if self._last_depth_consistency_loss is not None:
+            loss_dict['depth_consistency_loss'] = self._last_depth_consistency_loss
+            self._last_depth_consistency_loss = None
+        if self._last_depth_consistency_loss_applied is not None:
+            loss_dict['depth_consistency_loss_applied'] = self._last_depth_consistency_loss_applied
+            self._last_depth_consistency_loss_applied = None
+        if self._last_depth_consistency_ssi is not None:
+            loss_dict['depth_consistency_ssi'] = self._last_depth_consistency_ssi
+            self._last_depth_consistency_ssi = None
+        if self._last_depth_consistency_grad is not None:
+            loss_dict['depth_consistency_grad'] = self._last_depth_consistency_grad
+            self._last_depth_consistency_grad = None
+        if self._last_depth_loss_bins is not None:
+            for bin_key, loss_val in self._bin_finalize(self._last_depth_loss_bins).items():
+                loss_dict[bin_key] = loss_val
+            self._last_depth_loss_bins = None
+        if self._last_diffusion_loss_bins is not None:
+            for bin_key, loss_val in self._bin_finalize(self._last_diffusion_loss_bins).items():
+                loss_dict[bin_key] = loss_val
+            self._last_diffusion_loss_bins = None
         if self._last_timestep is not None:
             loss_dict['timestep'] = self._last_timestep
             self._last_timestep = None
@@ -4446,15 +5519,15 @@ class SDTrainer(BaseSDTrainProcess):
         if self._last_id_clean_target is not None:
             loss_dict['id_clean_target'] = self._last_id_clean_target
             self._last_id_clean_target = None
-        if self._last_id_shortfall is not None:
-            loss_dict['id_shortfall'] = self._last_id_shortfall
-            self._last_id_shortfall = None
+        if self._last_id_clean_delta is not None:
+            loss_dict['id_clean_delta'] = self._last_id_clean_delta
+            self._last_id_clean_delta = None
         if self._last_id_sim_bins is not None:
-            for bin_key, sim_val in self._last_id_sim_bins.items():
+            for bin_key, sim_val in self._bin_finalize(self._last_id_sim_bins).items():
                 loss_dict[bin_key] = sim_val
             self._last_id_sim_bins = None
         if self._last_shape_sim_bins is not None:
-            for bin_key, sim_val in self._last_shape_sim_bins.items():
+            for bin_key, sim_val in self._bin_finalize(self._last_shape_sim_bins).items():
                 loss_dict[bin_key] = sim_val
             self._last_shape_sim_bins = None
 
@@ -4485,6 +5558,48 @@ class SDTrainer(BaseSDTrainProcess):
         if hasattr(self.sd, 'unet') and hasattr(self.sd.unet, '_last_txt_token_norm'):
             loss_dict['txt_token_norm'] = self.sd.unet._last_txt_token_norm
             self.sd.unet._last_txt_token_norm = None
+
+        # Cross-microbatch correction: every metric mirrored into the
+        # MetricBuffer during this optimizer step gets its weighted mean
+        # over all microbatches written back into loss_dict, overwriting
+        # the single-microbatch shim that the legacy `_last_*` flush block
+        # produced above. With `gradient_accumulation_steps == 1` this is a
+        # no-op (the buffer's mean equals the single observation); with > 1
+        # it fixes the "last microbatch wins" bug.
+        if hasattr(self, '_metric_buffer'):
+            buffered_scalars = self._metric_buffer.flush_scalars()
+            for k, v in buffered_scalars.items():
+                loss_dict[k] = v
+
+            # Per-sample breakdowns: for metrics where SDTrainer called
+            # `_record_sample(...)`, wrap the scalar in a `MetricValue`
+            # that *behaves like a float* for every downstream consumer
+            # (arithmetic, format strings, epoch accumulators, prog-bar
+            # printf) but carries the JSON breakdown payload as an
+            # attribute. The logger picks up the breakdown via
+            # `_coerce_value` and writes it into `value_text`. Metrics
+            # without per-sample collection keep their plain scalar form;
+            # this is purely additive.
+            from extensions_built_in.sd_trainer.metric_buffer import MetricValue
+            buffered_per_sample = self._metric_buffer.flush_per_sample()
+            for k, payload in buffered_per_sample.items():
+                scalar = loss_dict.get(k)
+                if scalar is None:
+                    scalar = payload.get('mean')
+                if scalar is None:
+                    continue
+                try:
+                    loss_dict[k] = MetricValue(float(scalar), payload)
+                except (TypeError, ValueError):
+                    loss_dict[k] = scalar
+
+        # Canonical naming dual-write: every legacy key gets a sibling
+        # under the new `subsystem/kind/variant` namespace (see
+        # `extensions_built_in.sd_trainer.metric_naming.CANONICAL_RENAMES`).
+        # Existing dashboards keep reading the legacy key for one release;
+        # the new metrics tab consumes the canonical key directly.
+        from extensions_built_in.sd_trainer.metric_naming import apply_dual_write
+        loss_dict = apply_dual_write(loss_dict)
 
         self.end_of_training_loop()
 

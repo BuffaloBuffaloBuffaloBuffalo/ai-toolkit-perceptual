@@ -11,9 +11,10 @@ import { redirect } from 'next/navigation';
 import JobActionBar from '@/components/JobActionBar';
 import JobConfigViewer from '@/components/JobConfigViewer';
 import JobLossGraph from '@/components/JobLossGraph';
+import JobMetricsGraph from '@/components/JobMetricsGraph';
 import { Job } from '@prisma/client';
 
-type PageKey = 'overview' | 'samples' | 'config' | 'loss_log';
+type PageKey = 'overview' | 'samples' | 'config' | 'loss_log' | 'metrics_new';
 
 interface Page {
   name: string;
@@ -41,6 +42,15 @@ const pages: Page[] = [
     name: 'Loss Graph',
     value: 'loss_log',
     component: JobLossGraph,
+    mainCss: 'pt-24',
+  },
+  {
+    // Step 5: parallel-installed alongside the legacy "Loss Graph". Reads
+    // the canonical `subsystem/kind/variant` namespace + per-sample
+    // breakdown payloads added in steps 3-4.
+    name: 'Metrics (new)',
+    value: 'metrics_new',
+    component: JobMetricsGraph,
     mainCss: 'pt-24',
   },
   {

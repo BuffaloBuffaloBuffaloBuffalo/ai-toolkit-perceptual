@@ -173,11 +173,11 @@ The `scripts/sample_dataset.py` utility builds a smaller dataset directory by sa
 
 ## Example: Handsome Squidward (single-image LoRA)
 
-A worked example of depth-anchored fine-tuning on a character that isn't well represented in the base model, with a **one-image dataset**.
+A working example of depth-anchored fine-tuning on a character that isn't well represented in the base model, with a **one-image dataset**.
 
-**The setup.** Handsome Squidward is a side character from a single 2009 SpongeBob SquarePants episode. Flux 2 Klein 9B doesn't reliably reproduce him out of the box; prompts default to regular Squidward or a confused human-squid hybrid. We trained a LoRA on a single official illustration to teach the model what he looks like, then tested whether the trained LoRA could generalize to angles and contexts that don't exist anywhere in the source material.
+**The setup.** Handsome Squidward is a side character from a single SpongeBob SquarePants episode. Flux 2 Klein 9B doesn't reliably reproduce him out of the box; prompts default to regular Squidward or a confused human-squid hybrid. We trained a LoRA on a single official illustration to teach the model what he looks like, then tested whether the trained LoRA could generalize to angles and contexts that don't exist anywhere in the source material.
 
-**The dataset.** One image, one caption. That's it.
+**The dataset.** One image, one caption.
 
 ```
 examples/squidward/dataset/
@@ -194,8 +194,7 @@ The caption: *"a cartoon illustration of handsome squidward. he is standing conf
 - **Dataset:** 1 image, `num_repeats: 50`.
 - **Depth anchor:** `loss_weight: 0.005`, `model_id: depth-anything/Depth-Anything-V2-Large-hf`, `input_size: 1400`. The lower weight matches the larger perceptor's higher gradient magnitude (see the depth-anchor section above).
 - **Loss splitting:** `loss_split: diffusion_depth` on the dataset, so depth and diffusion fire on alternating optimizer steps.
-- **Mask source: none.** Single-character cartoon images don't need masking.
-- **No identity / body-proportion anchors.** Handsome Squidward isn't a face ArcFace recognizes, and ViTPose doesn't apply to a squid body.
+- **Mask source: none.** Single-character cartoon images with white backgrounds don't need masking.
 
 **Watching the depth anchor work.** Each preview tile shows (GT RGB | GT depth | Pred RGB | Pred depth) side by side. At the start of training the predicted depth is unstructured noise; by the end it tracks the GT depth closely.
 

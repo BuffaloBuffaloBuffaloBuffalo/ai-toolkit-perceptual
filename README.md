@@ -242,15 +242,19 @@ A working example of depth-anchored fine-tuning on an **artist's style** rather 
 - **Depth anchor:** `loss_weight: 0.005`, `model_id: depth-anything/Depth-Anything-V2-Large-hf`, `input_size: 1400`, `mask_source: none`.
 - **Loss splitting:** `loss_split: diffusion_depth` on the dataset, so depth and diffusion fire on alternating optimizer steps.
 
-**Watching the depth anchor work.** Each preview tile shows (GT RGB | GT depth | Pred RGB | Pred depth) at the same training image and a comparable noise level. Early on, the predicted depth has heavy halo artifacts and doesn't track the figure cleanly; by the end of training it's a much closer match to the GT depth.
+**Watching the depth anchor work.** The ground-truth pair (RGB | depth) is shown once at the top; the predicted pair (RGB | depth) is shown for an early and late step at a comparable noise level. Early on, the predicted depth has heavy halo artifacts and doesn't track the figure cleanly; by the end of training it's a much closer match to the GT depth.
 
-**Early (step 383, t=0.82)** — `depth_consistency_loss: 17.17`
+**Ground truth** (RGB | depth)
 
-![Early preview](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/releases/download/examples-amano-v1/preview_early.jpg)
+![Ground truth](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/releases/download/examples-amano-v1/preview_gt.jpg)
 
-**Late (step 3941, t=0.81)** — `depth_consistency_loss: 6.67`
+**Early prediction (step 383, t=0.82)** — `depth_consistency_loss: 17.17`
 
-![Late preview](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/releases/download/examples-amano-v1/preview_late.jpg)
+![Early prediction](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/releases/download/examples-amano-v1/preview_pred_early.jpg)
+
+**Late prediction (step 3941, t=0.81)** — `depth_consistency_loss: 6.67`
+
+![Late prediction](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/releases/download/examples-amano-v1/preview_pred_late.jpg)
 
 **Generalizing past the dataset.** None of these subjects appear in the training set. The LoRA carries Amano's linework, color treatment, and composition language onto subjects from very different IPs:
 

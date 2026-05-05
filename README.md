@@ -244,11 +244,11 @@ A working example of depth-anchored fine-tuning on an **artist's style** rather 
 
 **Watching the depth anchor work.** Each preview tile shows (GT RGB | GT depth | Pred RGB | Pred depth) at the same training image and a comparable noise level. Early on, the predicted depth has heavy halo artifacts and doesn't track the figure cleanly; by the end of training it's a much closer match to the GT depth.
 
-**Early (step 13, t=0.72)** — `depth_consistency_loss: 14.45`
+**Early (step 383, t=0.82)** — `depth_consistency_loss: 17.17`
 
 ![Early preview](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/releases/download/examples-amano-v1/preview_early.jpg)
 
-**Late (step 3031, t=0.80)** — `depth_consistency_loss: 6.80`
+**Late (step 3941, t=0.81)** — `depth_consistency_loss: 6.67`
 
 ![Late preview](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/releases/download/examples-amano-v1/preview_late.jpg)
 

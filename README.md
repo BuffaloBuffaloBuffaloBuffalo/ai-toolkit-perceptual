@@ -24,6 +24,8 @@ The standard LoRA training loss is per-pixel MSE in latent space. It tells the m
 
 Perceptual anchors give the LoRA more targeted guidance. Each one is a frozen vision model that scores a single property of the generated image, like its depth or its facial identity, and the LoRA gets rewarded for matching the training images on that property alone. You pick which properties matter for what you're training.
 
+**Forward pass.**
+
 ```mermaid
 flowchart TD
     GT([Training image])
@@ -55,14 +57,6 @@ flowchart TD
     Diff --> Total((Total loss))
     Anchor --> Total
 
-    %% Backward / gradient flow — explicit chain back through every frozen module
-    Total ==>|"∇"| Anchor
-    Anchor ==>|"∇"| Pp
-    Pp ==>|"chain rule<br/>through perceptor"| RGBp
-    RGBp ==>|"∇"| Decode
-    Decode ==>|"chain rule<br/>through VAE"| Zhat
-    Zhat ==>|"only LoRA params<br/>receive an update"| Model
-
     classDef frozen fill:#e8eaf6,stroke:#3949ab,color:#1a237e
     classDef trainable fill:#fff8e1,stroke:#f57c00,color:#e65100
     classDef loss fill:#e8f5e9,stroke:#2e7d32,color:#1b5e20
@@ -73,12 +67,29 @@ flowchart TD
     class Diff,Total loss
     class Decode,RGBp,Pp,Pg,Anchor anchor
     style Perceptual fill:#faf5fc,stroke:#6a1b9a,stroke-dasharray:5 4,color:#4a148c
-
-    %% Backward arrows in red so they're distinct from the forward pass
-    linkStyle 16,17,18,19,20,21 stroke:#c62828,stroke-width:2.5px,color:#c62828
 ```
 
-Solid arrows are the forward pass; the thick red arrows are the backward pass. The anchor path (lower half) is what this extension adds: both the GT image and the LoRA's prediction go through the **same frozen perceptor**, and the loss is computed on its outputs — a depth map for DA2, a face embedding for ArcFace, a keypoint heatmap for ViTPose. **The frozen perceptor and VAE decoder are still differentiable**, so during backprop the gradient flows backward through them by chain rule before it reaches the LoRA. Their weights never change, but they shape the gradient with whatever pretrained visual understanding they encode — that's where the "structural awareness" comes from. The LoRA itself is the only thing whose parameters actually update. Loss splitting (described below) takes this one step further by running the diffusion-loss step and the anchor-loss step alternately rather than summing them every step.
+The anchor path (lower half) is what this extension adds. Both the GT image and the LoRA's prediction go through the **same frozen perceptor**, and the loss is computed on its outputs — a depth map for DA2, a face embedding for ArcFace, a keypoint heatmap for ViTPose.
+
+**Backward pass.** The gradient from the anchor loss does not jump straight to the LoRA. The frozen perceptor and VAE decoder are still differentiable, so the gradient passes back through them by chain rule:
+
+```mermaid
+flowchart LR
+    Total((Total loss)) --> Anchor["Perceptual<br/>anchor loss"]
+    Anchor -->|"chain rule"| Pp["Frozen<br/>perceptor"]
+    Pp --> RGBp["Predicted<br/>RGB"]
+    RGBp -->|"chain rule"| Decode["VAE<br/>decode"]
+    Decode --> Zhat["Predicted z₀'"]
+    Zhat -->|"only LoRA<br/>params update"| Model[/"LoRA<br/>model"/]
+
+    classDef grad fill:#ffebee,stroke:#c62828,color:#c62828
+    classDef trainable fill:#fff8e1,stroke:#f57c00,color:#e65100
+    class Total,Anchor,Pp,RGBp,Decode,Zhat grad
+    class Model trainable
+    linkStyle 0,1,2,3,4,5 stroke:#c62828,stroke-width:2.5px,color:#c62828
+```
+
+Their weights never change, but they shape the gradient with whatever pretrained visual understanding they encode — depth-awareness for DA2, identity for ArcFace, body keypoints for ViTPose. The LoRA is the only thing whose parameters actually update, but what it ends up learning is **gradient signal that has been pre-shaped by a vision model that already understands the property you care about**. That's where the structural awareness in the trained LoRA comes from. Loss splitting (described below) takes this one step further by running the diffusion-loss step and the anchor-loss step alternately rather than summing them every step.
 
 ### Depth-Consistency Anchor
 

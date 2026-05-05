@@ -42,7 +42,7 @@ flowchart TD
         RGBp[Predicted RGB]
         Pp["Frozen perceptor<br/>(DA2 / ArcFace / ViTPose)"]
         Pg[Same frozen perceptor]
-        Anchor["Perceptual anchor loss<br/>(compares perceptor outputs,<br/>not pixels)"]
+        Anchor["Perceptual anchor loss<br/>(compares predicted vs. clean ground truth perceptor outputs,<br/>not pixels)"]
     end
 
     Zhat --> Decode

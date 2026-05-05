@@ -4,6 +4,20 @@ A fork of [AI Toolkit by Ostris](https://github.com/ostris/ai-toolkit) that adds
 
 **Supported models:** SDXL, FLUX.2 Klein 9B
 
+## Contents
+
+- [Perceptual Anchoring](#perceptual-anchoring) — depth, identity, body, face suppression
+- [Auto-Masking](#auto-masking) — body / clothing / subject masks for region-weighted loss
+- [Reg Dataset Semantics](#reg-dataset-semantics) — how reg samples are treated in this fork
+- [Training Metrics](#training-metrics) — what gets logged each step
+- [Training Previews](#training-previews) — what each anchor saves to disk
+- [Dataset-Tools UI](#dataset-tools-ui) — preflight passes for masks, depth, faces
+- [Example: Handsome Squidward (single-image LoRA)](#example-handsome-squidward-single-image-lora)
+- [Example: Yoshitaka Amano Style (small-dataset style LoRA)](#example-yoshitaka-amano-style-small-dataset-style-lora)
+- [Configuration Reference](#configuration-reference) — every fork-specific config option
+- [Upstream: AI Toolkit by Ostris](#upstream-ai-toolkit-by-ostris)
+- [Installation](#installation)
+
 ## Perceptual Anchoring
 
 The standard LoRA training loss is per-pixel MSE in latent space. It tells the model "match this exact image." On small datasets that turns into a strong instruction to memorize, which is why you often see washed-out colors, baked-in lighting, and "burn-in" (stippling, JPEG ghosts) showing up in every generation.

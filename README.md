@@ -386,16 +386,15 @@ This fork is based on [AI Toolkit](https://github.com/ostris/ai-toolkit), an all
 ## Installation
 
 Requirements:
-- python >3.10
-- Nvidia GPU with enough ram to do what you need
-- python venv
+- Python >3.10
+- Nvidia GPU with enough VRAM for what you're training
+- Python venv
 - git
-
 
 Linux:
 ```bash
-git clone https://github.com/ostris/ai-toolkit.git
-cd ai-toolkit
+git clone https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual.git
+cd ai-toolkit-perceptual
 python3 -m venv venv
 source venv/bin/activate
 # install torch first
@@ -403,19 +402,15 @@ pip3 install --no-cache-dir torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 -
 pip3 install -r requirements.txt
 ```
 
-For devices running **DGX OS** (including DGX Spark), follow [these](dgx_instructions.md) instructions.
-
-
 Windows:
-
-If you are having issues with Windows. I recommend using the easy install script at [https://github.com/Tavris1/AI-Toolkit-Easy-Install](https://github.com/Tavris1/AI-Toolkit-Easy-Install)
-
 ```bash
-git clone https://github.com/ostris/ai-toolkit.git
-cd ai-toolkit
+git clone https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual.git
+cd ai-toolkit-perceptual
 python -m venv venv
 .\venv\Scripts\activate
 pip install --no-cache-dir torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 --index-url https://download.pytorch.org/whl/cu126
 pip install -r requirements.txt
 ```
+
+For devices running **DGX OS** (including DGX Spark), follow [these](dgx_instructions.md) instructions.
 

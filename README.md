@@ -1,6 +1,6 @@
-# AI Toolkit - Perceptual Anchoring Fork
+# Perceptual LoRA Toolkit
 
-A fork of [AI Toolkit by Ostris](https://github.com/ostris/ai-toolkit) that adds **perceptual anchoring** to LoRA training. The idea is straightforward: instead of training only on per-pixel match against your dataset, you also tell the LoRA to match specific properties of those images using pre-trained vision models. There's an anchor for depth (the geometric structure of a scene), one for facial identity, one for body proportions, and a face-suppression option for when you don't want faces baked in at all. The depth anchor is the most useful one in practice. It lets the LoRA pick up the shapes in your dataset without locking in the colors, textures, or lighting, so trained models stay sharper on small datasets and generalize better to new prompts.
+An extension of [AI Toolkit by Ostris](https://github.com/ostris/ai-toolkit) that adds **perceptual anchoring** to LoRA training. The idea is straightforward: instead of training only on per-pixel match against your dataset, you also tell the LoRA to match specific properties of those images using pre-trained vision models. There's an anchor for depth (the geometric structure of a scene), one for facial identity, one for body proportions, and a face-suppression option for when you don't want faces baked in at all. The depth anchor is the most useful one in practice. It lets the LoRA pick up the shapes in your dataset without locking in the colors, textures, or lighting, so trained models stay sharper on small datasets and generalize better to new prompts.
 
 **Supported models:** SDXL, FLUX.2 Klein 9B
 
@@ -8,13 +8,13 @@ A fork of [AI Toolkit by Ostris](https://github.com/ostris/ai-toolkit) that adds
 
 - [Perceptual Anchoring](#perceptual-anchoring) — depth, identity, body, face suppression
 - [Auto-Masking](#auto-masking) — body / clothing / subject masks for region-weighted loss
-- [Reg Dataset Semantics](#reg-dataset-semantics) — how reg samples are treated in this fork
+- [Reg Dataset Semantics](#reg-dataset-semantics) — how reg samples are treated in this extension
 - [Training Metrics](#training-metrics) — what gets logged each step
 - [Training Previews](#training-previews) — what each anchor saves to disk
 - [Dataset-Tools UI](#dataset-tools-ui) — preflight passes for masks, depth, faces
 - [Example: Handsome Squidward (single-image LoRA)](#example-handsome-squidward-single-image-lora)
 - [Example: Yoshitaka Amano Style (small-dataset style LoRA)](#example-yoshitaka-amano-style-small-dataset-style-lora)
-- [Configuration Reference](#configuration-reference) — every fork-specific config option
+- [Configuration Reference](#configuration-reference) — every extension-specific config option
 - [Upstream: AI Toolkit by Ostris](#upstream-ai-toolkit-by-ostris)
 - [Installation](#installation)
 
@@ -37,7 +37,7 @@ flowchart TD
     Z0 -.-> Diff["Diffusion loss<br/>(MSE in latent space)"]
     Zhat -.-> Diff
 
-    subgraph Perceptual["Perceptual anchor path (this fork)"]
+    subgraph Perceptual["Perceptual anchor path (this extension)"]
         Decode[VAE decode]
         RGBp[Predicted RGB]
         Pp["Frozen perceptor<br/>(DA2 / ArcFace / ViTPose)"]
@@ -68,7 +68,7 @@ flowchart TD
     style Perceptual fill:#faf5fc,stroke:#6a1b9a,stroke-dasharray:5 4,color:#4a148c
 ```
 
-The anchor path (lower half) is what this fork adds. Both the GT image and the LoRA's prediction go through the **same frozen perceptor**, and the loss is computed on its outputs — a depth map for DA2, a face embedding for ArcFace, a keypoint heatmap for ViTPose. The LoRA only ever gets gradient signal about the property the perceptor was built to measure, which is exactly what lets it learn structure without memorizing pixels. Loss splitting (described below) takes this one step further by running the diffusion-loss step and the anchor-loss step alternately rather than summing them every step.
+The anchor path (lower half) is what this extension adds. Both the GT image and the LoRA's prediction go through the **same frozen perceptor**, and the loss is computed on its outputs — a depth map for DA2, a face embedding for ArcFace, a keypoint heatmap for ViTPose. The LoRA only ever gets gradient signal about the property the perceptor was built to measure, which is exactly what lets it learn structure without memorizing pixels. Loss splitting (described below) takes this one step further by running the diffusion-loss step and the anchor-loss step alternately rather than summing them every step.
 
 ### Depth-Consistency Anchor
 
@@ -183,7 +183,7 @@ QC tiles for visual inspection are saved at job start and can be regenerated fro
 
 ## Reg Dataset Semantics
 
-Reg datasets (`is_reg: true`) work the classic Dreambooth way: they're prior-preservation samples that train the model on generic non-subject images alongside your subject samples, so it doesn't forget how to make non-subject content while it's learning the subject. In this fork, reg semantics are tightened up:
+Reg datasets (`is_reg: true`) work the classic Dreambooth way: they're prior-preservation samples that train the model on generic non-subject images alongside your subject samples, so it doesn't forget how to make non-subject content while it's learning the subject. In this extension, reg semantics are tightened up:
 
 - **All perceptual anchors are turned off on reg samples.** Only the diffusion loss fires, scaled by `train.reg_weight`.
 - **Subject conditioning is stripped.** No clip-image or trigger-word injection.
@@ -326,7 +326,7 @@ A working example of depth-anchored fine-tuning on an **artist's style** rather 
 
 ## Configuration Reference
 
-Every fork-specific config option, grouped by the YAML block it lives in. Defaults shown match what you get if you omit the option entirely.
+Every extension-specific config option, grouped by the YAML block it lives in. Defaults shown match what you get if you omit the option entirely.
 
 ### `depth_consistency.*`
 
@@ -401,7 +401,7 @@ Auto-masking pipeline.
 | `cache_resolution` | `256` | Cached mask resolution. Higher = sharper at training time, more disk. |
 | `yolo_ckpt`, `yolo_conf`, `sam_size`, `dtype`, `primary_only` | (defaults) | Detection / segmentation backend knobs. The defaults work for almost everyone. |
 
-### `train.*` (fork-specific additions)
+### `train.*` (extension-specific additions)
 
 | Option | Default | What it does, when to use it |
 |---|---|---|
@@ -412,7 +412,7 @@ Auto-masking pipeline.
 
 ### Per-dataset overrides (`datasets[].*`)
 
-Every entry in `datasets:` accepts these fork-specific overrides. `null` or omitted = inherit the global value.
+Every entry in `datasets:` accepts these extension-specific overrides. `null` or omitted = inherit the global value.
 
 | Option | What it does, when to use it |
 |---|---|
@@ -431,7 +431,7 @@ Every entry in `datasets:` accepts these fork-specific overrides. `null` or omit
 
 ## Upstream: AI Toolkit by Ostris
 
-This fork is based on [AI Toolkit](https://github.com/ostris/ai-toolkit), an all-in-one training suite for diffusion models on consumer hardware.
+This extension is based on [AI Toolkit](https://github.com/ostris/ai-toolkit), an all-in-one training suite for diffusion models on consumer hardware.
 
 ### Support the Original Author
 

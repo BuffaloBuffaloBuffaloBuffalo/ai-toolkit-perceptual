@@ -198,10 +198,13 @@ The caption: *"a cartoon illustration of handsome squidward. he is standing conf
 
 **Watching the depth anchor work.** Each preview tile shows (GT RGB | GT depth | Pred RGB | Pred depth) side by side. At the start of training the predicted depth is unstructured noise; by the end it tracks the GT depth closely.
 
-| Early (step 21) | Late (step 1199) |
-|:---:|:---:|
-| ![Early preview](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/releases/download/examples-squidward-v1/preview_early.jpg) | ![Late preview](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/releases/download/examples-squidward-v1/preview_late.jpg) |
-| `depth_consistency_loss: 26.6` | `depth_consistency_loss: 1.6` |
+**Early (step 21)** — `depth_consistency_loss: 26.6`
+
+![Early preview](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/releases/download/examples-squidward-v1/preview_early.jpg)
+
+**Late (step 1199)** — `depth_consistency_loss: 1.6`
+
+![Late preview](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/releases/download/examples-squidward-v1/preview_late.jpg)
 
 **Generalizing past the dataset.** The training image is a confident front-three-quarter pose. Generations from the trained LoRA hold the character identity in poses, framings, and contexts that don't exist in the source material:
 
@@ -241,10 +244,13 @@ A working example of depth-anchored fine-tuning on an **artist's style** rather 
 
 **Watching the depth anchor work.** Each preview tile shows (GT RGB | GT depth | Pred RGB | Pred depth) at the same training image and a comparable noise level. Early on, the predicted depth has heavy halo artifacts and doesn't track the figure cleanly; by the end of training it's a much closer match to the GT depth.
 
-| Early (step 13, t=0.72) | Late (step 3031, t=0.80) |
-|:---:|:---:|
-| ![Early preview](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/releases/download/examples-amano-v1/preview_early.jpg) | ![Late preview](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/releases/download/examples-amano-v1/preview_late.jpg) |
-| `depth_consistency_loss: 14.45` | `depth_consistency_loss: 6.80` |
+**Early (step 13, t=0.72)** — `depth_consistency_loss: 14.45`
+
+![Early preview](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/releases/download/examples-amano-v1/preview_early.jpg)
+
+**Late (step 3031, t=0.80)** — `depth_consistency_loss: 6.80`
+
+![Late preview](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/releases/download/examples-amano-v1/preview_late.jpg)
 
 **Generalizing past the dataset.** None of these subjects appear in the training set. The LoRA carries Amano's linework, color treatment, and composition language onto subjects from very different IPs:
 

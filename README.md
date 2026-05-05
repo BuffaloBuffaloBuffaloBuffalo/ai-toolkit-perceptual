@@ -54,7 +54,14 @@ flowchart TD
 
     Diff --> Total((Total loss))
     Anchor --> Total
-    Total -. backprop updates only the LoRA .-> Model
+
+    %% Backward / gradient flow — explicit chain back through every frozen module
+    Total ==>|"∇"| Anchor
+    Anchor ==>|"∇"| Pp
+    Pp ==>|"chain rule<br/>through perceptor"| RGBp
+    RGBp ==>|"∇"| Decode
+    Decode ==>|"chain rule<br/>through VAE"| Zhat
+    Zhat ==>|"only LoRA params<br/>receive an update"| Model
 
     classDef frozen fill:#e8eaf6,stroke:#3949ab,color:#1a237e
     classDef trainable fill:#fff8e1,stroke:#f57c00,color:#e65100
@@ -66,9 +73,12 @@ flowchart TD
     class Diff,Total loss
     class Decode,RGBp,Pp,Pg,Anchor anchor
     style Perceptual fill:#faf5fc,stroke:#6a1b9a,stroke-dasharray:5 4,color:#4a148c
+
+    %% Backward arrows in red so they're distinct from the forward pass
+    linkStyle 16,17,18,19,20,21 stroke:#c62828,stroke-width:2.5px,color:#c62828
 ```
 
-The anchor path (lower half) is what this extension adds. Both the GT image and the LoRA's prediction go through the **same frozen perceptor**, and the loss is computed on its outputs — a depth map for DA2, a face embedding for ArcFace, a keypoint heatmap for ViTPose. The LoRA only ever gets gradient signal about the property the perceptor was built to measure, which is exactly what lets it learn structure without memorizing pixels. Loss splitting (described below) takes this one step further by running the diffusion-loss step and the anchor-loss step alternately rather than summing them every step.
+Solid arrows are the forward pass; the thick red arrows are the backward pass. The anchor path (lower half) is what this extension adds: both the GT image and the LoRA's prediction go through the **same frozen perceptor**, and the loss is computed on its outputs — a depth map for DA2, a face embedding for ArcFace, a keypoint heatmap for ViTPose. **The frozen perceptor and VAE decoder are still differentiable**, so during backprop the gradient flows backward through them by chain rule before it reaches the LoRA. Their weights never change, but they shape the gradient with whatever pretrained visual understanding they encode — that's where the "structural awareness" comes from. The LoRA itself is the only thing whose parameters actually update. Loss splitting (described below) takes this one step further by running the diffusion-loss step and the anchor-loss step alternately rather than summing them every step.
 
 ### Depth-Consistency Anchor
 

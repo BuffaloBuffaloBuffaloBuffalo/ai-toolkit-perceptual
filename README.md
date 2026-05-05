@@ -221,6 +221,39 @@ python run.py examples/squidward/config.yaml
 
 Edit `model.name_or_path` in the config to point at your local Flux 2 Klein checkpoint before running.
 
+## Example: Yoshitaka Amano Style (small-dataset style LoRA)
+
+A working example of depth-anchored fine-tuning on an **artist's style** rather than a specific subject, on a **small dataset** of 14 illustrations. Yoshitaka Amano is the illustrator behind the original Final Fantasy character art and a long-running body of solo watercolor portrait work. Flux 2 Klein 9B doesn't reproduce his look from a prompt alone — it defaults to generic anime or oil-paint stylings.
+
+**The reference style.** One illustration from the dataset is shown below to give a feel for what the LoRA is asked to learn: loose ink linework, watercolor washes, ornate costuming, hair drawn as long flowing tendrils.
+
+| ![Reference](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/releases/download/examples-amano-v1/dataset_reference.jpeg) |
+|:---:|
+| One of the 14 training illustrations. |
+
+**The config.** Key settings (full config at `output/amano/config.yaml` after a run):
+
+- **Network:** LoKr, linear/alpha 32, conv/alpha 16, full-rank, factor 8.
+- **Steps:** 4000, batch size 1, gradient accumulation 2.
+- **Resolution:** 768.
+- **Depth anchor:** `loss_weight: 0.005`, `model_id: depth-anything/Depth-Anything-V2-Large-hf`, `input_size: 1400`, `mask_source: none`.
+- **Loss splitting:** `loss_split: diffusion_depth` on the dataset, so depth and diffusion fire on alternating optimizer steps.
+
+**Watching the depth anchor work.** Each preview tile shows (GT RGB | GT depth | Pred RGB | Pred depth) at the same training image and a comparable noise level. Early on, the predicted depth has heavy halo artifacts and doesn't track the figure cleanly; by the end of training it's a much closer match to the GT depth.
+
+| Early (step 13, t=0.72) | Late (step 3031, t=0.80) |
+|:---:|:---:|
+| ![Early preview](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/releases/download/examples-amano-v1/preview_early.jpg) | ![Late preview](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/releases/download/examples-amano-v1/preview_late.jpg) |
+| `depth_consistency_loss: 14.45` | `depth_consistency_loss: 6.80` |
+
+**Generalizing past the dataset.** None of these subjects appear in the training set. The LoRA carries Amano's linework, color treatment, and composition language onto subjects from very different IPs:
+
+| Cloud (FF7) | Snow White (Disney) | Ziggy Stardust (Bowie) |
+|:---:|:---:|:---:|
+| ![Cloud](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/releases/download/examples-amano-v1/output_cloud.png) | ![Snow White](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/releases/download/examples-amano-v1/output_snow.png) | ![Ziggy](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/releases/download/examples-amano-v1/output_ziggy.png) |
+
+**Why depth anchoring matters here.** With a style dataset this small, the diffusion loss alone tends to overfit on the specific compositions of the training images — every output starts looking like a slight variation on the same handful of poses and figures. The depth anchor pushes the LoRA toward what's invariant across the artist's work (linework, paper texture, color treatment) and away from what's incidental (this exact figure, in this exact pose, against this exact background). Loss splitting reinforces the separation: the diffusion-step focuses on appearance, the depth-step on structure, and they only really agree on the high-level "this looks like Amano" signal.
+
 ## Configuration Reference
 
 Every fork-specific config option, grouped by the YAML block it lives in. Defaults shown match what you get if you omit the option entirely.

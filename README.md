@@ -37,12 +37,19 @@ flowchart TD
     Z0 -.-> Diff["Diffusion loss<br/>(MSE in latent space)"]
     Zhat -.-> Diff
 
-    Zhat --> Decode[VAE decode]
-    Decode --> RGBp[Predicted RGB]
-    RGBp --> Pp["Frozen perceptor<br/>(DA2 / ArcFace / ViTPose)"]
-    GT --> Pg[Same frozen perceptor]
+    subgraph Perceptual["Perceptual anchor path (this fork)"]
+        Decode[VAE decode]
+        RGBp[Predicted RGB]
+        Pp["Frozen perceptor<br/>(DA2 / ArcFace / ViTPose)"]
+        Pg[Same frozen perceptor]
+        Anchor["Perceptual anchor loss<br/>(compares perceptor outputs,<br/>not pixels)"]
+    end
 
-    Pp -.-> Anchor["Perceptual anchor loss<br/>(compares perceptor outputs,<br/>not pixels)"]
+    Zhat --> Decode
+    Decode --> RGBp
+    RGBp --> Pp
+    GT --> Pg
+    Pp -.-> Anchor
     Pg -.-> Anchor
 
     Diff --> Total((Total loss))
@@ -52,10 +59,13 @@ flowchart TD
     classDef frozen fill:#e8eaf6,stroke:#3949ab,color:#1a237e
     classDef trainable fill:#fff8e1,stroke:#f57c00,color:#e65100
     classDef loss fill:#e8f5e9,stroke:#2e7d32,color:#1b5e20
+    classDef anchor fill:#f3e5f5,stroke:#6a1b9a,color:#4a148c
 
-    class Encode,Decode,Pp,Pg frozen
+    class Encode frozen
     class Model trainable
-    class Diff,Anchor,Total loss
+    class Diff,Total loss
+    class Decode,RGBp,Pp,Pg,Anchor anchor
+    style Perceptual fill:#faf5fc,stroke:#6a1b9a,stroke-dasharray:5 4,color:#4a148c
 ```
 
 The anchor path (lower half) is what this fork adds. Both the GT image and the LoRA's prediction go through the **same frozen perceptor**, and the loss is computed on its outputs — a depth map for DA2, a face embedding for ArcFace, a keypoint heatmap for ViTPose. The LoRA only ever gets gradient signal about the property the perceptor was built to measure, which is exactly what lets it learn structure without memorizing pixels. Loss splitting (described below) takes this one step further by running the diffusion-loss step and the anchor-loss step alternately rather than summing them every step.

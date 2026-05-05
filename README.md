@@ -24,6 +24,42 @@ The standard LoRA training loss is per-pixel MSE in latent space. It tells the m
 
 Perceptual anchors give the LoRA more targeted guidance. Each one is a frozen vision model that scores a single property of the generated image, like its depth or its facial identity, and the LoRA gets rewarded for matching the training images on that property alone. You pick which properties matter for what you're training.
 
+```mermaid
+flowchart TD
+    GT([Training image])
+    GT --> Encode[VAE encode]
+    Encode --> Z0[Clean latent z₀]
+    Z0 --> Noise[Add noise at step t]
+    Noise --> Zt[Noisy latent z_t]
+    Zt --> Model[/LoRA model/]
+    Model --> Zhat[Predicted z₀']
+
+    Z0 -.-> Diff["Diffusion loss<br/>(MSE in latent space)"]
+    Zhat -.-> Diff
+
+    Zhat --> Decode[VAE decode]
+    Decode --> RGBp[Predicted RGB]
+    RGBp --> Pp["Frozen perceptor<br/>(DA2 / ArcFace / ViTPose)"]
+    GT --> Pg[Same frozen perceptor]
+
+    Pp -.-> Anchor["Perceptual anchor loss<br/>(compares perceptor outputs,<br/>not pixels)"]
+    Pg -.-> Anchor
+
+    Diff --> Total((Total loss))
+    Anchor --> Total
+    Total -. backprop updates only the LoRA .-> Model
+
+    classDef frozen fill:#e8eaf6,stroke:#3949ab,color:#1a237e
+    classDef trainable fill:#fff8e1,stroke:#f57c00,color:#e65100
+    classDef loss fill:#e8f5e9,stroke:#2e7d32,color:#1b5e20
+
+    class Encode,Decode,Pp,Pg frozen
+    class Model trainable
+    class Diff,Anchor,Total loss
+```
+
+The anchor path (lower half) is what this fork adds. Both the GT image and the LoRA's prediction go through the **same frozen perceptor**, and the loss is computed on its outputs — a depth map for DA2, a face embedding for ArcFace, a keypoint heatmap for ViTPose. The LoRA only ever gets gradient signal about the property the perceptor was built to measure, which is exactly what lets it learn structure without memorizing pixels. Loss splitting (described below) takes this one step further by running the diffusion-loss step and the anchor-loss step alternately rather than summing them every step.
+
 ### Depth-Consistency Anchor
 
 Tells the LoRA to keep the geometric structure of the training images while ignoring everything else. It separates "what's in the scene" (which is the LoRA's job) from "how it looks in this particular photo" (which can be left to the model's prior). Useful for:

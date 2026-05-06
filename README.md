@@ -55,26 +55,23 @@ flowchart TD
     Diff --> Total((Total loss))
     Anchor --> Total
 
-    subgraph LegendBox["Legend"]
-        L["∇ = gradients flow back<br/>along this edge during backprop"]
-    end
+    LegendNote["∇ = gradients flow back<br/>along this edge during backprop"]
 
     classDef frozen fill:#e8eaf6,stroke:#3949ab,color:#1a237e
     classDef trainable fill:#fff8e1,stroke:#f57c00,color:#e65100
     classDef loss fill:#e8f5e9,stroke:#2e7d32,color:#1b5e20
     classDef anchor fill:#f3e5f5,stroke:#6a1b9a,color:#4a148c
-    classDef legendNode fill:#fafafa,stroke:#bbb,color:#555
+    classDef legendNode fill:#fafafa,stroke:#bbb,color:#555,stroke-dasharray:3 3
 
     class Encode frozen
     class Model trainable
     class Diff,Total loss
     class Decode,RGBp,Pp,Pg,Anchor anchor
-    class L legendNode
+    class LegendNote legendNode
     style Perceptual fill:#faf5fc,stroke:#6a1b9a,stroke-dasharray:5 4,color:#4a148c
-    style LegendBox fill:#fafafa,stroke:#bbb,color:#555
 ```
 
-The anchor path (lower half) is what this extension adds. Both the GT image and the LoRA's prediction go through the **same frozen perceptor**, and the loss is computed on its outputs (a depth map for DA2, a face embedding for ArcFace, a keypoint heatmap for ViTPose). On the return trip, gradients flow back through the perceptor and VAE decoder even though their weights never update. Loss splitting (described below) takes this further by running the diffusion-loss step and the anchor-loss step alternately rather than summing them every step.
+The anchor path (lower half) is what this extension adds. Both the GT image and the LoRA's prediction go through the **same frozen perceptor**, and the loss is computed on its outputs (a depth map for DA2, a face embedding for ArcFace, a keypoint heatmap for ViTPose). Gradients pass through the perceptor and VAE decoder during backprop, but only the LoRA's weights actually change. Loss splitting (described below) takes this further by running the diffusion-loss step and the anchor-loss step alternately rather than summing them every step.
 
 ### Depth-Consistency Anchor
 

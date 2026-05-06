@@ -26,7 +26,9 @@ Perceptual anchors give the LoRA more targeted guidance. Each one is a frozen vi
 
 ```mermaid
 flowchart TD
+    LegendNote["∇ = gradients flow back<br/>along this edge during backprop"]
     GT([Training image])
+    LegendNote ~~~ GT
     GT --> Encode[VAE encode]
     Encode --> Z0[Clean latent z₀]
     Z0 --> Noise[Add noise at step t]
@@ -54,8 +56,6 @@ flowchart TD
 
     Diff --> Total((Total loss))
     Anchor --> Total
-
-    LegendNote["∇ = gradients flow back<br/>along this edge during backprop"]
 
     classDef frozen fill:#e8eaf6,stroke:#3949ab,color:#1a237e
     classDef trainable fill:#fff8e1,stroke:#f57c00,color:#e65100

@@ -436,3 +436,240 @@ export function useJobMetricsLog(jobID: string, reloadInterval: null | number = 
 
   return { series, canonicalKeys, rawKeys, status, refresh, setSeries };
 }
+
+// =====================================================================
+// Multi-job metrics fetch — fans out the canonical-key fetch logic from
+// `useJobMetricsLog` across N jobs in parallel. Used by the cross-job
+// comparison view.
+//
+// Returns:
+//   seriesByJob: { [jobId]: SeriesMap }
+//   canonicalKeysByJob: { [jobId]: string[] }
+//   unionCanonicalKeys: string[]   — sorted union across all jobs
+//   intersectCanonicalKeys: string[] — sorted intersection across jobs
+//   status / refresh
+// =====================================================================
+export interface MultiJobMetricsState {
+  seriesByJob: Record<string, SeriesMap>;
+  canonicalKeysByJob: Record<string, string[]>;
+  unionCanonicalKeys: string[];
+  intersectCanonicalKeys: string[];
+  status: 'idle' | 'loading' | 'success' | 'error' | 'refreshing';
+  refresh: () => void;
+}
+
+export function useMultiJobMetricsLog(
+  jobIDs: string[],
+  reloadInterval: null | number = null,
+): MultiJobMetricsState {
+  const [seriesByJob, setSeriesByJob] = useState<Record<string, SeriesMap>>({});
+  const [rawKeysByJob, setRawKeysByJob] = useState<Record<string, string[]>>({});
+  const [status, setStatus] = useState<'idle' | 'loading' | 'success' | 'error' | 'refreshing'>('idle');
+
+  const didInitialLoadRef = useRef(false);
+  const inFlightRef = useRef(false);
+  // per-job-per-key last step
+  const lastStepByJobKeyRef = useRef<Record<string, Record<string, number | null>>>({});
+  // monotonic counter used to discard results from stale in-flight refreshes
+  // when the caller swaps the job set out from under us. Bumped synchronously
+  // whenever jobIDsKey changes (via the latestJobIDsRef effect).
+  const generationRef = useRef(0);
+  // Always-fresh view of the caller's job set so refresh() never relies on
+  // its closure value (which would go stale across job swaps).
+  const latestJobIDsRef = useRef<string[]>(jobIDs);
+
+  // Stabilise the dependency for useEffect/useCallback regardless of array
+  // identity churn from the caller.
+  const jobIDsKey = useMemo(() => jobIDs.slice().sort().join('|'), [jobIDs]);
+
+  // Keep latestJobIDsRef + generation in sync with jobIDs synchronously on
+  // each render so refresh() always sees the current set.
+  if (latestJobIDsRef.current !== jobIDs) {
+    const prevKey = latestJobIDsRef.current.slice().sort().join('|');
+    if (prevKey !== jobIDsKey) generationRef.current += 1;
+    latestJobIDsRef.current = jobIDs;
+  }
+
+  const canonicalKeysByJob = useMemo(() => {
+    const out: Record<string, string[]> = {};
+    for (const [jid, raw] of Object.entries(rawKeysByJob)) {
+      const set = new Set<string>();
+      for (const k of raw) {
+        if (k.startsWith('_meta/')) continue;
+        if (k === 'learning_rate') continue;
+        set.add(canonicalizeKey(k));
+      }
+      out[jid] = Array.from(set).sort();
+    }
+    return out;
+  }, [rawKeysByJob]);
+
+  const unionCanonicalKeys = useMemo(() => {
+    const set = new Set<string>();
+    for (const arr of Object.values(canonicalKeysByJob)) {
+      for (const k of arr) set.add(k);
+    }
+    return Array.from(set).sort();
+  }, [canonicalKeysByJob]);
+
+  const intersectCanonicalKeys = useMemo(() => {
+    const arrays = Object.values(canonicalKeysByJob);
+    if (arrays.length === 0) return [];
+    let acc = new Set<string>(arrays[0]);
+    for (let i = 1; i < arrays.length; i++) {
+      const next = new Set<string>();
+      for (const k of arrays[i]) if (acc.has(k)) next.add(k);
+      acc = next;
+    }
+    return Array.from(acc).sort();
+  }, [canonicalKeysByJob]);
+
+  const refresh = useCallback(async () => {
+    const currentJobIDs = latestJobIDsRef.current;
+    if (currentJobIDs.length === 0) {
+      setSeriesByJob({});
+      setRawKeysByJob({});
+      setStatus('success');
+      didInitialLoadRef.current = true;
+      return;
+    }
+    // Skip if a refresh is already mid-flight for the same generation.
+    // Guarantees we don't pile dozens of parallel waves on top of each
+    // other when the polling interval is short relative to fetch latency
+    // (N keys × M jobs requests can saturate the browser connection pool).
+    if (inFlightRef.current) return;
+    inFlightRef.current = true;
+    const myGen = generationRef.current;
+    setStatus(didInitialLoadRef.current ? 'refreshing' : 'loading');
+
+    try {
+      // Phase 1: discover keys for each job (cheap call, limit=1).
+      const discovery = await Promise.all(
+        currentJobIDs.map(jid =>
+          apiClient
+            .get(`/api/jobs/${jid}/loss`, { params: { key: 'loss', limit: 1 } })
+            .then(res => ({ jid, keys: (res.data?.keys ?? []) as string[] }))
+            .catch(() => ({ jid, keys: [] as string[] })),
+        ),
+      );
+
+      // If our generation was bumped while Phase 1 was awaiting (the caller
+      // changed the job set), drop the result. The fresh refresh will run.
+      if (myGen !== generationRef.current) return;
+
+      const rawKeysNext: Record<string, string[]> = {};
+      for (const d of discovery) rawKeysNext[d.jid] = d.keys;
+      setRawKeysByJob(rawKeysNext);
+
+      // Phase 2: fetch every legacy key for each job in parallel.
+      const fetchTasks: Array<Promise<{ jid: string; key: string; points: LossPoint[] }>> = [];
+      for (const { jid, keys } of discovery) {
+        const keep = keys.filter(k => !k.startsWith('_meta/') && k !== 'learning_rate');
+        if (!lastStepByJobKeyRef.current[jid]) lastStepByJobKeyRef.current[jid] = {};
+        for (const k of keep) {
+          const params: Record<string, any> = { key: k };
+          const lastStep = lastStepByJobKeyRef.current[jid]?.[k];
+          if (reloadInterval && lastStep != null) params.since_step = lastStep;
+          params.limit = 1000000;
+          fetchTasks.push(
+            apiClient
+              .get(`/api/jobs/${jid}/loss`, { params })
+              .then(res => ({ jid, key: k, points: (res.data?.points ?? []) as LossPoint[] }))
+              .catch(() => ({ jid, key: k, points: [] as LossPoint[] })),
+          );
+        }
+      }
+
+      const fetched = await Promise.all(fetchTasks);
+
+      // Drop stale results if our generation was bumped during Phase 2.
+      if (myGen !== generationRef.current) return;
+
+      setSeriesByJob(prev => {
+        const next: Record<string, SeriesMap> = {};
+        // start from existing per-job maps so we keep historical points across
+        // incremental polls.
+        for (const jid of currentJobIDs) next[jid] = { ...(prev[jid] ?? {}) };
+
+        // group by (job, canonical key)
+        const grouped = new Map<string, LossPoint[]>();
+        for (const r of fetched) {
+          // Skip results for jobs no longer in the active set (defensive
+          // guard; the generation check above handles this in practice).
+          if (!(r.jid in next)) continue;
+          const canonical = canonicalizeKey(r.key);
+          const k = `${r.jid}::${canonical}`;
+          const list = grouped.get(k) ?? [];
+          for (const p of r.points) if (p.value !== null) list.push(p);
+          grouped.set(k, list);
+          if (r.points.length) {
+            const lastStep = r.points[r.points.length - 1].step;
+            if (!lastStepByJobKeyRef.current[r.jid]) lastStepByJobKeyRef.current[r.jid] = {};
+            const prevLast = lastStepByJobKeyRef.current[r.jid][r.key];
+            if (prevLast == null || lastStep > prevLast) {
+              lastStepByJobKeyRef.current[r.jid][r.key] = lastStep;
+            }
+          }
+        }
+
+        for (const [groupKey, pts] of grouped.entries()) {
+          const sep = groupKey.indexOf('::');
+          const jid = groupKey.slice(0, sep);
+          const canonical = groupKey.slice(sep + 2);
+          if (!next[jid]) continue;
+          const existing = next[jid][canonical] ?? [];
+          const stepMap = new Map<number, LossPoint>();
+          for (const p of existing) stepMap.set(p.step, p);
+          for (const p of pts) stepMap.set(p.step, p);
+          next[jid][canonical] = Array.from(stepMap.values()).sort((a, b) => a.step - b.step);
+        }
+
+        return next;
+      });
+
+      // garbage collect lastStepByJobKey entries for removed jobs
+      for (const jid of Object.keys(lastStepByJobKeyRef.current)) {
+        if (!currentJobIDs.includes(jid)) delete lastStepByJobKeyRef.current[jid];
+      }
+
+      setStatus('success');
+      didInitialLoadRef.current = true;
+    } catch (err) {
+      console.error('Error fetching multi-job metrics:', err);
+      // Only flag error if a fresher refresh hasn't already taken over.
+      if (myGen === generationRef.current) setStatus('error');
+    } finally {
+      inFlightRef.current = false;
+    }
+  }, [reloadInterval]);
+
+  useEffect(() => {
+    // Generation was already bumped synchronously during render (see the
+    // latestJobIDsRef sync above). Reset per-job state and kick off a fresh
+    // refresh. We also release the inFlight guard: any in-progress refresh
+    // is now stale (it'll discard its results via the gen check) and we
+    // want the new wave to start immediately, not wait on it.
+    inFlightRef.current = false;
+    didInitialLoadRef.current = false;
+    lastStepByJobKeyRef.current = {};
+    setSeriesByJob({});
+    setRawKeysByJob({});
+    setStatus('idle');
+
+    refresh();
+
+    if (reloadInterval) {
+      const interval = setInterval(refresh, reloadInterval);
+      return () => clearInterval(interval);
+    }
+  }, [jobIDsKey, reloadInterval, refresh]);
+
+  return {
+    seriesByJob,
+    canonicalKeysByJob,
+    unionCanonicalKeys,
+    intersectCanonicalKeys,
+    status,
+    refresh,
+  };
+}

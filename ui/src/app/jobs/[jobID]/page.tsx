@@ -12,9 +12,10 @@ import JobActionBar from '@/components/JobActionBar';
 import JobConfigViewer from '@/components/JobConfigViewer';
 import JobLossGraph from '@/components/JobLossGraph';
 import JobMetricsGraph from '@/components/JobMetricsGraph';
+import JobMetricsCompareGraph from '@/components/JobMetricsCompareGraph';
 import { Job } from '@prisma/client';
 
-type PageKey = 'overview' | 'samples' | 'config' | 'loss_log' | 'metrics_new';
+type PageKey = 'overview' | 'samples' | 'config' | 'loss_log' | 'metrics_new' | 'metrics_compare';
 
 interface Page {
   name: string;
@@ -51,6 +52,15 @@ const pages: Page[] = [
     name: 'Metrics (new)',
     value: 'metrics_new',
     component: JobMetricsGraph,
+    mainCss: 'pt-24',
+  },
+  {
+    // Cross-job comparison: pick a metric, fan it across N selected jobs.
+    // Anchored on the current job; additional jobs picked from the multi-
+    // select. Same fetch pipeline as Metrics (new), N-way parallel.
+    name: 'Compare Jobs',
+    value: 'metrics_compare',
+    component: JobMetricsCompareGraph,
     mainCss: 'pt-24',
   },
   {

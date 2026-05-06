@@ -71,7 +71,7 @@ flowchart TD
     style Perceptual fill:#faf5fc,stroke:#6a1b9a,stroke-dasharray:5 4,color:#4a148c
 ```
 
-The anchor path (lower half) is what this extension adds. Both the GT image and the LoRA's prediction go through the **same frozen perceptor**, and the loss is computed on its outputs (a depth map for DA2, a face embedding for ArcFace, a keypoint heatmap for ViTPose). Gradients flow back through the perceptor and VAE decoder, translating the perceptual loss into a **latent-space update** for the LoRA. The weights most strongly nudged are the ones whose latents most affected the property the perceptor measures (depth, identity, pose); others barely move. Loss splitting (described below) takes this further by running the diffusion-loss step and the anchor-loss step alternately rather than summing them every step.
+The anchor path (purple) is what this extension adds. Both the GT image and the LoRA's prediction go through the **same frozen perceptor**, and the loss is computed on its outputs (a depth map for DA2, a face embedding for ArcFace, a keypoint heatmap for ViTPose). Gradients flow back through the perceptor and VAE decoder, translating the perceptual loss into a **latent-space update** for the LoRA. The weights most strongly nudged are the ones whose latents most affected the property the perceptor measures (depth, identity, pose); others barely move. Loss splitting (described below) takes this further by running the diffusion-loss step and the anchor-loss step alternately rather than summing them every step.
 
 ### Depth-Consistency Anchor
 

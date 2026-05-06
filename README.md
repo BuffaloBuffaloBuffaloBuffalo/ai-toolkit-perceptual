@@ -1,20 +1,20 @@
-# AI Toolkit - Perceptual Anchoring Fork
+# Perceptual LoRA Toolkit
 
-A fork of [AI Toolkit by Ostris](https://github.com/ostris/ai-toolkit) that adds **perceptual anchoring** to LoRA training. The idea is straightforward: instead of training only on per-pixel match against your dataset, you also tell the LoRA to match specific properties of those images using pre-trained vision models. There's an anchor for depth (the geometric structure of a scene), one for facial identity, one for body proportions, and a face-suppression option for when you don't want faces baked in at all. The depth anchor is the most useful one in practice. It lets the LoRA pick up the shapes in your dataset without locking in the colors, textures, or lighting, so trained models stay sharper on small datasets and generalize better to new prompts.
+An extension of [AI Toolkit by Ostris](https://github.com/ostris/ai-toolkit) that adds **perceptual anchoring** to LoRA training. The idea is straightforward: instead of training only on per-pixel match against your dataset, you also tell the LoRA to match specific properties of those images using pre-trained vision models. There's an anchor for depth (the geometric structure of a scene), one for facial identity, one for body proportions, and a face-suppression option for when you don't want faces baked in at all. The depth anchor is the most useful one in practice. It lets the LoRA pick up the shapes in your dataset without locking in the colors, textures, or lighting, so trained models stay sharper on small datasets and generalize better to new prompts.
 
 **Supported models:** SDXL, FLUX.2 Klein 9B
 
 ## Contents
 
-- [Perceptual Anchoring](#perceptual-anchoring) — depth, identity, body, face suppression
-- [Auto-Masking](#auto-masking) — body / clothing / subject masks for region-weighted loss
-- [Reg Dataset Semantics](#reg-dataset-semantics) — how reg samples are treated in this fork
-- [Training Metrics](#training-metrics) — what gets logged each step
-- [Training Previews](#training-previews) — what each anchor saves to disk
-- [Dataset-Tools UI](#dataset-tools-ui) — preflight passes for masks, depth, faces
+- [Perceptual Anchoring](#perceptual-anchoring): depth, identity, body, face suppression
+- [Auto-Masking](#auto-masking): body / clothing / subject masks for region-weighted loss
+- [Reg Dataset Semantics](#reg-dataset-semantics): how reg samples are treated in this extension
+- [Training Metrics](#training-metrics): what gets logged each step
+- [Training Previews](#training-previews): what each anchor saves to disk
+- [Dataset-Tools UI](#dataset-tools-ui): preflight passes for masks, depth, faces
 - [Example: Handsome Squidward (single-image LoRA)](#example-handsome-squidward-single-image-lora)
 - [Example: Yoshitaka Amano Style (small-dataset style LoRA)](#example-yoshitaka-amano-style-small-dataset-style-lora)
-- [Configuration Reference](#configuration-reference) — every fork-specific config option
+- [Configuration Reference](#configuration-reference): every extension-specific config option
 - [Upstream: AI Toolkit by Ostris](#upstream-ai-toolkit-by-ostris)
 - [Installation](#installation)
 
@@ -23,6 +23,55 @@ A fork of [AI Toolkit by Ostris](https://github.com/ostris/ai-toolkit) that adds
 The standard LoRA training loss is per-pixel MSE in latent space. It tells the model "match this exact image." On small datasets that turns into a strong instruction to memorize, which is why you often see washed-out colors, baked-in lighting, and "burn-in" (stippling, JPEG ghosts) showing up in every generation.
 
 Perceptual anchors give the LoRA more targeted guidance. Each one is a frozen vision model that scores a single property of the generated image, like its depth or its facial identity, and the LoRA gets rewarded for matching the training images on that property alone. You pick which properties matter for what you're training.
+
+```mermaid
+flowchart TD
+    LegendNote["∇ = gradients flow back<br/>along this edge during backprop"]
+    GT([Training image])
+    LegendNote ~~~ GT
+    GT --> Encode[VAE encode]
+    Encode --> Z0[Clean latent z₀]
+    Z0 --> Noise[Add noise at step t]
+    Noise --> Zt[Noisy latent z_t]
+    Zt --> Model[/LoRA model/]
+    Model <-->|∇| Zhat[Predicted z₀']
+
+    Z0 -.-> Diff["Diffusion loss<br/>(MSE in latent space)"]
+    Zhat <-.->|∇| Diff
+
+    subgraph Perceptual["Perceptual anchor path (this extension)"]
+        Decode[VAE decode]
+        RGBp[Predicted RGB]
+        Pp["Frozen perceptor<br/>(DA2 / ArcFace / ViTPose)"]
+        Pg[Same frozen perceptor]
+        Anchor["Perceptual anchor loss<br/>(compares predicted vs. clean ground truth perceptor outputs,<br/>not pixels)"]
+    end
+
+    Zhat <-->|∇| Decode
+    Decode <-->|∇| RGBp
+    RGBp <-->|∇| Pp
+    GT --> Pg
+    Pp <-.->|∇| Anchor
+    Pg -.-> Anchor
+
+    Diff --> Total((Total loss))
+    Anchor --> Total
+
+    classDef frozen fill:#e8eaf6,stroke:#3949ab,color:#1a237e
+    classDef trainable fill:#fff8e1,stroke:#f57c00,color:#e65100
+    classDef loss fill:#e8f5e9,stroke:#2e7d32,color:#1b5e20
+    classDef anchor fill:#f3e5f5,stroke:#6a1b9a,color:#4a148c
+    classDef legendNode fill:#fafafa,stroke:#bbb,color:#555,stroke-dasharray:3 3
+
+    class Encode frozen
+    class Model trainable
+    class Diff,Total loss
+    class Decode,RGBp,Pp,Pg,Anchor anchor
+    class LegendNote legendNode
+    style Perceptual fill:#faf5fc,stroke:#6a1b9a,stroke-dasharray:5 4,color:#4a148c
+```
+
+The anchor path (purple) is what this extension adds. Both the GT image and the LoRA's prediction go through the **same frozen perceptor**, and the loss is computed on its outputs (a depth map for DA2, a face embedding for ArcFace, a keypoint heatmap for ViTPose). Gradients flow back through the perceptor and VAE decoder, translating the perceptual loss into a **latent-space update** for the LoRA. The weights most strongly nudged are the ones whose latents most affected the property the perceptor measures (depth, identity, pose); others barely move. Loss splitting (described below) takes this further by running the diffusion-loss step and the anchor-loss step alternately rather than summing them every step.
 
 ### Depth-Consistency Anchor
 
@@ -137,7 +186,7 @@ QC tiles for visual inspection are saved at job start and can be regenerated fro
 
 ## Reg Dataset Semantics
 
-Reg datasets (`is_reg: true`) work the classic Dreambooth way: they're prior-preservation samples that train the model on generic non-subject images alongside your subject samples, so it doesn't forget how to make non-subject content while it's learning the subject. In this fork, reg semantics are tightened up:
+Reg datasets (`is_reg: true`) work the classic Dreambooth way: they're prior-preservation samples that train the model on generic non-subject images alongside your subject samples, so it doesn't forget how to make non-subject content while it's learning the subject. In this extension, reg semantics are tightened up:
 
 - **All perceptual anchors are turned off on reg samples.** Only the diffusion loss fires, scaled by `train.reg_weight`.
 - **Subject conditioning is stripped.** No clip-image or trigger-word injection.
@@ -212,11 +261,11 @@ The caption: *"a cartoon illustration of handsome squidward. he is standing conf
 
 **Watching the depth anchor work.** Each preview tile shows (GT RGB | GT depth | Pred RGB | Pred depth) side by side. At the start of training the predicted depth is unstructured noise; by the end it tracks the GT depth closely.
 
-**Early (step 21)** — `depth_consistency_loss: 26.6`
+**Early (step 21)** `depth_consistency_loss: 26.6`
 
 ![Early preview](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/releases/download/examples-squidward-v1/preview_early.jpg)
 
-**Late (step 1199)** — `depth_consistency_loss: 1.6`
+**Late (step 1199)** `depth_consistency_loss: 1.6`
 
 ![Late preview](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/releases/download/examples-squidward-v1/preview_late.jpg)
 
@@ -240,7 +289,7 @@ Edit `model.name_or_path` in the config to point at your local Flux 2 Klein chec
 
 ## Example: Yoshitaka Amano Style (small-dataset style LoRA)
 
-A working example of depth-anchored fine-tuning on an **artist's style** rather than a specific subject, on a **small dataset** of 14 illustrations. Yoshitaka Amano is the illustrator behind the original Final Fantasy character art and a long-running body of solo watercolor portrait work. Flux 2 Klein 9B doesn't reproduce his look from a prompt alone — it defaults to generic anime or oil-paint stylings.
+A working example of depth-anchored fine-tuning on an **artist's style** rather than a specific subject, on a **small dataset** of 14 illustrations. Yoshitaka Amano is the illustrator behind the original Final Fantasy character art and a long-running body of solo watercolor portrait work. Flux 2 Klein 9B doesn't reproduce his look from a prompt alone; it defaults to generic anime or oil-paint stylings.
 
 **The reference style.** One illustration from the dataset is shown below to give a feel for what the LoRA is asked to learn: loose ink linework, watercolor washes, ornate costuming, hair drawn as long flowing tendrils.
 
@@ -262,11 +311,11 @@ A working example of depth-anchored fine-tuning on an **artist's style** rather 
 
 ![Ground truth](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/releases/download/examples-amano-v1/preview_gt.jpg)
 
-**Early prediction (step 383, t=0.82)** — `depth_consistency_loss: 17.17`
+**Early prediction (step 383, t=0.82)** `depth_consistency_loss: 17.17`
 
 ![Early prediction](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/releases/download/examples-amano-v1/preview_pred_early.jpg)
 
-**Late prediction (step 3941, t=0.81)** — `depth_consistency_loss: 6.67`
+**Late prediction (step 3941, t=0.81)** `depth_consistency_loss: 6.67`
 
 ![Late prediction](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/releases/download/examples-amano-v1/preview_pred_late.jpg)
 
@@ -276,11 +325,11 @@ A working example of depth-anchored fine-tuning on an **artist's style** rather 
 |:---:|:---:|:---:|
 | ![Cloud](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/releases/download/examples-amano-v1/output_cloud.png) | ![Snow White](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/releases/download/examples-amano-v1/output_snow.png) | ![Ziggy](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/releases/download/examples-amano-v1/output_ziggy.png) |
 
-**Why depth anchoring matters here.** With a style dataset this small, the diffusion loss alone tends to overfit on the specific compositions of the training images — every output starts looking like a slight variation on the same handful of poses and figures. The depth anchor pushes the LoRA toward what's invariant across the artist's work (linework, paper texture, color treatment) and away from what's incidental (this exact figure, in this exact pose, against this exact background). Loss splitting reinforces the separation: the diffusion-step focuses on appearance, the depth-step on structure, and they only really agree on the high-level "this looks like Amano" signal.
+**Why depth anchoring matters here.** With a style dataset this small, the diffusion loss alone tends to overfit on the specific compositions of the training images; every output starts looking like a slight variation on the same handful of poses and figures. The depth anchor pushes the LoRA toward what's invariant across the artist's work (linework, paper texture, color treatment) and away from what's incidental (this exact figure, in this exact pose, against this exact background). Loss splitting reinforces the separation: the diffusion-step focuses on appearance, the depth-step on structure, and they only really agree on the high-level "this looks like Amano" signal.
 
 ## Configuration Reference
 
-Every fork-specific config option, grouped by the YAML block it lives in. Defaults shown match what you get if you omit the option entirely.
+Every extension-specific config option, grouped by the YAML block it lives in. Defaults shown match what you get if you omit the option entirely.
 
 ### `depth_consistency.*`
 
@@ -355,7 +404,7 @@ Auto-masking pipeline.
 | `cache_resolution` | `256` | Cached mask resolution. Higher = sharper at training time, more disk. |
 | `yolo_ckpt`, `yolo_conf`, `sam_size`, `dtype`, `primary_only` | (defaults) | Detection / segmentation backend knobs. The defaults work for almost everyone. |
 
-### `train.*` (fork-specific additions)
+### `train.*` (extension-specific additions)
 
 | Option | Default | What it does, when to use it |
 |---|---|---|
@@ -366,7 +415,7 @@ Auto-masking pipeline.
 
 ### Per-dataset overrides (`datasets[].*`)
 
-Every entry in `datasets:` accepts these fork-specific overrides. `null` or omitted = inherit the global value.
+Every entry in `datasets:` accepts these extension-specific overrides. `null` or omitted = inherit the global value.
 
 | Option | What it does, when to use it |
 |---|---|
@@ -385,7 +434,7 @@ Every entry in `datasets:` accepts these fork-specific overrides. `null` or omit
 
 ## Upstream: AI Toolkit by Ostris
 
-This fork is based on [AI Toolkit](https://github.com/ostris/ai-toolkit), an all-in-one training suite for diffusion models on consumer hardware.
+This extension is based on [AI Toolkit](https://github.com/ostris/ai-toolkit), an all-in-one training suite for diffusion models on consumer hardware.
 
 ### Support the Original Author
 

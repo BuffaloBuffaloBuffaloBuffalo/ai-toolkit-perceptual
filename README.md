@@ -6,15 +6,15 @@ An extension of [AI Toolkit by Ostris](https://github.com/ostris/ai-toolkit) tha
 
 ## Contents
 
-- [Perceptual Anchoring](#perceptual-anchoring) — depth, identity, body, face suppression
-- [Auto-Masking](#auto-masking) — body / clothing / subject masks for region-weighted loss
-- [Reg Dataset Semantics](#reg-dataset-semantics) — how reg samples are treated in this extension
-- [Training Metrics](#training-metrics) — what gets logged each step
-- [Training Previews](#training-previews) — what each anchor saves to disk
-- [Dataset-Tools UI](#dataset-tools-ui) — preflight passes for masks, depth, faces
+- [Perceptual Anchoring](#perceptual-anchoring): depth, identity, body, face suppression
+- [Auto-Masking](#auto-masking): body / clothing / subject masks for region-weighted loss
+- [Reg Dataset Semantics](#reg-dataset-semantics): how reg samples are treated in this extension
+- [Training Metrics](#training-metrics): what gets logged each step
+- [Training Previews](#training-previews): what each anchor saves to disk
+- [Dataset-Tools UI](#dataset-tools-ui): preflight passes for masks, depth, faces
 - [Example: Handsome Squidward (single-image LoRA)](#example-handsome-squidward-single-image-lora)
 - [Example: Yoshitaka Amano Style (small-dataset style LoRA)](#example-yoshitaka-amano-style-small-dataset-style-lora)
-- [Configuration Reference](#configuration-reference) — every extension-specific config option
+- [Configuration Reference](#configuration-reference): every extension-specific config option
 - [Upstream: AI Toolkit by Ostris](#upstream-ai-toolkit-by-ostris)
 - [Installation](#installation)
 
@@ -55,19 +55,26 @@ flowchart TD
     Diff --> Total((Total loss))
     Anchor --> Total
 
+    subgraph LegendBox["Legend"]
+        L["∇ = gradients flow back<br/>along this edge during backprop"]
+    end
+
     classDef frozen fill:#e8eaf6,stroke:#3949ab,color:#1a237e
     classDef trainable fill:#fff8e1,stroke:#f57c00,color:#e65100
     classDef loss fill:#e8f5e9,stroke:#2e7d32,color:#1b5e20
     classDef anchor fill:#f3e5f5,stroke:#6a1b9a,color:#4a148c
+    classDef legendNode fill:#fafafa,stroke:#bbb,color:#555
 
     class Encode frozen
     class Model trainable
     class Diff,Total loss
     class Decode,RGBp,Pp,Pg,Anchor anchor
+    class L legendNode
     style Perceptual fill:#faf5fc,stroke:#6a1b9a,stroke-dasharray:5 4,color:#4a148c
+    style LegendBox fill:#fafafa,stroke:#bbb,color:#555
 ```
 
-The anchor path (lower half) is what this extension adds. Both the GT image and the LoRA's prediction go through the **same frozen perceptor**, and the loss is computed on its outputs — a depth map for DA2, a face embedding for ArcFace, a keypoint heatmap for ViTPose. Edges marked `∇` carry gradient back to the LoRA on the return trip, passing through the perceptor and VAE decoder by chain rule even though their weights never update. Loss splitting (described below) takes this further by running the diffusion-loss step and the anchor-loss step alternately rather than summing them every step.
+The anchor path (lower half) is what this extension adds. Both the GT image and the LoRA's prediction go through the **same frozen perceptor**, and the loss is computed on its outputs (a depth map for DA2, a face embedding for ArcFace, a keypoint heatmap for ViTPose). On the return trip, gradients flow back through the perceptor and VAE decoder even though their weights never update. Loss splitting (described below) takes this further by running the diffusion-loss step and the anchor-loss step alternately rather than summing them every step.
 
 ### Depth-Consistency Anchor
 
@@ -257,11 +264,11 @@ The caption: *"a cartoon illustration of handsome squidward. he is standing conf
 
 **Watching the depth anchor work.** Each preview tile shows (GT RGB | GT depth | Pred RGB | Pred depth) side by side. At the start of training the predicted depth is unstructured noise; by the end it tracks the GT depth closely.
 
-**Early (step 21)** — `depth_consistency_loss: 26.6`
+**Early (step 21)** `depth_consistency_loss: 26.6`
 
 ![Early preview](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/releases/download/examples-squidward-v1/preview_early.jpg)
 
-**Late (step 1199)** — `depth_consistency_loss: 1.6`
+**Late (step 1199)** `depth_consistency_loss: 1.6`
 
 ![Late preview](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/releases/download/examples-squidward-v1/preview_late.jpg)
 
@@ -285,7 +292,7 @@ Edit `model.name_or_path` in the config to point at your local Flux 2 Klein chec
 
 ## Example: Yoshitaka Amano Style (small-dataset style LoRA)
 
-A working example of depth-anchored fine-tuning on an **artist's style** rather than a specific subject, on a **small dataset** of 14 illustrations. Yoshitaka Amano is the illustrator behind the original Final Fantasy character art and a long-running body of solo watercolor portrait work. Flux 2 Klein 9B doesn't reproduce his look from a prompt alone — it defaults to generic anime or oil-paint stylings.
+A working example of depth-anchored fine-tuning on an **artist's style** rather than a specific subject, on a **small dataset** of 14 illustrations. Yoshitaka Amano is the illustrator behind the original Final Fantasy character art and a long-running body of solo watercolor portrait work. Flux 2 Klein 9B doesn't reproduce his look from a prompt alone; it defaults to generic anime or oil-paint stylings.
 
 **The reference style.** One illustration from the dataset is shown below to give a feel for what the LoRA is asked to learn: loose ink linework, watercolor washes, ornate costuming, hair drawn as long flowing tendrils.
 
@@ -307,11 +314,11 @@ A working example of depth-anchored fine-tuning on an **artist's style** rather 
 
 ![Ground truth](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/releases/download/examples-amano-v1/preview_gt.jpg)
 
-**Early prediction (step 383, t=0.82)** — `depth_consistency_loss: 17.17`
+**Early prediction (step 383, t=0.82)** `depth_consistency_loss: 17.17`
 
 ![Early prediction](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/releases/download/examples-amano-v1/preview_pred_early.jpg)
 
-**Late prediction (step 3941, t=0.81)** — `depth_consistency_loss: 6.67`
+**Late prediction (step 3941, t=0.81)** `depth_consistency_loss: 6.67`
 
 ![Late prediction](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/releases/download/examples-amano-v1/preview_pred_late.jpg)
 
@@ -321,7 +328,7 @@ A working example of depth-anchored fine-tuning on an **artist's style** rather 
 |:---:|:---:|:---:|
 | ![Cloud](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/releases/download/examples-amano-v1/output_cloud.png) | ![Snow White](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/releases/download/examples-amano-v1/output_snow.png) | ![Ziggy](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/releases/download/examples-amano-v1/output_ziggy.png) |
 
-**Why depth anchoring matters here.** With a style dataset this small, the diffusion loss alone tends to overfit on the specific compositions of the training images — every output starts looking like a slight variation on the same handful of poses and figures. The depth anchor pushes the LoRA toward what's invariant across the artist's work (linework, paper texture, color treatment) and away from what's incidental (this exact figure, in this exact pose, against this exact background). Loss splitting reinforces the separation: the diffusion-step focuses on appearance, the depth-step on structure, and they only really agree on the high-level "this looks like Amano" signal.
+**Why depth anchoring matters here.** With a style dataset this small, the diffusion loss alone tends to overfit on the specific compositions of the training images; every output starts looking like a slight variation on the same handful of poses and figures. The depth anchor pushes the LoRA toward what's invariant across the artist's work (linework, paper texture, color treatment) and away from what's incidental (this exact figure, in this exact pose, against this exact background). Loss splitting reinforces the separation: the diffusion-step focuses on appearance, the depth-step on structure, and they only really agree on the high-level "this looks like Amano" signal.
 
 ## Configuration Reference
 

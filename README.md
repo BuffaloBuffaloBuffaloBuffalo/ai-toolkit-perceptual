@@ -24,8 +24,6 @@ The standard LoRA training loss is per-pixel MSE in latent space. It tells the m
 
 Perceptual anchors give the LoRA more targeted guidance. Each one is a frozen vision model that scores a single property of the generated image, like its depth or its facial identity, and the LoRA gets rewarded for matching the training images on that property alone. You pick which properties matter for what you're training.
 
-**Forward pass.**
-
 ```mermaid
 flowchart TD
     GT([Training image])
@@ -34,10 +32,10 @@ flowchart TD
     Z0 --> Noise[Add noise at step t]
     Noise --> Zt[Noisy latent z_t]
     Zt --> Model[/LoRA model/]
-    Model --> Zhat[Predicted z₀']
+    Model <-->|∇| Zhat[Predicted z₀']
 
     Z0 -.-> Diff["Diffusion loss<br/>(MSE in latent space)"]
-    Zhat -.-> Diff
+    Zhat <-.->|∇| Diff
 
     subgraph Perceptual["Perceptual anchor path (this extension)"]
         Decode[VAE decode]
@@ -47,11 +45,11 @@ flowchart TD
         Anchor["Perceptual anchor loss<br/>(compares predicted vs. clean ground truth perceptor outputs,<br/>not pixels)"]
     end
 
-    Zhat --> Decode
-    Decode --> RGBp
-    RGBp --> Pp
+    Zhat <-->|∇| Decode
+    Decode <-->|∇| RGBp
+    RGBp <-->|∇| Pp
     GT --> Pg
-    Pp -.-> Anchor
+    Pp <-.->|∇| Anchor
     Pg -.-> Anchor
 
     Diff --> Total((Total loss))
@@ -69,27 +67,7 @@ flowchart TD
     style Perceptual fill:#faf5fc,stroke:#6a1b9a,stroke-dasharray:5 4,color:#4a148c
 ```
 
-The anchor path (lower half) is what this extension adds. Both the GT image and the LoRA's prediction go through the **same frozen perceptor**, and the loss is computed on its outputs — a depth map for DA2, a face embedding for ArcFace, a keypoint heatmap for ViTPose.
-
-**Backward pass.** The gradient from the anchor loss does not jump straight to the LoRA. The frozen perceptor and VAE decoder are still differentiable, so the gradient passes back through them by chain rule:
-
-```mermaid
-flowchart LR
-    Total((Total loss)) --> Anchor["Perceptual<br/>anchor loss"]
-    Anchor -->|"chain rule"| Pp["Frozen<br/>perceptor"]
-    Pp --> RGBp["Predicted<br/>RGB"]
-    RGBp -->|"chain rule"| Decode["VAE<br/>decode"]
-    Decode --> Zhat["Predicted z₀'"]
-    Zhat -->|"only LoRA<br/>params update"| Model[/"LoRA<br/>model"/]
-
-    classDef grad fill:#ffebee,stroke:#c62828,color:#c62828
-    classDef trainable fill:#fff8e1,stroke:#f57c00,color:#e65100
-    class Total,Anchor,Pp,RGBp,Decode,Zhat grad
-    class Model trainable
-    linkStyle 0,1,2,3,4,5 stroke:#c62828,stroke-width:2.5px,color:#c62828
-```
-
-Their weights never change, but they shape the gradient with whatever pretrained visual understanding they encode — depth-awareness for DA2, identity for ArcFace, body keypoints for ViTPose. The LoRA is the only thing whose parameters actually update, but what it ends up learning is **gradient signal that has been pre-shaped by a vision model that already understands the property you care about**. That's where the structural awareness in the trained LoRA comes from. Loss splitting (described below) takes this one step further by running the diffusion-loss step and the anchor-loss step alternately rather than summing them every step.
+The anchor path (lower half) is what this extension adds. Both the GT image and the LoRA's prediction go through the **same frozen perceptor**, and the loss is computed on its outputs — a depth map for DA2, a face embedding for ArcFace, a keypoint heatmap for ViTPose. Edges marked `∇` carry gradient back to the LoRA on the return trip, passing through the perceptor and VAE decoder by chain rule even though their weights never update. Loss splitting (described below) takes this further by running the diffusion-loss step and the anchor-loss step alternately rather than summing them every step.
 
 ### Depth-Consistency Anchor
 

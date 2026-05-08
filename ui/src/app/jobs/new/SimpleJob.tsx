@@ -1811,13 +1811,7 @@ export default function SimpleJob({
                       </FormGroup>
                     </div>
                   </div>
-                  {/* Per-dataset perceptual anchoring overrides — show when multiple datasets or any identity/body/subject-mask feature enabled */}
-                  {(jobConfig.config.process[0].datasets.length > 1 ||
-                    jobConfig.config.process[0].face_id?.enabled ||
-                    jobConfig.config.process[0].subject_mask?.enabled ||
-                    (jobConfig.config.process[0].face_id?.identity_loss_weight ?? 0) > 0 ||
-                    (jobConfig.config.process[0].face_id?.body_proportion_loss_weight ?? 0) > 0) && (
-                    <details className="mt-3">
+                  <details className="mt-3">
                       <summary className="cursor-pointer text-sm text-gray-400 hover:text-gray-200">
                         Per-Dataset Perceptual Anchoring Overrides
                       </summary>
@@ -1930,8 +1924,7 @@ export default function SimpleJob({
                         </div>
                         */}
                       </div>
-                    </details>
-                  )}
+                  </details>
                 </div>
               ))}
               <button

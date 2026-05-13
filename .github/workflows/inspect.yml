@@ -1,0 +1,47 @@
+# Temporary verification workflow — pulls the just-built image
+# and inspects /app/ai-toolkit/ to confirm what code it contains.
+---
+name: Inspect Built Image
+
+on:
+  push:
+    branches:
+      - ci-verify
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull image
+        run: |
+          IMAGE=ghcr.io/$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]'):ci-verify
+          echo "IMAGE=${IMAGE}" >> "$GITHUB_ENV"
+          docker pull "${IMAGE}"
+
+      - name: Inspect /app/ai-toolkit/
+        run: |
+          set -x
+          echo "=== git remote ==="
+          docker run --rm "${IMAGE}" bash -c "cd /app/ai-toolkit && git remote -v"
+          echo "=== git log -1 ==="
+          docker run --rm "${IMAGE}" bash -c "cd /app/ai-toolkit && git log -1 --oneline"
+          echo "=== git rev-parse HEAD ==="
+          docker run --rm "${IMAGE}" bash -c "cd /app/ai-toolkit && git rev-parse HEAD"
+          echo "=== look for perceptual / fork-only files ==="
+          docker run --rm "${IMAGE}" bash -c "ls /app/ai-toolkit/toolkit/ | grep -iE 'perceptual|depth_id|normal_id' || echo 'NONE FOUND'"
+          echo "=== check for the fork-only example config ==="
+          docker run --rm "${IMAGE}" bash -c "ls /app/ai-toolkit/config/examples/ | grep -i flux2_klein || echo 'NONE FOUND'"
+          echo "=== HEAD of README in image ==="
+          docker run --rm "${IMAGE}" bash -c "head -20 /app/ai-toolkit/README.md"
+          echo "=== sha of requirements.txt in image vs in upstream ==="
+          docker run --rm "${IMAGE}" sha256sum /app/ai-toolkit/requirements.txt

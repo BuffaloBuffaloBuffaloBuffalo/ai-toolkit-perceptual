@@ -64,9 +64,11 @@ COPY ui/package-lock.json /app/ai-toolkit/ui/
 WORKDIR /app/ai-toolkit/ui
 RUN npm install
 
-# Now copy the full source tree (fork code) and build the UI
+# Now copy the full source tree (fork code) and build the UI.
+# update_db runs `prisma generate` to produce @prisma/client types — must run
+# before `next build` / `tsc` which depend on those types.
 COPY . /app/ai-toolkit/
-RUN npm run build && npm run update_db
+RUN npm run update_db && npm run build
 
 # Expose port (assuming the application runs on port 3000)
 EXPOSE 8675

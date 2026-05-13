@@ -360,6 +360,8 @@ Full config is at [`examples/squidward/config.yaml`](examples/squidward/config.y
 - Depth anchor: weight `0.005`, DA2-Large at `input_size: 1400`, `mask_source: none`.
 - Loss splitting on the dataset (`loss_split: diffusion_depth`).
 
+These settings were tuned for the single-image case and likely won't transfer to multi-image training as-is. We're still researching optimal settings for multi-image runs (depth weight, `input_size`, `mask_source`, and loss-split behavior all interact differently once the dataset has variety to draw on).
+
 Each preview tile shows (GT RGB | GT depth | Pred RGB | Pred depth) side by side. At the start of training the predicted depth is unstructured noise; by the end it tracks the GT depth closely.
 
 Early (step 21), `depth_consistency_loss: 26.6`:

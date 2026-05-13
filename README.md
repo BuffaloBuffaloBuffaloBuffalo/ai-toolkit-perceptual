@@ -12,9 +12,10 @@ An extension of [AI Toolkit by Ostris](https://github.com/ostris/ai-toolkit) tha
 - [Training Metrics](#training-metrics): what gets logged each step
 - [Training Previews](#training-previews): what each anchor saves to disk
 - [Dataset-Tools UI](#dataset-tools-ui): preflight passes for masks, depth, faces
-- [Example: Sketchwave Style (single-image style LoRA)](#example-sketchwave-style-single-image-style-lora)
-- [Example: Yoshitaka Amano Style (small-dataset style LoRA)](#example-yoshitaka-amano-style-small-dataset-style-lora)
-- [Example: Handsome Squidward (single-image LoRA)](#example-handsome-squidward-single-image-lora)
+- [Examples](#examples)
+  - [Sketchwave Style (single-image style LoRA)](#example-sketchwave-style-single-image-style-lora)
+  - [Yoshitaka Amano Style (small-dataset style LoRA)](#example-yoshitaka-amano-style-small-dataset-style-lora)
+  - [Handsome Squidward (single-image LoRA)](#example-handsome-squidward-single-image-lora)
 - [Configuration Reference](#configuration-reference): every extension-specific config option
 - [Upstream: AI Toolkit by Ostris](#upstream-ai-toolkit-by-ostris)
 - [Installation](#installation)
@@ -244,7 +245,11 @@ All three run as non-blocking background jobs. Start them and come back when the
 
 The `scripts/sample_dataset.py` utility builds a smaller dataset directory by sampling N random images (with their captions) from a larger source. Useful for building reg sets, running ablations, or making smoke-test datasets without copying everything.
 
-## Example: Sketchwave Style (single-image style LoRA)
+## Examples
+
+> **Note on inference target.** All example configs in this README and under `config/examples/` are tuned for inference against the **distilled** model (Flux 2 Klein). If you plan to apply the trained LoRAs against the **base (non-distilled)** model instead, checkpoints in the **500–800 step range** are usually closer to optimal than the **1000–1200 step range** the configs save out.
+
+### Example: Sketchwave Style (single-image style LoRA)
 
 Training a style LoRA from a single image. One training image, one caption, and the LoRA picks up an entire visual vocabulary.
 
@@ -289,7 +294,7 @@ python run.py examples/sketchwave/config.yaml
 
 Edit `model.name_or_path` in the config to point at your local Flux 2 Klein checkpoint first.
 
-## Example: Yoshitaka Amano Style (small-dataset style LoRA)
+### Example: Yoshitaka Amano Style (small-dataset style LoRA)
 
 Training a style LoRA from a small dataset of 14 illustrations. With depth anchoring the LoRA learns enough of the artist's visual language to carry it onto subjects nowhere in the dataset.
 
@@ -331,7 +336,7 @@ None of these subjects appear in the training set. The LoRA carries Amano's line
 
 With a style dataset this small, the diffusion loss alone tends to overfit on the specific compositions of the training images; every output starts looking like a slight variation on the same handful of poses and figures. The depth anchor pushes the LoRA toward what's invariant across the artist's work (linework, paper texture, color treatment) and away from what's incidental (this exact figure, in this exact pose, against this exact background). Loss splitting reinforces the separation: the diffusion-step focuses on appearance, the depth-step on structure, and they only really agree on the high-level "this looks like Amano" signal.
 
-## Example: Handsome Squidward (single-image LoRA)
+### Example: Handsome Squidward (single-image LoRA)
 
 Training a subject LoRA from a single image. One illustration, one caption, and the LoRA learns a character the base model can't reliably reproduce.
 

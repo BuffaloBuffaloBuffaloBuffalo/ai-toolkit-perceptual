@@ -4,6 +4,9 @@ name: Build and Push Container Image
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - ci-verify
 
 env:
   REGISTRY: ghcr.io

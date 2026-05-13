@@ -1,0 +1,16 @@
+.git
+.github
+__pycache__
+*.pyc
+.venv
+venv
+.env
+.idea
+.vscode
+node_modules
+ui/node_modules
+ui/.next
+output
+output_*
+samples
+.DS_Store

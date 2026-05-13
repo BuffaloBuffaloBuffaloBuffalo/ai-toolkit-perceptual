@@ -51,28 +51,22 @@ RUN ln -s /usr/bin/python3 /usr/bin/python
 # install pytorch before cache bust to avoid redownloading pytorch
 RUN pip install --no-cache-dir torch==2.9.1 torchvision==0.24.1 torchaudio==2.9.1 --index-url https://download.pytorch.org/whl/cu128 --break-system-packages
 
-# Fix cache busting by moving CACHEBUST to right before git clone
-ARG CACHEBUST=1234
-ARG GIT_COMMIT=main
-RUN echo "Cache bust: ${CACHEBUST}" && \
-    git clone https://github.com/ostris/ai-toolkit.git && \
-    cd ai-toolkit && \
-    git checkout ${GIT_COMMIT}
-
 WORKDIR /app/ai-toolkit
 
-# copy requirements.txt to leverage docker cache
+# Install Python deps first so source changes don't bust the pip cache layer
 COPY requirements.txt /app/ai-toolkit/requirements.txt
-
-# Install Python dependencies
 RUN pip install --no-cache-dir --break-system-packages -r requirements.txt && \
     pip install setuptools==69.5.1 --no-cache-dir --break-system-packages
 
-# Build UI
+# Install Node deps (still cache-friendly if package files don't change)
+COPY ui/package.json /app/ai-toolkit/ui/
+COPY ui/package-lock.json /app/ai-toolkit/ui/
 WORKDIR /app/ai-toolkit/ui
-RUN npm install && \
-    npm run build && \
-    npm run update_db
+RUN npm install
+
+# Now copy the full source tree (fork code) and build the UI
+COPY . /app/ai-toolkit/
+RUN npm run build && npm run update_db
 
 # Expose port (assuming the application runs on port 3000)
 EXPOSE 8675

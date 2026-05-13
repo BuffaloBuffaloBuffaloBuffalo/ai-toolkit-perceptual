@@ -78,4 +78,37 @@ jobs:
           subject-digest: ${{ steps.build.outputs.digest }}
           push-to-registry: true
 
+      - name: Expose tag for downstream jobs
+        id: out
+        run: echo "tag=${{ steps.tags.outputs.tags }}" >> "$GITHUB_OUTPUT"
+    outputs:
+      tags: ${{ steps.tags.outputs.tags }}
+
+  inspect:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Pull image
+        run: |
+          IMAGE=$(echo "${{ needs.build-and-push.outputs.tags }}" | cut -d',' -f1)
+          echo "IMAGE=${IMAGE}" >> "$GITHUB_ENV"
+          docker pull "${IMAGE}"
+      - name: Inspect /app/ai-toolkit/
+        run: |
+          set -x
+          docker run --rm "${IMAGE}" bash -c "cd /app/ai-toolkit && git remote -v 2>/dev/null || echo '(no .git in image)'"
+          docker run --rm "${IMAGE}" bash -c "cd /app/ai-toolkit && git log -1 --oneline 2>/dev/null || echo '(no .git in image)'"
+          docker run --rm "${IMAGE}" bash -c "ls /app/ai-toolkit/toolkit/ | grep -iE 'perceptual|depth_id|normal_id' || echo 'NONE FOUND'"
+          docker run --rm "${IMAGE}" bash -c "ls /app/ai-toolkit/config/examples/ | grep -i flux2_klein || echo 'NONE FOUND'"
+          docker run --rm "${IMAGE}" head -5 /app/ai-toolkit/README.md
+          docker run --rm "${IMAGE}" sha256sum /app/ai-toolkit/requirements.txt
 # EOF .github/workflows/build.yml

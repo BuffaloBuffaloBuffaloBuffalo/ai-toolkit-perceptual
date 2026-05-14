@@ -8,6 +8,7 @@ import {
 } from '@/hooks/useJobLossLog';
 import useJobsList from '@/hooks/useJobsList';
 import { useEffect, useMemo, useState } from 'react';
+import useLocalStorageState from '@/hooks/useLocalStorageState';
 import {
   ResponsiveContainer,
   LineChart,
@@ -117,14 +118,15 @@ function pickDefaultMetric(candidates: string[]): string | null {
 export default function JobMetricsCompareGraph({ job }: Props) {
   const { jobs: allJobs, status: jobsStatus } = useJobsList(false, 30000);
 
-  // Selected job IDs. Anchor (props `job`) always at index 0; user can
-  // toggle additional jobs from the picker.
-  const [selectedJobIDs, setSelectedJobIDs] = useState<string[]>([job.id]);
+  // Per-job prefs persist in localStorage. Anchor job (`job`) is always at
+  // index 0 of `selectedJobIDs`; user-toggled additions are after it.
+  const lsKey = (suffix: string) => `aitk:metricsCompare:${job.id}:${suffix}`;
+  const [selectedJobIDs, setSelectedJobIDs] = useLocalStorageState<string[]>(lsKey('selectedJobIDs'), [job.id]);
 
   // Reset when anchor changes (e.g. user navigates to a different job).
   useEffect(() => {
-    setSelectedJobIDs([job.id]);
-  }, [job.id]);
+    setSelectedJobIDs(prev => (prev[0] === job.id ? prev : [job.id]));
+  }, [job.id, setSelectedJobIDs]);
 
   // 8s reload interval is intentional: an N-job, M-key fetch can issue
   // hundreds of requests per refresh, and the browser's per-origin
@@ -134,17 +136,17 @@ export default function JobMetricsCompareGraph({ job }: Props) {
 
   // Subsystem filter: lets the user narrow the metric dropdown when many
   // canonical keys are present. Defaults to "all".
-  const [subsystem, setSubsystem] = useState<string>('all');
-  const [keyMode, setKeyMode] = useState<'union' | 'intersect'>('intersect');
-  const [metric, setMetric] = useState<string | null>(null);
+  const [subsystem, setSubsystem] = useLocalStorageState<string>(lsKey('subsystem'), 'all');
+  const [keyMode, setKeyMode] = useLocalStorageState<'union' | 'intersect'>(lsKey('keyMode'), 'intersect');
+  const [metric, setMetric] = useLocalStorageState<string | null>(lsKey('metric'), null);
 
   // Smoothing / display controls (mirrors the single-job graph).
-  const [useLogScale, setUseLogScale] = useState(false);
-  const [showRaw, setShowRaw] = useState(false);
-  const [showSmoothed, setShowSmoothed] = useState(true);
-  const [smoothing, setSmoothing] = useState(0);
-  const [plotStride, setPlotStride] = useState(1);
-  const [windowSize, setWindowSize] = useState<number>(0);
+  const [useLogScale, setUseLogScale] = useLocalStorageState(lsKey('useLogScale'), false);
+  const [showRaw, setShowRaw] = useLocalStorageState(lsKey('showRaw'), false);
+  const [showSmoothed, setShowSmoothed] = useLocalStorageState(lsKey('showSmoothed'), true);
+  const [smoothing, setSmoothing] = useLocalStorageState(lsKey('smoothing'), 0);
+  const [plotStride, setPlotStride] = useLocalStorageState(lsKey('plotStride'), 1);
+  const [windowSize, setWindowSize] = useLocalStorageState<number>(lsKey('windowSize'), 0);
 
   const subsystems = useMemo(() => {
     const set = new Set<string>();

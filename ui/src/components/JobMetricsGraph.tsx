@@ -8,6 +8,7 @@ import {
   subsystemOf,
 } from '@/hooks/useJobLossLog';
 import { useMemo, useState, useEffect } from 'react';
+import useLocalStorageState from '@/hooks/useLocalStorageState';
 import {
   ResponsiveContainer,
   LineChart,
@@ -20,10 +21,8 @@ import {
 } from 'recharts';
 
 // =====================================================================
-// New "Metrics" tab — parallel to the legacy `JobLossGraph` and
-// designed to surface the canonical `subsystem/kind/variant` namespace
-// introduced in step 4. Keeps feature parity with the old graph for
-// smoothing / log-Y / stride / window, and adds:
+// "Metrics" tab — surfaces the canonical `subsystem/kind/variant`
+// namespace. Supports smoothing / log-Y / stride / window plus:
 //   - View dropdown that filters by subsystem (Identity, Body shape, ...)
 //   - Facet dropdown: none | by t-band | by sample
 //   - Custom tooltip rendering the per-sample breakdown when present.
@@ -190,21 +189,24 @@ function pivotBySample(points: LossPoint[]): PivotedSample[] {
 export default function JobMetricsGraph({ job }: Props) {
   const { series, canonicalKeys, status, refresh } = useJobMetricsLog(job.id, 2000);
 
-  const [view, setView] = useState<ViewKey>('overview');
-  const [facet, setFacet] = useState<FacetKey>('none');
-  const [useLogScale, setUseLogScale] = useState(false);
-  const [showRaw, setShowRaw] = useState(false);
-  const [showSmoothed, setShowSmoothed] = useState(true);
-  const [showTrend, setShowTrend] = useState(true);
-  const [smoothing, setSmoothing] = useState(0);
-  const [plotStride, setPlotStride] = useState(1);
-  const [windowSize, setWindowSize] = useState<number>(0);
-  const [enabled, setEnabled] = useState<Record<string, boolean>>({});
+  // All chart prefs persist per-job in localStorage so a refresh / tab switch
+  // restores the same view (selected series, zoom, smoothing, etc.).
+  const lsKey = (suffix: string) => `aitk:metrics:${job.id}:${suffix}`;
+  const [view, setView] = useLocalStorageState<ViewKey>(lsKey('view'), 'overview');
+  const [facet, setFacet] = useLocalStorageState<FacetKey>(lsKey('facet'), 'none');
+  const [useLogScale, setUseLogScale] = useLocalStorageState(lsKey('useLogScale'), false);
+  const [showRaw, setShowRaw] = useLocalStorageState(lsKey('showRaw'), false);
+  const [showSmoothed, setShowSmoothed] = useLocalStorageState(lsKey('showSmoothed'), true);
+  const [showTrend, setShowTrend] = useLocalStorageState(lsKey('showTrend'), true);
+  const [smoothing, setSmoothing] = useLocalStorageState(lsKey('smoothing'), 0);
+  const [plotStride, setPlotStride] = useLocalStorageState(lsKey('plotStride'), 1);
+  const [windowSize, setWindowSize] = useLocalStorageState<number>(lsKey('windowSize'), 0);
+  const [enabled, setEnabled] = useLocalStorageState<Record<string, boolean>>(lsKey('enabled'), {});
 
   // by_sample-facet-only state: which metric to fan into per-sample series,
   // and whether to show all sample series or just the top-N most-frequent.
-  const [bySampleMetric, setBySampleMetric] = useState<string | null>(null);
-  const [bySampleShowAll, setBySampleShowAll] = useState(false);
+  const [bySampleMetric, setBySampleMetric] = useLocalStorageState<string | null>(lsKey('bySampleMetric'), null);
+  const [bySampleShowAll, setBySampleShowAll] = useLocalStorageState(lsKey('bySampleShowAll'), false);
 
   // Group keys by subsystem for the view filter.
   const subsystems = useMemo(() => {

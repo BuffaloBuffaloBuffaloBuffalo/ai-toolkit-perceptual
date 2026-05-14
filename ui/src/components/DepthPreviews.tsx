@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import useDepthPreviews, { DepthPreview } from '@/hooks/useDepthPreviews';
+import useLocalStorageState from '@/hooks/useLocalStorageState';
 import SampleImageCard from './SampleImageCard';
 import { Job } from '@prisma/client';
 import { LuImageOff, LuLoader, LuBan, LuX } from 'react-icons/lu';
@@ -21,11 +22,6 @@ function bandFor(t: number): Band {
   return `t${lo.toString().padStart(2, '0')}` as Band;
 }
 
-// URL persistence: we don't go through next/router because filter state churns
-// on every keystroke and a full router.replace per change is overkill. Instead
-// we read the URL once on mount (so refresh + tab-return both restore state)
-// and write back with `replaceState` on change. Keys are namespaced with `dp_`
-// so other tabs can carve their own without collisions.
 function basename(p: string): string {
   const i = p.lastIndexOf('/');
   return i >= 0 ? p.slice(i + 1) : p;
@@ -36,41 +32,6 @@ function clamp01(v: number): number {
 }
 function sizeKey(s?: { w: number; h: number }): string | null {
   return s ? `${s.w}x${s.h}` : null;
-}
-function readInitialFromUrl() {
-  if (typeof window === 'undefined') {
-    return { minStep: '', maxStep: '', minT: 0, maxT: 1, band: 'all' as Band, sample: 'all', size: 'all', sortKey: 'step' as SortKey, sortDir: 'desc' as SortDir, selectedFile: null as string | null };
-  }
-  const p = new URLSearchParams(window.location.search);
-  const band = p.get('dp_band');
-  const sortKey = p.get('dp_sortKey');
-  const sortDir = p.get('dp_sortDir');
-  const minTRaw = p.get('dp_minT');
-  const maxTRaw = p.get('dp_maxT');
-  return {
-    minStep: p.get('dp_minStep') ?? '',
-    maxStep: p.get('dp_maxStep') ?? '',
-    minT: minTRaw == null ? 0 : clamp01(parseFloat(minTRaw)),
-    maxT: maxTRaw == null ? 1 : clamp01(parseFloat(maxTRaw)),
-    band: (band && BAND_SET.has(band as Band) ? band : 'all') as Band,
-    sample: p.get('dp_sample') ?? 'all',
-    size: p.get('dp_size') ?? 'all',
-    sortKey: (sortKey && SORT_KEYS.has(sortKey as SortKey) ? sortKey : 'step') as SortKey,
-    sortDir: (sortDir === 'asc' ? 'asc' : 'desc') as SortDir,
-    selectedFile: p.get('dp_selected'),
-  };
-}
-function writeUrl(updates: Record<string, string | number | null | undefined>) {
-  if (typeof window === 'undefined') return;
-  const params = new URLSearchParams(window.location.search);
-  for (const [k, raw] of Object.entries(updates)) {
-    const v = raw == null ? '' : String(raw);
-    if (v === '') params.delete(k);
-    else params.set(k, v);
-  }
-  const q = params.toString();
-  const url = `${window.location.pathname}${q ? `?${q}` : ''}${window.location.hash}`;
-  window.history.replaceState(window.history.state, '', url);
 }
 
 interface Props {
@@ -91,71 +52,93 @@ export default function DepthPreviews({ job }: Props) {
     return { lo, hi };
   }, [previews]);
 
-  // Filter / sort state. Empty strings on the step inputs mean "no constraint"
-  // — keeps the controls usable before previews finish loading. Initial values
-  // come from the URL (`dp_*` keys), so a refresh / tab-switch / shared link
-  // all land on the same view; setters mirror back to the URL.
-  const initial = useMemo(readInitialFromUrl, []);
-  const [minStep, _setMinStep] = useState<string>(initial.minStep);
-  const setMinStep = (v: string) => { _setMinStep(v); writeUrl({ dp_minStep: v }); };
-  const [maxStep, _setMaxStep] = useState<string>(initial.maxStep);
-  const setMaxStep = (v: string) => { _setMaxStep(v); writeUrl({ dp_maxStep: v }); };
-  const [minT, _setMinT] = useState<number>(initial.minT);
-  const setMinT = (v: number) => { const c = clamp01(v); _setMinT(c); writeUrl({ dp_minT: c === 0 ? null : c.toFixed(2) }); };
-  const [maxT, _setMaxT] = useState<number>(initial.maxT);
-  const setMaxT = (v: number) => { const c = clamp01(v); _setMaxT(c); writeUrl({ dp_maxT: c === 1 ? null : c.toFixed(2) }); };
-  const [band, _setBand] = useState<Band>(initial.band);
-  const setBand = (v: Band) => { _setBand(v); writeUrl({ dp_band: v === 'all' ? null : v }); };
-  const [sample, _setSample] = useState<string>(initial.sample);
-  const setSample = (v: string) => { _setSample(v); writeUrl({ dp_sample: v === 'all' ? null : v }); };
-  const [size, _setSize] = useState<string>(initial.size);
-  const setSize = (v: string) => { _setSize(v); writeUrl({ dp_size: v === 'all' ? null : v }); };
-  const [sortKey, _setSortKey] = useState<SortKey>(initial.sortKey);
-  const setSortKey = (v: SortKey) => { _setSortKey(v); writeUrl({ dp_sortKey: v === 'step' ? null : v }); };
-  const [sortDir, _setSortDir] = useState<SortDir>(initial.sortDir);
-  const setSortDir = (v: SortDir) => { _setSortDir(v); writeUrl({ dp_sortDir: v === 'desc' ? null : v }); };
-  // Path of the preview currently zoomed in the overlay; null = closed.
-  const [selectedPath, _setSelectedPath] = useState<string | null>(null);
+  // Filter / sort state. Persisted per-job in localStorage so a refresh,
+  // tab-switch-and-return, or browser-restart all land on the last view the
+  // user had for this job. Empty strings on the step inputs mean "no
+  // constraint" — keeps the controls usable before previews finish loading.
+  const lsKey = (suffix: string) => `aitk:depthPreviews:${job.id}:${suffix}`;
+  const [minStep, setMinStep] = useLocalStorageState<string>(lsKey('minStep'), '');
+  const [maxStep, setMaxStep] = useLocalStorageState<string>(lsKey('maxStep'), '');
+  const [minT, setMinT] = useLocalStorageState<number>(lsKey('minT'), 0);
+  const [maxT, setMaxT] = useLocalStorageState<number>(lsKey('maxT'), 1);
+  const [band, setBand] = useLocalStorageState<Band>(lsKey('band'), 'all');
+  const [sample, setSample] = useLocalStorageState<string>(lsKey('sample'), 'all');
+  const [size, setSize] = useLocalStorageState<string>(lsKey('size'), 'all');
+  const [sortKey, setSortKey] = useLocalStorageState<SortKey>(lsKey('sortKey'), 'step');
+  const [sortDir, setSortDir] = useLocalStorageState<SortDir>(lsKey('sortDir'), 'desc');
+  // Zoom-overlay state. The full path is transient (it depends on where the
+  // training output lives); we persist just the filename and resolve it back
+  // to a path once the preview list arrives.
+  const [selectedPath, _setSelectedPathTransient] = useState<string | null>(null);
+  const [persistedSelectedFile, setPersistedSelectedFile] = useLocalStorageState<string | null>(
+    lsKey('selected'),
+    null,
+  );
   const setSelectedPath = (p: string | null) => {
-    _setSelectedPath(p);
-    writeUrl({ dp_selected: p ? basename(p) : null });
+    _setSelectedPathTransient(p);
+    setPersistedSelectedFile(p ? basename(p) : null);
   };
-  // Resolve the URL-restored selected filename to a full path once previews
-  // load. Only runs while we don't yet have a selection and the URL points at
-  // one — avoids overwriting an in-progress user selection.
+  // Resolve a previously-persisted selection to a full path once previews
+  // load. Only runs while no transient selection is active — avoids
+  // overwriting an in-progress click with a stale localStorage value.
   useEffect(() => {
     if (selectedPath != null) return;
-    if (!initial.selectedFile) return;
+    if (!persistedSelectedFile) return;
     if (previews.length === 0) return;
-    const match = previews.find(p => basename(p.path) === initial.selectedFile);
-    if (match) _setSelectedPath(match.path);
-  }, [previews, selectedPath, initial.selectedFile]);
+    const match = previews.find(p => basename(p.path) === persistedSelectedFile);
+    if (match) _setSelectedPathTransient(match.path);
+  }, [previews, selectedPath, persistedSelectedFile]);
 
-  // Unique source names from image previews (videos have no src). Sorted
-  // alphabetically so the dropdown is stable as new previews stream in.
+  // Sample × size options are linked: each dropdown shows only values that
+  // *exist in combination with* the other dropdown's current selection. This
+  // prevents the user from picking a (sample, size) pair that has no previews.
+  // If a setter is called with a value that would leave the partner dropdown
+  // on an unreachable value, the partner is reset to "all" — see setters
+  // below.
+  const sizeSortCmp = (a: string, b: string) => {
+    const [aw, ah] = a.split('x').map(n => parseInt(n, 10));
+    const [bw, bh] = b.split('x').map(n => parseInt(n, 10));
+    return aw - bw || ah - bh;
+  };
   const sampleOptions = useMemo(() => {
     const set = new Set<string>();
     for (const p of previews) {
-      if (p.srcName) set.add(p.srcName);
+      if (!p.srcName) continue;
+      if (size !== 'all' && sizeKey(p.size) !== size) continue;
+      set.add(p.srcName);
     }
     return Array.from(set).sort();
-  }, [previews]);
-
-  // Unique sample sizes ("WxH"), sorted by width then height for a stable
-  // listing. Previews from older trainer builds without a size suffix don't
-  // contribute and won't pass a size filter; they remain visible under "all".
+  }, [previews, size]);
   const sizeOptions = useMemo(() => {
     const set = new Set<string>();
     for (const p of previews) {
       const k = sizeKey(p.size);
-      if (k) set.add(k);
+      if (!k) continue;
+      if (sample !== 'all' && p.srcName !== sample) continue;
+      set.add(k);
     }
-    return Array.from(set).sort((a, b) => {
-      const [aw, ah] = a.split('x').map(n => parseInt(n, 10));
-      const [bw, bh] = b.split('x').map(n => parseInt(n, 10));
-      return aw - bw || ah - bh;
-    });
-  }, [previews]);
+    return Array.from(set).sort(sizeSortCmp);
+  }, [previews, sample]);
+
+  // When the user picks a value, validate that the other dropdown's current
+  // value is still reachable; if not, reset the other to "all" so the UI
+  // never displays a stuck-but-unreachable pair.
+  const sampleHasSize = (s: string, z: string): boolean => {
+    if (z === 'all') return true;
+    return previews.some(p => p.srcName === s && sizeKey(p.size) === z);
+  };
+  const sizeHasSample = (z: string, s: string): boolean => {
+    if (s === 'all') return true;
+    return previews.some(p => sizeKey(p.size) === z && p.srcName === s);
+  };
+  const pickSample = (v: string) => {
+    setSample(v);
+    if (v !== 'all' && size !== 'all' && !sampleHasSize(v, size)) setSize('all');
+  };
+  const pickSize = (v: string) => {
+    setSize(v);
+    if (v !== 'all' && sample !== 'all' && !sizeHasSample(v, sample)) setSample('all');
+  };
 
   const filtered = useMemo(() => {
     const stepLo = minStep === '' ? -Infinity : parseInt(minStep, 10);
@@ -308,10 +291,10 @@ export default function DepthPreviews({ job }: Props) {
           <span className={labelCls}>Sample</span>
           <select
             value={sample}
-            onChange={e => setSample(e.target.value)}
+            onChange={e => pickSample(e.target.value)}
             className={`${inputCls} max-w-[14rem]`}
             disabled={sampleOptions.length === 0}
-            title={sampleOptions.length === 0 ? 'No samples discovered yet' : 'Filter by source image'}
+            title={sampleOptions.length === 0 ? 'No samples match the current Size filter' : 'Filter by source image'}
           >
             <option value="all">all ({sampleOptions.length})</option>
             {sampleOptions.map(s => (
@@ -325,10 +308,10 @@ export default function DepthPreviews({ job }: Props) {
           <span className={labelCls}>Size</span>
           <select
             value={size}
-            onChange={e => setSize(e.target.value)}
+            onChange={e => pickSize(e.target.value)}
             className={inputCls}
             disabled={sizeOptions.length === 0}
-            title={sizeOptions.length === 0 ? 'No sized previews discovered yet (older trainer builds omit the size suffix).' : 'Filter by sample resolution (W×H)'}
+            title={sizeOptions.length === 0 ? 'No sized previews match the current Sample filter (older trainer builds also omit the size suffix).' : 'Filter by sample resolution (W×H)'}
           >
             <option value="all">all ({sizeOptions.length})</option>
             {sizeOptions.map(s => (

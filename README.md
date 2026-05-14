@@ -18,6 +18,7 @@ An extension of [AI Toolkit by Ostris](https://github.com/ostris/ai-toolkit) tha
   - [Handsome Squidward (single-image LoRA)](#example-handsome-squidward-single-image-lora)
 - [Configuration Reference](#configuration-reference): every extension-specific config option
 - [Upstream: AI Toolkit by Ostris](#upstream-ai-toolkit-by-ostris)
+- [Deploy on Runpod](#deploy-on-runpod): one-click cloud GPU
 - [Installation](#installation)
 
 ## Perceptual Anchoring
@@ -509,6 +510,40 @@ This extension is based on [AI Toolkit](https://github.com/ostris/ai-toolkit), a
 
 
 
+
+## Deploy on Runpod
+
+**[One-click deploy →](https://runpod.io/console/deploy?template=7pjx8jn8r1)**
+
+The deploy link drops you into Runpod with a pre-built template for this fork. Pick a GPU, paste your SSH public key into the `PUBLIC_KEY` field, hit deploy. After 1–3 minutes the UI is live; click "Connect → HTTP Service [Port 8675]" on the pod card to open it.
+
+The template uses the published image `ghcr.io/buffalobuffalobuffalobuffalo/ai-toolkit-perceptual:latest`, so deploys always pick up the latest release. To pin a specific version, edit the template's image field to `:0.8.x` (or whatever release you want).
+
+### Recommended GPUs
+
+| GPU | VRAM | Approx. $/hr | Good for |
+|---|---:|---:|---|
+| **RTX A6000** | 48 GB | $0.33 | Best value — fits Klein 9B and SDXL with headroom for big batches |
+| RTX 4090 | 24 GB | $0.34 | Snug-but-workable for Klein 9B, plenty for SDXL |
+| A40 | 48 GB | $0.35 | A6000 backup; Secure cloud only |
+| A100 80 GB SXM | 80 GB | $1.39 | When you want batch-size headroom (multi-image training, big resolution sweeps) |
+
+The A6000 / 4090 pair is the practical sweet spot. Stock is volatile — if your first pick times out at "Rented but unscheduled", terminate and try a different class.
+
+### What persists across pod restarts
+
+The template mounts a 100 GB **volume** at `/workspace`. The image symlinks `/app/ai-toolkit/{output, datasets, .cache}` into it on boot, so anything you write to the conventional output paths survives a pod stop. HuggingFace + Torch caches also live there, so you only download model weights once.
+
+If you Stop a pod the container disk is wiped on next start — the volume isn't. If you only Restart, both persist. Either way, point your datasets at `/workspace/datasets/...` and trained LoRAs land in `/workspace/output/<job_name>/`.
+
+### SSH access
+
+- **Proxied SSH** (no public IP needed): `ssh <pod-id>@ssh.runpod.io -i ~/.ssh/<your_key>`. Uses keys saved in your Runpod *account settings* (Account → Settings → SSH Public Keys). One-time setup, works for any pod you launch.
+- **Direct TCP SSH** on port 22: only relevant on Runpod Community-cloud pods (Secure cloud doesn't expose a public IP). Uses the `PUBLIC_KEY` env var you set at deploy time.
+
+For most users the proxied path is what you want — set your key in account settings once and skip the per-pod `PUBLIC_KEY` ceremony.
+
+---
 
 ## Installation
 

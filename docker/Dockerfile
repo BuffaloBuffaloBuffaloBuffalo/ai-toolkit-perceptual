@@ -8,6 +8,18 @@ ENV DEBIAN_FRONTEND=noninteractive
 # ref https://en.wikipedia.org/wiki/CUDA
 ENV TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0 10.0 12.0"
 
+# Default HuggingFace + Torch caches to /workspace so model weights persist
+# across Runpod pod restarts (where /workspace is the mounted volume). The
+# dirs are created at build time so the env is valid even outside Runpod —
+# you'll just be caching to container disk in that case. start.sh symlinks
+# `/app/ai-toolkit/{output,datasets,.cache}` into /workspace at boot, which
+# composes cleanly with these env vars (`/workspace/.cache/...`).
+ENV HF_HOME=/workspace/.cache/huggingface
+ENV HUGGINGFACE_HUB_CACHE=/workspace/.cache/huggingface
+ENV TRANSFORMERS_CACHE=/workspace/.cache/huggingface
+ENV TORCH_HOME=/workspace/.cache/torch
+RUN mkdir -p /workspace/.cache/huggingface /workspace/.cache/torch
+
 # Install dependencies
 RUN apt-get update && apt-get install --no-install-recommends -y \
     git \

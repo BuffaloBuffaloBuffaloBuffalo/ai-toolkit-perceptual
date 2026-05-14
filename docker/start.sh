@@ -57,6 +57,27 @@ export_env_vars() {
     echo 'source /etc/rp_environment' >> ~/.bashrc
 }
 
+# Redirect outputs + datasets to /workspace when it's mounted (Runpod volume,
+# or anywhere else you bind-mount one in). Lets `docker run` and Runpod pods
+# share the same conventional output paths in job configs (`output/<name>`)
+# without users having to know about container-disk vs volume-disk semantics
+# — trained LoRAs survive a pod stop, model caches survive a restart.
+link_workspace_dirs() {
+    if [ ! -d /workspace ]; then
+        return
+    fi
+    for d in output datasets .cache; do
+        mkdir -p "/workspace/$d"
+        target="/app/ai-toolkit/$d"
+        # Only create the symlink if nothing's there yet. If the path already
+        # exists as a regular dir/file (e.g. baked into the image), leave it
+        # alone — don't surprise anyone by silently relocating their data.
+        if [ ! -e "$target" ]; then
+            ln -sfn "/workspace/$d" "$target"
+        fi
+    done
+}
+
 # ---------------------------------------------------------------------------- #
 #                               Main Program                                   #
 # ---------------------------------------------------------------------------- #
@@ -66,5 +87,6 @@ echo "Pod Started"
 
 setup_ssh
 export_env_vars
+link_workspace_dirs
 echo "Starting AI Toolkit UI..."
-cd /app/ai-toolkit/ui && npm run start 
+cd /app/ai-toolkit/ui && npm run start

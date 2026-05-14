@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, use } from 'react';
+import { useMemo, useState, use } from 'react';
 import { FaChevronLeft } from 'react-icons/fa';
 import { Button } from '@headlessui/react';
 import { TopBar, MainContent } from '@/components/layout';
@@ -13,9 +13,11 @@ import JobConfigViewer from '@/components/JobConfigViewer';
 import JobLossGraph from '@/components/JobLossGraph';
 import JobMetricsGraph from '@/components/JobMetricsGraph';
 import JobMetricsCompareGraph from '@/components/JobMetricsCompareGraph';
+import DepthPreviews from '@/components/DepthPreviews';
 import { Job } from '@prisma/client';
+import { JobConfig } from '@/types';
 
-type PageKey = 'overview' | 'samples' | 'config' | 'loss_log' | 'metrics_new' | 'metrics_compare';
+type PageKey = 'overview' | 'samples' | 'depth_previews' | 'config' | 'loss_log' | 'metrics_new' | 'metrics_compare';
 
 interface Page {
   name: string;
@@ -23,6 +25,18 @@ interface Page {
   component: React.ComponentType<{ job: Job }>;
   menuItem?: React.ComponentType<{ job?: Job | null }> | null;
   mainCss?: string;
+  /** Hide the tab unless the predicate (run against the loaded job) returns true. */
+  condition?: (job: Job) => boolean;
+}
+
+function hasDepthPreviews(job: Job): boolean {
+  if (!job.job_config) return false;
+  try {
+    const cfg = JSON.parse(job.job_config) as JobConfig;
+    return (cfg.config?.process?.[0]?.depth_consistency?.preview_every ?? 0) > 0;
+  } catch {
+    return false;
+  }
 }
 
 const pages: Page[] = [
@@ -38,6 +52,13 @@ const pages: Page[] = [
     component: SampleImages,
     menuItem: SampleImagesMenu,
     mainCss: 'pt-24',
+  },
+  {
+    name: 'Depth Previews',
+    value: 'depth_previews',
+    component: DepthPreviews,
+    mainCss: 'pt-24',
+    condition: hasDepthPreviews,
   },
   {
     name: 'Loss Graph',
@@ -77,7 +98,11 @@ export default function JobPage({ params }: { params: { jobID: string } }) {
   const { job, status, refreshJob } = useJob(jobID, 5000);
   const [pageKey, setPageKey] = useState<PageKey>('overview');
 
-  const page = pages.find(p => p.value === pageKey);
+  const visiblePages = useMemo(() => (job ? pages.filter(p => !p.condition || p.condition(job)) : pages.filter(p => !p.condition)), [job]);
+  // If the previously selected tab no longer applies (e.g. preview_every was
+  // turned off after the user landed on it), bounce back to overview.
+  const page = visiblePages.find(p => p.value === pageKey) ?? visiblePages[0];
+  const effectivePageKey = page?.value ?? 'overview';
 
   return (
     <>
@@ -104,26 +129,26 @@ export default function JobPage({ params }: { params: { jobID: string } }) {
           />
         )}
       </TopBar>
-      <MainContent className={pages.find(page => page.value === pageKey)?.mainCss}>
+      <MainContent className={page?.mainCss}>
         {status === 'loading' && job == null && <p>Loading...</p>}
         {status === 'error' && job == null && <p>Error fetching job</p>}
         {job && (
           <>
-            {pages.map(page => {
-              const Component = page.component;
-              return page.value === pageKey ? <Component key={page.value} job={job} /> : null;
+            {visiblePages.map(p => {
+              const Component = p.component;
+              return p.value === effectivePageKey ? <Component key={p.value} job={job} /> : null;
             })}
           </>
         )}
       </MainContent>
       <div className="bg-gray-800 absolute top-12 left-0 w-full h-8 flex items-center px-2 text-sm">
-        {pages.map(page => (
+        {visiblePages.map(p => (
           <Button
-            key={page.value}
-            onClick={() => setPageKey(page.value)}
-            className={`px-4 py-1 h-8  ${page.value === pageKey ? 'bg-gray-300 dark:bg-gray-700' : ''}`}
+            key={p.value}
+            onClick={() => setPageKey(p.value)}
+            className={`px-4 py-1 h-8  ${p.value === effectivePageKey ? 'bg-gray-300 dark:bg-gray-700' : ''}`}
           >
-            {page.name}
+            {p.name}
           </Button>
         ))}
         {page?.menuItem && (

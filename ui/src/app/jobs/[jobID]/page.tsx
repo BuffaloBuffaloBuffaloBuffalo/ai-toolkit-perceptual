@@ -146,11 +146,21 @@ export default function JobPage({ params }: { params: { jobID: string } }) {
       <MainContent className={page?.mainCss}>
         {status === 'loading' && job == null && <p>Loading...</p>}
         {status === 'error' && job == null && <p>Error fetching job</p>}
+        {/* All tabs mount once and stay mounted; we hide inactive ones with
+            display:none rather than unmounting so per-tab local state (zoom,
+            selected series, scroll position, etc.) survives a tab switch.
+            Tabs that need to persist across *refresh* still mirror to the
+            URL on their own (see DepthPreviews for the pattern). */}
         {job && (
           <>
             {visiblePages.map(p => {
               const Component = p.component;
-              return p.value === effectivePageKey ? <Component key={p.value} job={job} /> : null;
+              const isActive = p.value === effectivePageKey;
+              return (
+                <div key={p.value} className={isActive ? 'contents' : 'hidden'} aria-hidden={!isActive}>
+                  <Component job={job} />
+                </div>
+              );
             })}
           </>
         )}

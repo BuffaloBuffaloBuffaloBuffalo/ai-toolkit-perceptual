@@ -95,9 +95,11 @@ class Flux2Model(BaseModel):
         dtype = self.torch_dtype
         self.print_and_status_update("Loading Mistral")
 
+        mistral_path = self.model_config.te_name_or_path if self.model_config.te_name_or_path is not None else MISTRAL_PATH
+
         text_encoder: Mistral3ForConditionalGeneration = (
             Mistral3ForConditionalGeneration.from_pretrained(
-                MISTRAL_PATH,
+                mistral_path,
                 torch_dtype=dtype,
             )
         )
@@ -121,7 +123,7 @@ class Flux2Model(BaseModel):
                 offload_percent=self.model_config.layer_offloading_text_encoder_percent,
             )
 
-        tokenizer = AutoProcessor.from_pretrained(MISTRAL_PATH)
+        tokenizer = AutoProcessor.from_pretrained(mistral_path)
         return text_encoder, tokenizer
 
     def load_model(self):

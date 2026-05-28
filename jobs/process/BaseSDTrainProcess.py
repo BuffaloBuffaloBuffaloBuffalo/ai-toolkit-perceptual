@@ -778,6 +778,15 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     state_dict = self.optimizer.state_dict()
                 torch.save(state_dict, file_path)
                 print_acc(f"Saved optimizer to {file_path}")
+                # Stepped copy paired with this checkpoint, when enabled.
+                # ``step_num`` is the zero-padded ``_NNNNNNNNN`` suffix (or
+                # '' for the initial save before any step) — only emit the
+                # copy when there's a step to pair with.
+                if self.save_config.save_optimizer_per_checkpoint and step_num:
+                    stepped_filename = f'{self.job.name}{step_num}_optimizer.pt'
+                    stepped_path = os.path.join(self.save_root, stepped_filename)
+                    torch.save(state_dict, stepped_path)
+                    print_acc(f"Saved per-checkpoint optimizer to {stepped_path}")
             except Exception as e:
                 print_acc(e)
                 print_acc("Could not save optimizer")

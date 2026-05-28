@@ -29,6 +29,14 @@ class SaveConfig:
         self.push_to_hub: bool = kwargs.get("push_to_hub", False)
         self.hf_repo_id: Optional[str] = kwargs.get("hf_repo_id", None)
         self.hf_private: Optional[str] = kwargs.get("hf_private", False)
+        # When True, write a stepped copy of the optimizer state alongside
+        # each checkpoint (e.g. ``{job_name}_000000250_optimizer.pt``) so the
+        # user can roll a stateful optimizer (Adam, Automagic, etc.) back to
+        # the same step as a saved LoRA checkpoint. The canonical
+        # ``optimizer.pt`` is still written for resume-from-latest.
+        # Stepped copies are pruned by ``clean_up_saves`` alongside the
+        # safetensors files via the existing ``max_step_saves_to_keep``.
+        self.save_optimizer_per_checkpoint: bool = kwargs.get('save_optimizer_per_checkpoint', False)
 
 class LoggingConfig:
     def __init__(self, **kwargs):

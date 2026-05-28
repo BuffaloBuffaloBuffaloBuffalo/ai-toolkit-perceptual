@@ -7,7 +7,7 @@ An extension of [AI Toolkit by Ostris](https://github.com/ostris/ai-toolkit) tha
 
 These can be used independently or together. Weight noising is the bigger practical win for subject-likeness LoRAs; perceptual anchoring is the bigger win when you need geometric/structural control.
 
-**Supported models:** SDXL, FLUX.2 Klein 9B
+**Supported models:** SDXL, FLUX.2 Klein 9B, Z-Image Turbo (experimental — see [Z-Image Turbo](#z-image-turbo-experimental))
 
 ## Contents
 
@@ -19,6 +19,7 @@ These can be used independently or together. Weight noising is the bigger practi
 - [Training Previews](#training-previews): what each anchor saves to disk
 - [Dataset-Tools UI](#dataset-tools-ui): preflight passes for masks, depth, faces
 - [Quickstart Templates](#quickstart-templates): UI presets for validated configs
+- [Z-Image Turbo (experimental)](#z-image-turbo-experimental): early support, current best-guess settings, ComfyUI inference tip
 - [Tips and Tricks](#tips-and-tricks): empirical patterns from training runs
 - [Examples](#examples)
   - [Sketchwave Style (single-image style LoRA)](#example-sketchwave-style-single-image-style-lora)
@@ -316,7 +317,33 @@ Current templates:
 - **Subject Likeness, Masked (Flux 2 Klein 9B + Weight Noise)**: same recipe plus subject masking with per-region weights (`background:0`, `clothing:1`, `body:1`) and depth-consistency restricted to the subject mask. Use this when you can be disciplined about captioning only the changeable parts of the character and skipping the background/setting. See the [Tips and Tricks](#tips-and-tricks) section for the rationale.
   - YAML: [`config/examples/subject_likeness_masked_flux2_klein9b.yaml`](config/examples/subject_likeness_masked_flux2_klein9b.yaml)
 
+- **Subject Likeness (Z-Image Turbo + Weight Noise)** *(experimental — see [section below](#z-image-turbo-experimental))*: LoKr + weight noise (relative, σ=0.0125) on Z-Image Turbo via the de-distill training adapter. Single 1024 bucket with `num_repeats: 50`, subject-masked depth-consistency (`background:0`, `clothing:1`), AdamW8bit @ lr=2.5e-4, batch=4, 1500 steps. Custom timestep distribution + curve front-load high-t and low-mid-t training. Transformer kept in bf16 (Tongyi-MAI warns against FP8 on Turbo); text encoder quantized to qfloat8.
+  - YAML: [`config/examples/subject_likeness_zimage_turbo.yaml`](config/examples/subject_likeness_zimage_turbo.yaml)
+
 Templates live in `ui/src/app/jobs/new/quickstarts.ts`; the YAML files under `config/examples/` mirror them and stay in sync. Adding a new template is a one-export change on the TS side plus a YAML mirror. The chosen template name shows in the dropdown label and stays there until you pick another. It's not saved to the config; the form *is* the template after apply.
+
+## Z-Image Turbo (experimental)
+
+Z-Image Turbo support is **experimental**. The quickstart settings above are the current best guess from a handful of validated production runs, not a tuned recipe — the model is recent (Tongyi-MAI released it in late 2025) and community best practices are still forming.
+
+If you find configurations that produce noticeably better likeness, fewer artifacts, or faster convergence, **please open an issue** ([github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/issues](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/issues)) with your config + before/after samples so we can update the defaults. Especially interested in:
+
+- Step count / LR / sigma sweeps for different dataset sizes
+- Whether multi-bucket actually hurts vs the single 1024 default we ship
+- Identity / landmark loss settings that transfer cleanly from the Flux 2 recipes
+- Reports on Z-Image base (non-turbo) — currently we only ship a Turbo template
+
+### Training notes
+
+- The training adapter (`ostris/zimage_turbo_training_adapter_v2`) is merged in at load with `+1.0`, then runtime-inverted to `-1.0` at sample time. The optimizer sees a "base-like" model; the trained LoRA inverts cleanly back to 8-step turbo at inference. See `ZImageModel.load_training_adapter`.
+- **Do not enable transformer quantization on Turbo.** Tongyi-MAI explicitly warns that FP8 on Z-Image Turbo causes noticeable quality degradation. The quickstart keeps `model.quantize: false`. Text-encoder quantization is fine.
+- Z-Image reuses Flux's 16-ch VAE byte-for-byte. Anything you know about prompt / caption / cropping discipline for Flux character LoRAs transfers.
+
+### Inference tip — use RES_2S sampler at 8 steps
+
+The trainer's preview samples use the default flowmatch sampler so they're directly comparable across steps, but **for actual inference Z-Image Turbo seems to look noticeably cleaner with the RES_2S sampler at 8 steps** (ComfyUI side, via the [`RES4LYF`](https://github.com/ClownsharkBatwing/RES4LYF) sampler nodes). RES_2S is a single-step rational-exponential integrator and seems to handle Turbo's distilled trajectory better than the standard Euler / DPM samplers most ComfyUI workflows default to. Fine eye / iris detail (the failure mode you'll see most often at 512² or under aggressive quantization) holds up better.
+
+If you're seeing pixelation in training previews specifically, note that the trainer also currently uses a fixed `shift=3.0` schedule rather than the dynamic shifting `diffusers.ZImagePipeline` defaults to. This matches the ComfyUI workflow shipped with Z-Image so the LoRA you train will look right in ComfyUI; preview-only mismatch.
 
 ## Tips and Tricks
 

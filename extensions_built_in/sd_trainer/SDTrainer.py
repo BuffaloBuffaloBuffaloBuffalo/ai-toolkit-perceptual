@@ -1291,7 +1291,9 @@ class SDTrainer(BaseSDTrainProcess):
                     encoder = 'sdxl' if arch == 'sdxl' else 'sd15'
                 elif arch in ('sd3',):
                     encoder = 'sd3'
-                elif arch in ('flux', 'flex1', 'flex2'):
+                elif arch in ('flux', 'flex1', 'flex2', 'zimage'):
+                    # Z-Image reuses the Flux VAE (16-ch latents, same scaling
+                    # and shift factors as black-forest-labs/FLUX.1-dev).
                     encoder = 'flux'
                 else:
                     encoder = 'sdxl'  # safe default (4ch)
@@ -1376,7 +1378,13 @@ class SDTrainer(BaseSDTrainProcess):
                 decoder.eval()
                 decoder.requires_grad_(False)
                 self._taef2_decoder = decoder
-            elif self.sd.is_flux or 'flex' in getattr(self.sd, 'arch', ''):
+            elif (
+                self.sd.is_flux
+                or 'flex' in getattr(self.sd, 'arch', '')
+                or getattr(self.sd, 'arch', '') == 'zimage'
+            ):
+                # Z-Image's VAE is the Flux VAE (16-ch latents, identical
+                # scaling/shift factors), so TAEF1 is the correct tiny decoder.
                 taesd_name = "madebyollin/taef1"
                 print_acc(f"  Loading TAESD ({taesd_name}) for face losses...")
                 self.taesd = AutoencoderTiny.from_pretrained(

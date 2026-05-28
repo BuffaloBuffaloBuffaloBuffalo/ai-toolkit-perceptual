@@ -1,0 +1,126 @@
+# Z-Image base smoke test — exercises the custom-loss pipeline end-to-end
+# on the standard Z-Image (not turbo) transformer. Trains for a handful of
+# steps with subject_mask + depth_consistency enabled so we get a real
+# signal that x0 decode → DA2 perceptor → loss path is wired correctly.
+#
+# Not intended to learn anything; intended to catch crashes / shape
+# mismatches the moment the integration is broken.
+---
+job: extension
+config:
+  name: "z_image_base_smoke"
+  process:
+    - type: "diffusion_trainer"
+      training_folder: "output"
+      sqlite_db_path: "./aitk_db.db"
+      device: cuda
+      trigger_word: null
+      performance_log_every: 10
+      network:
+        type: "lora"
+        linear: 16
+        linear_alpha: 16
+      save:
+        dtype: bf16
+        save_every: 5
+        max_step_saves_to_keep: 1
+        save_format: diffusers
+        push_to_hub: false
+      datasets:
+        - folder_path: "/home/z/Documents/repos/ai-toolkit/datasets/scarlett_highres"
+          mask_path: null
+          mask_min_value: 0.1
+          default_caption: ""
+          caption_ext: txt
+          caption_dropout_rate: 0.05
+          cache_latents_to_disk: true
+          is_reg: false
+          network_weight: 1
+          resolution: [512]
+          controls: []
+          shrink_video_to_frames: true
+          num_frames: 1
+          flip_x: false
+          flip_y: false
+          num_repeats: 1
+          diffusion_loss_weight: 1
+          depth_loss_weight: 0.005
+          loss_split: sum
+          background_loss_weight: 0
+          clothing_loss_weight: 1
+          body_loss_weight: 1
+      train:
+        max_grad_norm: 1
+        batch_size: 1
+        bypass_guidance_embedding: false
+        steps: 5
+        gradient_accumulation: 1
+        train_unet: true
+        train_text_encoder: false
+        gradient_checkpointing: true
+        noise_scheduler: flowmatch
+        optimizer: adamw8bit
+        timestep_type: weighted
+        content_or_style: balanced
+        optimizer_params:
+          weight_decay: 0.0001
+        unload_text_encoder: false
+        cache_text_embeddings: true
+        lr: 1e-4
+        ema_config:
+          use_ema: false
+        skip_first_sample: true
+        force_first_sample: false
+        disable_sampling: false
+        dtype: bf16
+        loss_type: mse
+        diffusion_loss_weight: 1
+        diffusion_loss_max_t: 1
+        diffusion_loss_min_t: 0
+      logging:
+        log_every: 1
+        use_ui_logger: false
+      model:
+        name_or_path: "Tongyi-MAI/Z-Image"
+        quantize: true
+        qtype: qfloat8
+        quantize_te: true
+        qtype_te: qfloat8
+        arch: zimage
+        low_vram: false
+      sample:
+        sampler: flowmatch
+        sample_every: 5
+        width: 512
+        height: 512
+        samples:
+          - prompt: "A photo of Clare Bowen"
+        neg: ""
+        seed: 42
+        walk_seed: false
+        guidance_scale: 4
+        sample_steps: 12
+        num_frames: 1
+        fps: 1
+      depth_consistency:
+        loss_weight: 0.005
+        input_size: 518
+        preview_every: 5
+        mask_source: subject
+        loss_max_t: 1
+        model_id: "depth-anything/Depth-Anything-V2-Small-hf"
+        loss_min_t: 0
+        grad_checkpoint: true
+        ssi_weight: 0
+        grad_weight: 1
+        grad_scales: 6
+      subject_mask:
+        enabled: true
+        background_loss_weight: 0
+        clothing_loss_weight: 1
+        save_debug_previews: false
+        cache_resolution: 512
+        segformer_res: 512
+meta:
+  name: "[name]"
+  version: "1.0"

@@ -135,6 +135,7 @@ export const defaultJobConfig: JobConfig = {
           max_step_saves_to_keep: 4,
           save_format: 'diffusers',
           push_to_hub: false,
+          save_optimizer_per_checkpoint: false,
         },
         datasets: [defaultDatasetConfig],
         train: {

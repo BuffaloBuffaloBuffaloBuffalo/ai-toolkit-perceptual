@@ -78,6 +78,12 @@ export interface SaveConfig {
   max_step_saves_to_keep: number;
   save_format: string;
   push_to_hub: boolean;
+  /** Write a stepped copy of the optimizer state alongside each checkpoint
+   *  (e.g. ``{job}_000000250_optimizer.pt``) so stateful optimizers can be
+   *  rolled back to a specific checkpoint. The canonical ``optimizer.pt`` is
+   *  still written for resume-from-latest. Stepped copies are pruned by
+   *  ``max_step_saves_to_keep``. Defaults to false. */
+  save_optimizer_per_checkpoint?: boolean;
 }
 
 export interface DatasetConfig {

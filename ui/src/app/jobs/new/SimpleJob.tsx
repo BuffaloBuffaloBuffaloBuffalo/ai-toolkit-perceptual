@@ -484,6 +484,11 @@ export default function SimpleJob({
               min={1}
               required
             />
+            <Checkbox
+              label="Save optimizer per checkpoint"
+              checked={jobConfig.config.process[0].save.save_optimizer_per_checkpoint || false}
+              onChange={value => setJobConfig(value, 'config.process[0].save.save_optimizer_per_checkpoint')}
+            />
           </Card>
         </div>
         <div>

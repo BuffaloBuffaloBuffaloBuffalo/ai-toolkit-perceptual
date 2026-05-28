@@ -736,7 +736,12 @@ export const modelArchs: ModelArch[] = [
 }) as any;
 
 // Only expose supported models in the UI selector
-const enabledModelNames = new Set(['sdxl', 'flux2_klein_9b']);
+const enabledModelNames = new Set([
+  'sdxl',
+  'flux2_klein_9b',
+  'zimage',
+  'zimage:turbo',
+]);
 
 export const groupedModelOptions: GroupedSelectOption[] = modelArchs
   .filter(arch => enabledModelNames.has(arch.name))

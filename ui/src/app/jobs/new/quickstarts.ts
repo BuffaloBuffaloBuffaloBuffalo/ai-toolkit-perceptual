@@ -334,7 +334,9 @@ function buildSubjectLikenessZImageTurboConfig(current: JobConfig): JobConfig {
             max_grad_norm: 1,
             batch_size: 4,
             bypass_guidance_embedding: false,
-            steps: 1500,
+            // ZiT can take ~200 steps per training image to converge, so a
+            // 10 to 15 image dataset wants something in the 2000 to 3000 range.
+            steps: 3000,
             gradient_accumulation: 1,
             train_unet: true,
             train_text_encoder: false,
@@ -478,7 +480,7 @@ const subjectLikenessZImageTurbo: QuickstartTemplate = {
     'LoKr + weight noise (relative σ=0.0125) on Z-Image Turbo via the ' +
     'de-distill training adapter. Single 1024 bucket (multi-bucket was tried ' +
     'and empirically worse), subject-masked depth-consistency (background:0 ' +
-    '/ clothing:1), AdamW8bit @ lr=2.5e-4, batch=4, 1500 steps. Custom ' +
+    '/ clothing:1), AdamW8bit @ lr=2.5e-4, batch=4, 3000 steps. Custom ' +
     'timestep distribution + curve front-load high-t and low-mid-t training. ' +
     'Transformer kept in bf16 (Tongyi-MAI warns against FP8 on Turbo); text ' +
     'encoder quantized.',

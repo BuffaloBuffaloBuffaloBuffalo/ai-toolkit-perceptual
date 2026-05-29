@@ -317,7 +317,7 @@ Current templates:
 - **Subject Likeness, Masked (Flux 2 Klein 9B + Weight Noise)**: same recipe plus subject masking with per-region weights (`background:0`, `clothing:1`, `body:1`) and depth-consistency restricted to the subject mask. Use this when you can be disciplined about captioning only the changeable parts of the character and skipping the background/setting. See the [Tips and Tricks](#tips-and-tricks) section for the rationale.
   - YAML: [`config/examples/subject_likeness_masked_flux2_klein9b.yaml`](config/examples/subject_likeness_masked_flux2_klein9b.yaml)
 
-- **Subject Likeness (Z-Image Turbo + Weight Noise)**: experimental, see [Z-Image Turbo](#z-image-turbo-experimental) below. LoKr + weight noise (relative, σ=0.0125) via the de-distill training adapter. Single 1024 bucket with `num_repeats: 50`, subject-masked depth-consistency (`background:0`, `clothing:1`), AdamW8bit @ lr=2.5e-4, batch=4, 1500 steps. Custom timestep distribution and curve to front-load high-t and low-mid-t training. Transformer in bf16 (Tongyi-MAI warns against FP8 on Turbo), text encoder quantized to qfloat8.
+- **Subject Likeness (Z-Image Turbo + Weight Noise)**: experimental, see [Z-Image Turbo](#z-image-turbo-experimental) below. LoKr + weight noise (relative, σ=0.0125) via the de-distill training adapter. Single 1024 bucket with `num_repeats: 50`, subject-masked depth-consistency (`background:0`, `clothing:1`), AdamW8bit @ lr=2.5e-4, batch=4, 3000 steps. Custom timestep distribution and curve to front-load high-t and low-mid-t training. Transformer in bf16 (Tongyi-MAI warns against FP8 on Turbo), text encoder quantized to qfloat8.
   - YAML: [`config/examples/subject_likeness_zimage_turbo.yaml`](config/examples/subject_likeness_zimage_turbo.yaml)
 
 Templates live in `ui/src/app/jobs/new/quickstarts.ts`; the YAML files under `config/examples/` mirror them and stay in sync. Adding a new template is a one-export change on the TS side plus a YAML mirror. The chosen template name shows in the dropdown label and stays there until you pick another. It's not saved to the config; the form *is* the template after apply.
@@ -331,6 +331,7 @@ A few notes:
 - The de-distill adapter (`ostris/zimage_turbo_training_adapter_v2`) is merged at load with `+1.0` and runtime-inverted to `-1.0` at sample time. The optimizer sees a base-like model; the LoRA inverts back to 8-step turbo at inference.
 - Don't quantize the transformer. Tongyi-MAI warns FP8 on Turbo causes noticeable quality degradation, so the quickstart keeps `model.quantize: false`. Text encoder quantization is fine.
 - Z-Image reuses the Flux VAE byte-for-byte, so Flux caption and cropping habits transfer.
+- ZiT can take up to **200 steps per training image** to converge, noticeably more than Flux 2 Klein typically needs. The quickstart defaults to 3000 steps so a 10 to 15 image dataset has room to settle. Optimizations to bring this down are in progress.
 
 For inference, [RES_2S](https://github.com/ClownsharkBatwing/RES4LYF) at 8 steps tends to look noticeably cleaner than the default Euler/DPM samplers most ComfyUI workflows use. Fine eye and iris detail holds up better.
 

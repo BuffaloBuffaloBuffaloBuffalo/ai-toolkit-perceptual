@@ -84,7 +84,10 @@ config:
         max_grad_norm: 1
         batch_size: 4
         bypass_guidance_embedding: false
-        steps: 1500
+        # ZiT can take up to ~200 steps per training image to converge, so a
+        # 10 to 15 image dataset wants something in the 2000 to 3000 range.
+        # Optimizations to bring this down are in progress.
+        steps: 3000
         gradient_accumulation: 1
         train_unet: true
         train_text_encoder: false

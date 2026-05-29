@@ -379,6 +379,18 @@ datasets:
 
 The Subject Likeness quickstart uses exactly this ratio.
 
+### Start with a small dataset
+
+With these methods **you need far fewer images** than you'd think to get good, generalizable results. Start with **10 to 15 images** picked for quality and diversity. If that converges well, try adding more images to the same run or restart with the larger dataset. Going big from the start tends to be wasted effort.
+
+### Body horror mid-training is usually fine
+
+Anecdotally, you may see more body horror and extra limbs partway through training when weight noising is on. This is normal. The noise pushes the weights around more between optimizer steps, so some checkpoints may diverge pretty badly before the run converges.
+
+Rough heuristic: budget around **80 to 100 steps per training image**. If you're sampling every 25 steps and see continuous body horror for more than 20% of the run, the noise sigma is probably too high. Lower it in increments of 0.0025 until it resolves. We're still figuring out the training dynamics across different datasets, so reports of what worked (or didn't) are welcome.
+
+I recommend saving checkpoints every 25 steps. The optimal checkpoint is often in a narrow window.
+
 ## Examples
 
 > **Note on inference target.** All example configs in this README and under `config/examples/` are tuned for inference against the **distilled** model (Flux 2 Klein). If you plan to apply the trained LoRAs against the **base (non-distilled)** model instead, checkpoints in the **500–800 step range** are usually closer to optimal than the **1000–1200 step range** the configs save out.

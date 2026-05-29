@@ -26,7 +26,8 @@ These can be used independently or together. Weight noising is the bigger practi
   - [Yoshitaka Amano Style (small-dataset style LoRA)](#example-yoshitaka-amano-style-small-dataset-style-lora)
 - [Configuration Reference](#configuration-reference): every extension-specific config option
 - [Upstream: AI Toolkit by Ostris](#upstream-ai-toolkit-by-ostris)
-- [Installation](#installation)
+- [Installation](#installation): local setup, or one-click RunPod template
+- [Running the Web UI](#running-the-web-ui): start the job builder, dataset tools, and training monitors
 
 ## Perceptual Anchoring
 
@@ -634,6 +635,12 @@ This extension is based on [AI Toolkit](https://github.com/ostris/ai-toolkit), a
 
 ## Installation
 
+### Run on RunPod
+
+No local GPU? [**Deploy the prebuilt RunPod template →**](https://console.runpod.io/deploy?template=bn89xhug15&ref=hfo6q4j3). It runs the same Docker image this repo builds, with the web UI already up on port 8675.
+
+### Local install
+
 Requirements:
 - Python >3.10
 - Nvidia GPU with enough VRAM for what you're training
@@ -662,4 +669,19 @@ pip install -r requirements.txt
 ```
 
 For devices running **DGX OS** (including DGX Spark), follow [these](dgx_instructions.md) instructions.
+
+## Running the Web UI
+
+Job creation, the dataset-tools preflights, and live training monitors all live in the web UI. Since this repo only documents what it adds on top of upstream AI Toolkit, it's easy to miss how to start the UI itself.
+
+After a local install, launch it from the `ui/` directory:
+
+```bash
+cd ui
+npm run build_and_start
+```
+
+This installs the UI's Node dependencies, initializes its database, builds, and serves the app at **http://localhost:8675** (requires Node.js 18+). The first run does the full build; afterwards `npm run start` restarts it without rebuilding.
+
+> Using the RunPod template? The UI is already running, so just open port **8675** from the pod's **Connect** menu.
 

@@ -107,6 +107,23 @@ def clean_caption(caption):
     return caption
 
 
+def waveform_to_stereo(waveform):
+    c = waveform.shape[0]
+    if c == 2:
+        return waveform
+    if c == 1:
+        return waveform.expand(2, -1)
+    if c == 6:  # 5.1: FL, FR, FC, LFE, BL, BR
+        fl, fr, fc, _, bl, br = waveform
+        k = 0.7071
+        return torch.stack([fl + k * fc + k * bl, fr + k * fc + k * br])
+    if c == 8:  # 7.1: FL, FR, FC, LFE, BL, BR, SL, SR
+        fl, fr, fc, _, bl, br, sl, sr = waveform
+        k = 0.7071
+        return torch.stack([fl + k * fc + k * (bl + sl), fr + k * fc + k * (br + sr)])
+    return waveform.mean(0, keepdim=True).expand(2, -1)
+
+
 class CaptionMixin:
     def get_caption_item(self: 'AiToolkitDataset', index):
         if not hasattr(self, 'caption_type'):
@@ -631,6 +648,7 @@ class ImageProcessingDTOMixin:
                         target_duration = source_duration
 
                     waveform, sample_rate = torchaudio.load(self.path)  # [channels, samples]
+                    waveform = waveform_to_stereo(waveform)  # LTX-2 audio VAE expects stereo
                     
                     if self.dataset_config.audio_normalize:
                         peak = waveform.abs().amax()  # global peak across channels
@@ -670,9 +688,9 @@ class ImageProcessingDTOMixin:
                         self.audio_data = {"waveform": waveform, "sample_rate": int(sample_rate)}
 
                 except Exception as e:
-                    # Keep behavior identical for non-audio datasets; for audio datasets, just skip if missing/broken.
-                    if hasattr(self.dataset_config, 'debug') and self.dataset_config.debug:
-                        print_acc(f"Could not extract/stretch audio for {self.path}: {e}")
+                    # Audio was requested (do_audio) but extraction failed (bad/silent codec, missing
+                    # audio stream, etc.). Surface it loudly instead of silently training on no audio.
+                    print_acc(f"** WARNING ** Could not extract/stretch audio for {self.path}: {e}")
                     self.audio_data = None
                     self.audio_tensor = None
             

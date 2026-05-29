@@ -1,0 +1,83 @@
+# =============================================================================
+# LTX-2.3 (22B) LoRA — 80GB validation run (DGX / RunPod / H100-class)
+# Goal: prove the ported arch loads, caches, trains with a falling loss, samples
+# t2v + i2v with no tiling/jitter, and the LoRA saves + reloads for inference.
+#
+# Prereqs on the 80GB box:
+#   - env built from the UPDATED dgx_requirements.txt (diffusers @dc8d9032 / 0.38.0.dev0)
+#   - weights auto-download on first run (~46GB full dev + ~24GB Gemma TE), or
+#     swap name_or_path to the fp8 file to cut the transformer to ~27GB.
+#   - a real captioned video dataset at datasets[0].folder_path (a few dozen
+#     short .mp4 + same-name .txt). test_data/dance_clips works for a functional
+#     check but is tiny/silent.
+# =============================================================================
+---
+job: extension
+config:
+  name: "ltx23_80gb_v1"
+  process:
+    - type: 'sd_trainer'
+      training_folder: "output"
+      device: cuda:0
+      network:
+        type: "lora"
+        linear: 32
+        linear_alpha: 32
+      save:
+        dtype: float16
+        save_every: 250
+        max_step_saves_to_keep: 4
+      datasets:
+        - folder_path: "/path/to/captioned_video_clips"   # <-- EDIT
+          caption_ext: "txt"
+          caption_dropout_rate: 0.05
+          resolution: [512]        # divisible by 32; bump to [512, 768] once stable
+          num_frames: 97           # 8n+1 (49/97/121). Start lower if VAE memory is tight.
+          shrink_video_to_frames: true
+          fps: 24
+          do_i2v: true             # exercises first-frame conditioning
+          do_audio: true           # joint audio; set false if the box's torchaudio can't decode the clips' audio
+          audio_normalize: true
+      train:
+        batch_size: 1
+        steps: 1000
+        gradient_accumulation: 1
+        train_unet: true
+        train_text_encoder: false
+        gradient_checkpointing: true
+        noise_scheduler: "flowmatch"
+        timestep_type: 'linear'
+        optimizer: "adamw8bit"
+        lr: 1e-4
+        dtype: bf16
+        cache_text_embeddings: true
+      model:
+        # full dev (best quality). For ~27GB instead of ~46GB use:
+        #   "Lightricks/LTX-2.3-fp8/ltx-2.3-22b-dev-fp8.safetensors"
+        name_or_path: "Lightricks/LTX-2.3/ltx-2.3-22b-dev.safetensors"
+        arch: 'ltx2.3'
+        quantize: true             # qfloat8 keeps it comfortable on 80GB + faster; set false for full-bf16 fidelity
+        qtype: "qfloat8"
+        quantize_te: true
+        qtype_te: "qfloat8"
+        low_vram: false            # 80GB: no offload; faster, avoids the framewise-encode path
+      sample:
+        sampler: "flowmatch"
+        sample_every: 250
+        width: 512
+        height: 512
+        num_frames: 49             # samples are expensive; keep below training frames
+        fps: 24
+        prompts:
+          - "[trigger] a person dancing in a sunlit studio, smooth motion"
+          - "a chef plating a dish in a busy kitchen, steam rising"
+          # i2v: provide an init image to exercise the LTX2ImageToVideoPipeline path
+          # - "--ctrl_img /path/to/first_frame.png a slow zoom out revealing a city skyline"
+        neg: ""
+        seed: 42
+        walk_seed: true
+        guidance_scale: 5.0
+        sample_steps: 30
+  meta:
+    name: "[name]"
+    version: '1.0'

@@ -1,6 +1,6 @@
 torchao==0.10.0
 safetensors
-git+https://github.com/huggingface/diffusers@8600b4c10d67b0ce200f664204358747bd53c775
+git+https://github.com/huggingface/diffusers@dc8d9032171c83741fd37ed2b12bc9d8274464f3
 transformers==4.57.3
 lycoris-lora==1.8.3
 flatten_json
@@ -37,7 +37,7 @@ matplotlib==3.10.1
 setuptools==69.5.1
 scipy==1.12.0
 av==16.0.1
-torchcodec
+torchcodec==0.9.1
 insightface
 onnxruntime-gpu
 onnx2torch

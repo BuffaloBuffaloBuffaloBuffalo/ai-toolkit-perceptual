@@ -55,6 +55,7 @@ class FileItemDTO(
         self.path = kwargs.get("path", "")
         self.dataset_config: "DatasetConfig" = kwargs.get("dataset_config", None)
         self.is_video = self.dataset_config.num_frames > 1
+        self.num_frames = self.dataset_config.num_frames
         size_database = kwargs.get("size_database", {})
         dataset_root = kwargs.get("dataset_root", None)
         self.encode_control_in_text_embeddings = kwargs.get(
@@ -210,6 +211,7 @@ class DataLoaderBatchDTO:
         try:
             self.file_items: List["FileItemDTO"] = kwargs.get("file_items", None)
             is_latents_cached = self.file_items[0].is_latent_cached
+            self.num_frames: int = self.file_items[0].num_frames
             self.tensor: Union[torch.Tensor, None] = None
             self.latents: Union[torch.Tensor, None] = None
             self.control_tensor: Union[torch.Tensor, None] = None

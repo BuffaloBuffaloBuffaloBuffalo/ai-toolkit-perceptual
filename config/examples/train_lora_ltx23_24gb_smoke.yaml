@@ -1,0 +1,79 @@
+# =============================================================================
+# LTX-2.3 (22B) LoRA — minimal 24GB SMOKE config
+# Purpose: prove the new arch imports, loads, caches latents, and runs >=1
+# finite-loss training step WITHOUT OOM/NaN. NOT a real training recipe.
+#
+# !! 22B is very tight on 24GB even at fp8. The combined checkpoint is
+#    dequantized to bf16 on load before being re-quantized, which spikes
+#    CPU/GPU memory at load time. If it OOMs on load, this smoke must move to
+#    the 80GB box; locally you can still prove import + latent caching.
+#
+# Prereqs (NOT auto-present locally — the cached Lightricks/LTX-2.3 dir is an
+# empty negative-cache marker, the weights are not downloaded):
+#   1. The fp8 checkpoint is auto-downloaded by the loader from the
+#      "repo/repo/file.safetensors" name_or_path below (~27GB). Needs HF_TOKEN
+#      with access + disk space.
+#   2. The Gemma-3-12B text encoder: by default LTX23Model pulls
+#      "Lightricks/gemma-3-12b-it-qat-q4_0-unquantized" (~24GB). To reuse the
+#      already-cached "google/gemma-3-12b-it" instead, uncomment te_name_or_path.
+#   3. A small captioned VIDEO dataset (a few short .mp4 + same-name .txt).
+#      Set datasets[0].folder_path below. (The repo's /bodytest is images-only.)
+# =============================================================================
+---
+job: extension
+config:
+  name: "ltx23_smoke_v1"
+  process:
+    - type: 'sd_trainer'
+      training_folder: "output"
+      device: cuda:0
+      network:
+        type: "lora"
+        linear: 16
+        linear_alpha: 16
+      save:
+        dtype: float16
+        save_every: 1000          # > steps, so no mid-run save churn during the smoke
+        max_step_saves_to_keep: 1
+      datasets:
+        - folder_path: "test_data/dance_clips"   # repo fixture clips (silent); swap for your own captioned clips
+          caption_ext: "txt"
+          default_caption: "a person dancing"   # fixtures have no .txt; gives the smoke a caption
+          caption_dropout_rate: 0.0
+          resolution: [256]        # must be divisible by 32
+          num_frames: 17           # must be 8n+1 (1, 9, 17, 25, ...). Drop to 9 if tight.
+          shrink_video_to_frames: true
+          fps: 24
+          do_i2v: false            # keep the first smoke t2v-only (no first-frame encode)
+          do_audio: false          # audio off for the first OOM test; enable once video works
+      train:
+        batch_size: 1
+        steps: 2
+        gradient_accumulation: 1
+        train_unet: true
+        train_text_encoder: false
+        gradient_checkpointing: true
+        noise_scheduler: "flowmatch"
+        timestep_type: 'linear'
+        optimizer: "adamw8bit"
+        lr: 1e-4
+        dtype: bf16
+        cache_text_embeddings: true   # keep Gemma-12B off-GPU during steps
+        disable_sampling: true        # sampling is the biggest extra VRAM cost; off for the smoke
+      model:
+        # repo_id/repo/filename.safetensors -> loader auto-downloads + converts everything from this one file
+        name_or_path: "Lightricks/LTX-2.3-fp8/ltx-2.3-22b-dev-fp8.safetensors"
+        arch: 'ltx2.3'
+        # To reuse the already-cached Gemma instead of downloading the Lightricks mirror:
+        # te_name_or_path: "google/gemma-3-12b-it"
+        quantize: true
+        qtype: "qfloat8"
+        quantize_te: true
+        qtype_te: "qfloat8"
+        low_vram: true
+        layer_offloading: true
+        layer_offloading_transformer_percent: 1.0
+        layer_offloading_text_encoder_percent: 1.0
+  meta:
+    name: "[name]"
+    version: '1.0'

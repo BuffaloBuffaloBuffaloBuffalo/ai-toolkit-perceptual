@@ -1,0 +1,130 @@
+# LTX-2.3 (22B) LoKr — single-clip cartwheel motion training.
+#
+# Recipe ported from the "Subject Likeness (Flux 2 Klein 9B + Weight Noise)"
+# UNMASKED preset (config/examples/subject_likeness_flux2_klein9b.yaml):
+# LoKr 32/32 (conv 16/16, full-rank, factor 8) + weight_noise (relative,
+# sigma 0.0125) + adamw8bit + flowmatch/linear + bf16 + qfloat8 + 1200 steps.
+# lr overridden to 1e-4 (preset was 5e-5).
+#
+# Adapted for LTX-2.3 video (vs the image preset):
+#   - trainer: sd_trainer (the class that supports video + weight_noise + LoKr;
+#     the preset's diffusion_trainer is the image-side class).
+#   - dataset: single 320x240 clip; single resolution + num_frames (not the
+#     512/768/1024 image buckets); batch_size 1 (video memory, preset used 4).
+#   - face_id / subject_mask: OFF (as in the unmasked preset).
+# depth_consistency is ON (full-frame, mask_source: none) — that is the POINT
+# of this run: exercise the depth-consistency loss on LTX-2.3 video.
+---
+job: extension
+config:
+  name: "ltx23_cartwheel_lokr"
+  process:
+    - type: 'sd_trainer'
+      training_folder: "output"
+      device: cuda:0
+      trigger_word: null
+      performance_log_every: 10
+      network:
+        type: "lokr"
+        linear: 32
+        linear_alpha: 32
+        conv: 16
+        conv_alpha: 16
+        lokr_full_rank: true
+        lokr_factor: 8
+        network_kwargs:
+          ignore_if_contains: []
+      save:
+        dtype: bf16
+        save_every: 100
+        max_step_saves_to_keep: 6
+        save_format: diffusers
+        push_to_hub: false
+      datasets:
+        - folder_path: "test_data/cartwheel_gimnasia"   # single clip + its .txt caption
+          caption_ext: txt
+          caption_dropout_rate: 0.05
+          cache_latents_to_disk: true
+          is_reg: false
+          network_weight: 1
+          resolution: [512]            # single res (source is 320x240); ÷32 bucketing
+          num_frames: 49               # 8n+1; sampled evenly across the 119-frame clip
+          shrink_video_to_frames: true
+          fps: 24
+          do_i2v: true
+          do_audio: false              # clip has no audio stream
+          num_repeats: 1
+          diffusion_loss_weight: 1
+          depth_loss_weight: 0.005
+          loss_split: sum
+      train:
+        weight_noise:                  # headline feature of the preset
+          enabled: true
+          mode: relative
+          sigma: 0.0125
+          log_every: 1
+        max_grad_norm: 1
+        batch_size: 1
+        steps: 1200
+        gradient_accumulation: 1
+        train_unet: true
+        train_text_encoder: false
+        gradient_checkpointing: true
+        noise_scheduler: flowmatch
+        optimizer: adamw8bit
+        timestep_type: linear
+        content_or_style: balanced
+        optimizer_params:
+          weight_decay: 0.0001
+        cache_text_embeddings: true
+        lr: 1e-4                        # your override (preset was 5e-5)
+        ema_config:
+          use_ema: false
+        skip_first_sample: false
+        force_first_sample: true        # baseline sample before training
+        disable_sampling: false
+        dtype: bf16
+        loss_type: mse
+      model:
+        name_or_path: "Lightricks/LTX-2.3-fp8/ltx-2.3-22b-dev-fp8.safetensors"
+        arch: 'ltx2.3'
+        quantize: true
+        qtype: qfloat8
+        quantize_te: true
+        qtype_te: qfloat8
+        low_vram: false
+        layer_offloading: false
+      sample:
+        sampler: flowmatch
+        sample_every: 100
+        width: 512
+        height: 384                     # ~4:3 to match the clip; ÷32
+        num_frames: 49
+        fps: 24
+        samples:
+          - prompt: "Video of a man doing a cartwheel in a gymnasium. the camera tracks as he moves from right to left"
+          - prompt: "Video of a woman doing a cartwheel on a beach at sunset, the camera tracks as she moves from left to right"
+        neg: ""
+        seed: 42
+        walk_seed: false
+        guidance_scale: 5.0
+        sample_steps: 25
+      face_id:
+        enabled: false
+      depth_consistency:
+        loss_weight: 0.005
+        input_size: 518
+        preview_every: 100          # video previews are heavy; match sample cadence
+        mask_source: none           # full-frame depth (unmasked)
+        loss_max_t: 1
+        loss_min_t: 0
+        model_id: "depth-anything/Depth-Anything-V2-Large-hf"
+        grad_checkpoint: true        # video is memory-heavy; checkpoint the depth path
+        ssi_weight: 0
+        grad_weight: 1
+        grad_scales: 6
+      subject_mask:
+        enabled: false
+  meta:
+    name: "[name]"
+    version: '1.0'

@@ -1,0 +1,70 @@
+# Short LTX-2.3 validation run for an 80GB GPU (RunPod A100/H100).
+# Proves end-to-end on real hardware: load (incl. BWE vocoder) -> cache latents
+# (+ first frame for i2v) -> finite-loss steps -> t2v sample via LTX2Pipeline ->
+# LoRA saved. Kept to ~10 steps + 1 sample to minimize pod cost. Dataset is the
+# silent fixture clips shipped in the repo, so the run is self-contained.
+---
+job: extension
+config:
+  name: "ltx23_runpod_validate"
+  process:
+    - type: 'sd_trainer'
+      training_folder: "output"
+      device: cuda:0
+      network:
+        type: "lora"
+        linear: 16
+        linear_alpha: 16
+      save:
+        dtype: float16
+        save_every: 10
+        max_step_saves_to_keep: 1
+      datasets:
+        - folder_path: "test_data/dance_clips"
+          caption_ext: "txt"
+          default_caption: "a person dancing"
+          caption_dropout_rate: 0.0
+          resolution: [512]
+          num_frames: 49           # 8n+1
+          shrink_video_to_frames: true
+          fps: 24
+          do_i2v: true             # exercise first-frame conditioning
+          do_audio: false          # audio path already validated on CPU; skip backend risk here
+      train:
+        batch_size: 1
+        steps: 10
+        gradient_accumulation: 1
+        train_unet: true
+        train_text_encoder: false
+        gradient_checkpointing: true
+        noise_scheduler: "flowmatch"
+        timestep_type: 'linear'
+        optimizer: "adamw8bit"
+        lr: 1e-4
+        dtype: bf16
+        cache_text_embeddings: true
+      model:
+        name_or_path: "Lightricks/LTX-2.3-fp8/ltx-2.3-22b-dev-fp8.safetensors"
+        arch: 'ltx2.3'
+        quantize: true
+        qtype: "qfloat8"
+        quantize_te: true
+        qtype_te: "qfloat8"
+        low_vram: false
+      sample:
+        sampler: "flowmatch"
+        sample_every: 10
+        width: 512
+        height: 512
+        num_frames: 25           # 8n+1; small to keep the sample cheap
+        fps: 24
+        prompts:
+          - "a person dancing in a sunlit studio, smooth motion"
+        neg: ""
+        seed: 42
+        walk_seed: false
+        guidance_scale: 5.0
+        sample_steps: 20
+  meta:
+    name: "[name]"
+    version: '1.0'

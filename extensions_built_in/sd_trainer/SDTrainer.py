@@ -52,6 +52,7 @@ from toolkit.depth_consistency import (
     cache_depth_gt_embeddings,
     cache_video_depth_gt_embeddings,
     load_taehv_wan21,
+    load_taehv_ltx2,
     decode_wan_x0_to_frames,
     save_video_depth_preview,
 )
@@ -3854,13 +3855,25 @@ class SDTrainer(BaseSDTrainProcess):
             _dc_pure_preview = (not _dc_active.any().item()) and _dc_preview_only_active.any().item()
 
             if _dc_any_to_process.any():
-                # Lazy-load TAEHV on first video step — keeps image-only runs lean.
+                # Lazy-load the tiny video decoder on first video step (keeps
+                # image-only runs lean). Pick the decoder matching the model's
+                # latent space: LTX-2/2.3 (128-ch, taeltx) vs Wan 2.1 (16-ch).
                 if self._wan_depth_decoder is None:
-                    print_acc("DepthConsistency (video): loading TAEHV tiny decoder...")
-                    self._wan_depth_decoder = load_taehv_wan21(
-                        device=self.device_torch,
-                        dtype=get_torch_dtype(self.train_config.dtype),
-                    )
+                    _dc_arch = (getattr(self.sd.model_config, 'arch', '') or '')
+                    if _dc_arch.startswith('ltx'):
+                        _dc_ltx_ver = str(getattr(self.sd, 'ltx_version', '2.3'))
+                        print_acc(f"DepthConsistency (video): loading TAEHV LTX-{_dc_ltx_ver} tiny decoder...")
+                        self._wan_depth_decoder = load_taehv_ltx2(
+                            device=self.device_torch,
+                            dtype=get_torch_dtype(self.train_config.dtype),
+                            version=_dc_ltx_ver,
+                        )
+                    else:
+                        print_acc("DepthConsistency (video): loading TAEHV tiny decoder...")
+                        self._wan_depth_decoder = load_taehv_wan21(
+                            device=self.device_torch,
+                            dtype=get_torch_dtype(self.train_config.dtype),
+                        )
 
                 # x0 recovery (flow-matching only — Wan 2.1 uses flowmatch).
                 if self.sd.is_flow_matching:

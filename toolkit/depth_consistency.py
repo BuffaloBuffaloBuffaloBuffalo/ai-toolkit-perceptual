@@ -546,6 +546,36 @@ def load_taehv_wan21(device: str = "cuda", dtype: torch.dtype = torch.bfloat16):
     return tae
 
 
+def load_taehv_ltx2(device: str = "cuda", dtype: torch.dtype = torch.bfloat16, version: str = "2.3"):
+    """Load TAEHV tiny decoder for LTX-2 / LTX-2.3 latents (128-channel).
+
+    LTX counterpart of load_taehv_wan21. The TAEHV class auto-configures
+    patch_size=4 / latent_channels=128 when the checkpoint name contains
+    'taeltx'. madebyollin ships separate weights per generation:
+    ``taeltx2_3.pth`` (LTX-2.3) and ``taeltx_2.pth`` (LTX-2.0). Output is
+    [0, 1] directly (no latents_mean/std denormalization, same as the Wan
+    path). Weights live in ``toolkit/taehv/`` and are auto-downloaded if
+    missing (they are gitignored).
+    """
+    import sys
+    _here = os.path.dirname(os.path.abspath(__file__))
+    _taehv_dir = os.path.join(_here, "taehv")
+    if _taehv_dir not in sys.path:
+        sys.path.insert(0, _taehv_dir)
+    from taehv import TAEHV  # noqa: E402
+    fname = "taeltx2_3.pth" if str(version) == "2.3" else "taeltx_2.pth"
+    ckpt = os.path.join(_taehv_dir, fname)
+    if not os.path.exists(ckpt):
+        import urllib.request
+        url = f"https://raw.githubusercontent.com/madebyollin/taehv/main/{fname}"
+        print(f"DepthConsistency: downloading LTX tiny decoder {fname} from {url} ...")
+        urllib.request.urlretrieve(url, ckpt)
+    tae = TAEHV(checkpoint_path=ckpt).to(device).to(dtype).eval()
+    for p in tae.parameters():
+        p.requires_grad_(False)
+    return tae
+
+
 def decode_wan_x0_to_frames(
     x0_latents: torch.Tensor,
     decoder,

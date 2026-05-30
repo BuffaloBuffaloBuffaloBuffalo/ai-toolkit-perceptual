@@ -155,11 +155,13 @@ class Flux2Model(BaseModel):
 
         transformer.load_state_dict(transformer_state_dict, assign=True)
 
-        transformer.to(self.quantize_device, dtype=dtype)
-
         if self.model_config.quantize:
             # patch the state dict method
             patch_dequantization_on_save(transformer)
+            # Avoid full-model peak VRAM allocation before quantization.
+            # quantize_model() moves blocks to GPU one at a time, so the
+            # transformer must stay on CPU here (do not move to quantize_device).
+            self.print_and_status_update("Keeping transformer on CPU for quantization")
             self.print_and_status_update("Quantizing Transformer")
             quantize_model(self, transformer)
             flush()
@@ -233,11 +235,19 @@ class Flux2Model(BaseModel):
         tokenizer = [pipe.tokenizer]
 
         flush()
-        # just to make sure everything is on the right device and dtype
-        text_encoder[0].to(self.device_torch)
+        # just to make sure everything is on the right device and dtype.
+        # in low_vram mode keep both on CPU; they are streamed to GPU on demand
+        # (layer offloading / per-call .to()) so we don't blow the VRAM budget here.
+        if self.model_config.low_vram:
+            text_encoder[0].to("cpu")
+        else:
+            text_encoder[0].to(self.device_torch)
         text_encoder[0].requires_grad_(False)
         text_encoder[0].eval()
-        pipe.transformer = pipe.transformer.to(self.device_torch)
+        if self.model_config.low_vram:
+            pipe.transformer = pipe.transformer.to("cpu")
+        else:
+            pipe.transformer = pipe.transformer.to(self.device_torch)
         flush()
 
         # save it to the model class

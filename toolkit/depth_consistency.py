@@ -20,6 +20,7 @@ from typing import List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 from tqdm import tqdm
 
@@ -70,6 +71,29 @@ def _load_then_close(cache_path: str) -> dict:
     del existing
     gc.collect()
     return copied
+
+
+def _read_cached_tensor(cache_path: str, key: str, version_key: str):
+    """Lean cache-HIT read: pull a single tensor by ``key`` without loading or
+    cloning the rest of the file, and without forcing a GC pass.
+
+    The full-file ``load_file`` + clone-all + ``gc.collect()`` in
+    ``_load_then_close`` exists only to release the mmap before an in-place
+    rewrite (the write path). The read/hit path never rewrites the file, so
+    none of that is needed — and a per-item ``gc.collect()`` turns cache reuse
+    into an O(N^2) heap walk that starves the loop with no GPU work (pure CPU,
+    no VRAM). ``safe_open`` reads only the header for ``keys()`` and only the
+    requested tensor's bytes for ``get_tensor()``; the returned tensor owns its
+    storage and the file is closed on context exit, so no mmap lingers.
+
+    Returns the tensor when both ``key`` and ``version_key`` are present, else
+    None (caller falls through to recompute).
+    """
+    with safe_open(cache_path, framework="pt", device="cpu") as f:
+        keys = f.keys()
+        if key in keys and version_key in keys:
+            return f.get_tensor(key)
+    return None
 
 
 def _blur_cache_suffix(sigma: float) -> str:
@@ -454,9 +478,9 @@ def cache_depth_gt_embeddings(
             depth_key = f"depth_gt{_blur_sfx}"
 
         if os.path.exists(cache_path):
-            data = _load_then_close(cache_path)
-            if depth_key in data and CACHE_VERSION_KEY in data:
-                file_item.depth_gt = data[depth_key].clone()
+            cached = _read_cached_tensor(cache_path, depth_key, CACHE_VERSION_KEY)
+            if cached is not None:
+                file_item.depth_gt = cached
                 continue
 
         # v2: run DA2 on the *dataloader-transformed* pixels so cached depth
@@ -677,13 +701,13 @@ def cache_video_depth_gt_embeddings(
 
         # Cache hit: reuse if version matches AND cached T == requested T.
         if os.path.exists(cache_path):
-            data = _load_then_close(cache_path)
-            if (
-                video_depth_key in data
-                and CACHE_VERSION_VIDEO_KEY in data
-                and (num_frames is None or data[video_depth_key].shape[0] == num_frames)
+            cached = _read_cached_tensor(
+                cache_path, video_depth_key, CACHE_VERSION_VIDEO_KEY
+            )
+            if cached is not None and (
+                num_frames is None or cached.shape[0] == num_frames
             ):
-                file_item.depth_gt_video = data[video_depth_key].clone()
+                file_item.depth_gt_video = cached
                 continue
 
         # Read frames sequentially — cv2's CAP_PROP_FRAME_COUNT over-reports by

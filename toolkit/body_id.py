@@ -218,6 +218,23 @@ class DifferentiableBodyProportionEncoder(nn.Module):
     VIS_THRESHOLD = 0.2  # minimum visibility to trust a keypoint
 
     @staticmethod
+    def _heatmaps_to_coords(heatmaps: torch.Tensor) -> torch.Tensor:
+        """Differentiable soft-argmax for ViTPose's (unnormalized, ~Gaussian) heatmaps.
+
+        ViTPose heatmaps are non-negative blobs that sum to ~20, NOT a probability
+        distribution, so ``dsntnn.dsnt(heatmaps)`` directly computes a meaningless
+        centroid (~800 px off the true peak in a 256x192 input — every keypoint
+        wrong). Integral regression fixes it: clamp to >=0, normalize each
+        keypoint's heatmap to a spatial distribution, then take its expectation.
+        Matches the argmax peak to ~3 px (within the 4-px heatmap grid) while
+        staying smoothly differentiable. Returns ``(B, K, 2)`` in [-1, 1].
+        """
+        import dsntnn
+        hm = heatmaps.clamp(min=0)
+        hm = hm / hm.sum(dim=(2, 3), keepdim=True).clamp(min=1e-6)
+        return dsntnn.dsnt(hm)
+
+    @staticmethod
     def _compute_ratios(
         keypoints: torch.Tensor,
         visibilities: torch.Tensor,
@@ -347,7 +364,7 @@ class DifferentiableBodyProportionEncoder(nn.Module):
         heatmaps = outputs.heatmaps.float()  # (1, 17, 64, 48)
 
         # Differentiable coordinates in [-1, 1]
-        coords = dsntnn.dsnt(heatmaps)  # (1, 17, 2)
+        coords = self._heatmaps_to_coords(heatmaps)  # (1, 17, 2) integral regression
         # Confidence from heatmap peaks
         confidence = heatmaps.flatten(2).max(dim=2).values  # (1, 17)
 
@@ -427,7 +444,7 @@ class DifferentiableBodyProportionEncoder(nn.Module):
                 heatmaps = self.model(sample.to(model_dtype), dataset_index=torch.tensor([0], device=sample.device)).heatmaps.float()
 
                 # Differentiable coordinates in [-1, 1]
-                coords = dsntnn.dsnt(heatmaps)  # (1, 17, 2)
+                coords = self._heatmaps_to_coords(heatmaps)  # (1, 17, 2) integral regression
                 confidence = heatmaps.flatten(2).max(dim=2).values.detach()  # (1, 17) — detach to prevent gradient through peak values (causes green dot artifacts)
 
                 all_kp.append(coords)
@@ -542,7 +559,9 @@ def cache_body_proportion_embeddings(
 
     include_head = getattr(face_id_config, 'body_proportion_include_head', False)
     # Cache version key: v3 = with head ratios, v2 = body only
-    CACHE_VERSION_KEY = 'body_proportion_v3_head' if include_head else 'body_proportion_v2'
+    # v4/v3: integral-regression keypoints (fixed the dsnt-on-raw-heatmaps bug);
+    # old caches stored garbage ratios and must be recomputed.
+    CACHE_VERSION_KEY = 'body_proportion_v4_head' if include_head else 'body_proportion_v3'
 
     for file_item in tqdm(file_items, desc="Caching body proportion embeddings"):
         img_dir = os.path.dirname(file_item.path)
@@ -658,7 +677,7 @@ def cache_video_body_proportion_embeddings(
 
     include_head = getattr(face_id_config, 'body_proportion_include_head', False)
     gt_key = "body_proportion_gt_video_head" if include_head else "body_proportion_gt_video"
-    version_key = f"{gt_key}_v1"
+    version_key = f"{gt_key}_v2"  # v2: integral-regression keypoints (dsnt bug fix)
 
     print(f"  -  Loading ViTPose for GT video body-proportion caching ({len(video_items)} videos)...")
     encoder = DifferentiableBodyProportionEncoder()

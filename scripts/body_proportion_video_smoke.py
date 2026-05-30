@@ -118,7 +118,7 @@ def main():
         assert float(ref_vis_cpu.sum()) > 0, "no body detected in any frame (bad test image?)"
         cache_path = os.path.join(tmp, "_face_id_cache", "body.safetensors")
         data = load_file(cache_path)
-        assert "body_proportion_gt_video" in data and "body_proportion_gt_video_v1" in data
+        assert "body_proportion_gt_video" in data and "body_proportion_gt_video_v2" in data
         print(f"  GT {tuple(gt.shape)} (N={n} ratios) vis_sum={float(ref_vis_cpu.sum()):.2f} cache OK  {fmt_mem()}")
 
         # --- 2 + 3. self-consistency + sensitivity ---

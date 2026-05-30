@@ -7,7 +7,7 @@ An extension of [AI Toolkit by Ostris](https://github.com/ostris/ai-toolkit) tha
 
 These can be used independently or together. Weight noising is the bigger practical win for subject-likeness LoRAs; perceptual anchoring is the bigger win when you need geometric/structural control.
 
-**Supported models:** SDXL, FLUX.2 Klein 9B, Z-Image Turbo (experimental, see [Z-Image Turbo](#z-image-turbo-experimental))
+**Supported models:** SDXL, FLUX.2 Klein 9B, Z-Image Turbo (experimental, see [Z-Image Turbo](#z-image-turbo-experimental)), LTX-2.3 video (experimental, see [LTX-2.3 Video](#ltx-23-video-experimental))
 
 ## Contents
 
@@ -20,6 +20,7 @@ These can be used independently or together. Weight noising is the bigger practi
 - [Dataset-Tools UI](#dataset-tools-ui): preflight passes for masks, depth, faces
 - [Quickstart Templates](#quickstart-templates): UI presets for validated configs
 - [Z-Image Turbo (experimental)](#z-image-turbo-experimental): early support, current best-guess settings, ComfyUI inference tip
+- [LTX-2.3 Video (experimental)](#ltx-23-video-experimental): early video training support, example configs
 - [Tips and Tricks](#tips-and-tricks): empirical patterns from training runs
 - [Examples](#examples)
   - [Sketchwave Style (single-image style LoRA)](#example-sketchwave-style-single-image-style-lora)
@@ -337,6 +338,10 @@ A few notes:
 For inference, [RES_2S](https://github.com/ClownsharkBatwing/RES4LYF) at 8 steps tends to look noticeably cleaner than the default Euler/DPM samplers most ComfyUI workflows use. Fine eye and iris detail holds up better.
 
 The trainer uses a fixed `shift=3.0` rather than the dynamic shifting `diffusers.ZImagePipeline` defaults to. That matches the ComfyUI workflow, so trained LoRAs look right there; the mismatch is preview-only.
+
+## LTX-2.3 Video (experimental)
+
+Early support for training LoRAs on LTX-2.3 (22B), the video model, including the depth-consistency anchor applied across frames. It's fresh and only lightly tested, so treat the example configs as starting points rather than tuned recipes. Grab one from `config/examples/` to start: `train_lora_ltx23_24gb_smoke.yaml` for a quick smoke test, `train_lora_ltx23_80gb.yaml` for a real run, or `train_ltx23_cartwheel_lokr.yaml` for a worked example. If you find settings that hold up, [open an issue](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/issues) with your config and samples.
 
 ## Tips and Tricks
 

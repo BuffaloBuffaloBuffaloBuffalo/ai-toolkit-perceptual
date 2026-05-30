@@ -250,6 +250,13 @@ class DataLoaderBatchDTO:
             self.depth_gt_list: Union[list, None] = None
             # Depth consistency loss (video): per-video GT depth cubes, (T, H, W)
             self.depth_gt_video_list: Union[list, None] = None
+            # Identity loss (video): per-frame ArcFace GT cube (T, 512), normalized
+            # face bbox (T, 4) and validity mask (T,) — one entry per file item.
+            self.identity_gt_video_list: Union[list, None] = None
+            self.identity_gt_video_bbox_list: Union[list, None] = None
+            self.identity_gt_video_valid_list: Union[list, None] = None
+            # Body-proportion loss (video): per-frame ViTPose GT cubes (T, 2N).
+            self.body_proportion_gt_video_list: Union[list, None] = None
             self.normal_embedding: Union[torch.Tensor, None] = None
             self.vae_anchor_features: Union[Dict, None] = None  # per-level VAE encoder features
             self.face_bboxes: Union[List, None] = None  # per-item face bboxes in original image coords
@@ -672,6 +679,24 @@ class DataLoaderBatchDTO:
                     getattr(x, 'depth_gt_video', None) for x in self.file_items
                 ]
 
+            # collect per-frame GT identity cubes for video items (T, 512) fp16
+            if any([getattr(x, 'identity_gt_video', None) is not None for x in self.file_items]):
+                self.identity_gt_video_list = [
+                    getattr(x, 'identity_gt_video', None) for x in self.file_items
+                ]
+                self.identity_gt_video_bbox_list = [
+                    getattr(x, 'identity_gt_video_bbox', None) for x in self.file_items
+                ]
+                self.identity_gt_video_valid_list = [
+                    getattr(x, 'identity_gt_video_valid', None) for x in self.file_items
+                ]
+
+            # collect per-frame GT body-proportion cubes for video items (T, 2N)
+            if any([getattr(x, 'body_proportion_gt_video', None) is not None for x in self.file_items]):
+                self.body_proportion_gt_video_list = [
+                    getattr(x, 'body_proportion_gt_video', None) for x in self.file_items
+                ]
+
             # collect normal embeddings (Sapiens normal maps, for normal loss)
             if any([getattr(x, 'normal_embedding', None) is not None for x in self.file_items]):
                 nm_embeds = []
@@ -803,6 +828,10 @@ class DataLoaderBatchDTO:
         del self.body_shape_embedding
         del self.depth_gt_list
         del self.depth_gt_video_list
+        del self.identity_gt_video_list
+        del self.identity_gt_video_bbox_list
+        del self.identity_gt_video_valid_list
+        del self.body_proportion_gt_video_list
         del self.normal_embedding
         del self.vae_anchor_features
         del self.face_bboxes

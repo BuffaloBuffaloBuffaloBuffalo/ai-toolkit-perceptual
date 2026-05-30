@@ -1015,6 +1015,16 @@ class FaceIDConfig:
         self.identity_loss_num_refs: int = kwargs.get('identity_loss_num_refs', 0)
         # Track identity metrics even when identity_loss_weight is 0
         self.identity_metrics: bool = kwargs.get('identity_metrics', False)
+        # --- Video (5D) identity loss: per-frame ArcFace over decoded frames ---
+        # Frames per chunk through the ArcFace encoder under gradient
+        # checkpointing (r50 is heavier than DA2-Small; keep this small).
+        self.identity_loss_frames_per_chunk: int = kwargs.get('identity_loss_frames_per_chunk', 4)
+        # Save an animated-webp identity preview every N steps (0 = never).
+        self.identity_loss_preview_every: int = kwargs.get('identity_loss_preview_every', 0)
+        # Video GT is built from the DECODED clip; a frame is only used as a target
+        # if the detector finds a face in the decoded frame with det_score >= this.
+        # Raise to drop frames the tiny decoder blurs past recognition.
+        self.identity_loss_decoded_det_threshold: float = kwargs.get('identity_loss_decoded_det_threshold', 0.5)
         # Auxiliary landmark shape loss via MediaPipe FaceMesh landmarks
         self.landmark_loss_weight: float = kwargs.get('landmark_loss_weight', 0.0)  # 0 = disabled
         # Auxiliary body proportion loss via MediaPipe BlazePose bone-length ratios
@@ -1022,6 +1032,11 @@ class FaceIDConfig:
         self.body_proportion_loss_min_t: float = kwargs.get('body_proportion_loss_min_t', 0.0)
         self.body_proportion_loss_max_t: float = kwargs.get('body_proportion_loss_max_t', 1.0)
         self.body_proportion_include_head: bool = kwargs.get('body_proportion_include_head', False)
+        # --- Video (5D) body-proportion loss: per-frame ViTPose over decoded frames ---
+        # Frames per chunk through the ViTPose encoder under gradient
+        # checkpointing (ViTPose-base is heavy; keep this small).
+        self.body_proportion_frames_per_chunk: int = kwargs.get('body_proportion_frames_per_chunk', 2)
+        self.body_proportion_preview_every: int = kwargs.get('body_proportion_preview_every', 0)
         # Auxiliary body shape loss via HybrIK SMPL beta prediction
         self.body_shape_loss_weight: float = kwargs.get('body_shape_loss_weight', 0.0)  # 0 = disabled
         self.body_shape_loss_min_t: float = kwargs.get('body_shape_loss_min_t', 0.4)

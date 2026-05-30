@@ -668,8 +668,7 @@ def cache_video_depth_gt_embeddings(
             cached T lines up with the decoded x0 T at training time.
         batch_size: frames per DA2 forward pass during caching.
     """
-    import cv2
-    import numpy as np
+    from toolkit.video_frames import read_video_frames_with_transform
 
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -710,62 +709,13 @@ def cache_video_depth_gt_embeddings(
                 file_item.depth_gt_video = cached
                 continue
 
-        # Read frames sequentially — cv2's CAP_PROP_FRAME_COUNT over-reports by
-        # 1 on some AVI containers and POS_FRAMES seek to the reported last
-        # frame fails silently. Sequential decode gives the actual count.
-        cap = cv2.VideoCapture(file_item.path)
-        all_frames_bgr = []
-        while True:
-            ok, fr = cap.read()
-            if not ok:
-                break
-            all_frames_bgr.append(fr)
-        cap.release()
-        total = len(all_frames_bgr)
-        if total == 0:
+        # Read + transform frames exactly as the dataloader does (flip → resize
+        # → crop), uniformly subsampled to num_frames so cached T matches the
+        # decoded x0 T at training time.
+        video_tensor = read_video_frames_with_transform(file_item, num_frames)
+        if video_tensor is None:
             print(f"  -  Warning: cannot read video frames: {file_item.path}")
             continue
-
-        if num_frames is not None and num_frames < total:
-            indices = np.linspace(0, total - 1, num_frames, dtype=int)
-        else:
-            indices = np.arange(total)
-
-        # v2: apply dataloader flip + resize + crop per frame so cached depth
-        # matches the training video tensor. Same chain used for images.
-        from PIL import Image as _PILImage
-        flip_x = bool(getattr(file_item, 'flip_x', False))
-        flip_y = bool(getattr(file_item, 'flip_y', False))
-
-        frames = []
-        for idx in indices:
-            fr = all_frames_bgr[int(idx)]
-            fr_rgb = cv2.cvtColor(fr, cv2.COLOR_BGR2RGB)
-            pil = _PILImage.fromarray(fr_rgb)
-            # Per-frame transform (flip happens before resize+crop — same as
-            # dataloader_mixins.load_and_process_video).
-            if flip_x:
-                pil = pil.transpose(_PILImage.FLIP_LEFT_RIGHT)
-            if flip_y:
-                pil = pil.transpose(_PILImage.FLIP_TOP_BOTTOM)
-            stw = getattr(file_item, 'scale_to_width', None)
-            sth = getattr(file_item, 'scale_to_height', None)
-            cx = getattr(file_item, 'crop_x', None)
-            cy = getattr(file_item, 'crop_y', None)
-            cw = getattr(file_item, 'crop_width', None)
-            ch = getattr(file_item, 'crop_height', None)
-            if None not in (stw, sth, cx, cy, cw, ch):
-                pil = pil.resize((int(stw), int(sth)), _PILImage.BICUBIC)
-                pil = pil.crop((int(cx), int(cy),
-                                int(cx) + int(cw), int(cy) + int(ch)))
-            frame_arr = np.asarray(pil, dtype=np.float32) / 255.0
-            frames.append(torch.from_numpy(frame_arr).permute(2, 0, 1))
-
-        if not frames:
-            print(f"  -  Warning: no frames read from {file_item.path}")
-            continue
-
-        video_tensor = torch.stack(frames)  # (T, 3, H, W)
 
         # Per-frame depth via DA2, no-grad, batched. Blur (if configured)
         # is applied per-batch in pixel space so the cached GT depth matches

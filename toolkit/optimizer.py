@@ -97,6 +97,14 @@ def get_optimizer(
     elif lower_type == 'automagic':
         from toolkit.optimizers.automagic import Automagic
         optimizer = Automagic(params, lr=float(learning_rate), **optimizer_params)
+    elif lower_type == 'rose':
+        # Range-Of-Slice Equilibration optimizer (Kieren 2026, Apache 2.0).
+        # Stateless: no per-param momentum/variance buffers; uses per-slice
+        # |max| - min as the gradient denominator. See toolkit/optimizers/rose.py
+        # for the full docstring + recommended hyperparams. LR must be tuned
+        # independently — Adam defaults are NOT appropriate.
+        from toolkit.optimizers.rose import Rose
+        optimizer = Rose(params, lr=float(learning_rate), **optimizer_params)
     else:
         raise ValueError(f'Unknown optimizer type {optimizer_type}')
     return optimizer

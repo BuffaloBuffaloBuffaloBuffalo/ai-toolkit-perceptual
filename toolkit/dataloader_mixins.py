@@ -12,6 +12,7 @@ import traceback
 import cv2
 import numpy as np
 import torch
+from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 from tqdm import tqdm
 from transformers import CLIPImageProcessor, CLIPVisionModelWithProjection, SiglipImageProcessor
@@ -746,6 +747,15 @@ class ImageProcessingDTOMixin:
         # handle get_prompt_embedding
         if self.is_text_embedding_cached:
             self.load_prompt_embedding()
+        # DepthConsistency GT: read the cached depth map(s) here — in the
+        # DataLoader worker, overlapped with training — rather than during the
+        # serial up-front caching pass. No-op unless this item is depth-cached.
+        # Sits above the latent-cached / video early-returns so every path is
+        # covered.
+        if self.is_depth_cached:
+            self.get_depth_gt()
+        if self.is_depth_video_cached:
+            self.get_depth_gt_video()
         # if we are caching latents, just do that
         if self.is_latent_cached:
             self.get_latent()
@@ -1819,6 +1829,82 @@ class LatentCachingFileItemDTOMixin:
             if 'audio_latent' in state_dict:
                 self._cached_audio_latent = state_dict['audio_latent']
         return self._encoded_latent
+
+
+class DepthCachingFileItemDTOMixin:
+    def __init__(self, *args, **kwargs):
+        # if we have super, call it
+        if hasattr(super(), '__init__'):
+            super().__init__(*args, **kwargs)
+        # DepthConsistency GT depth maps. The up-front caching pass
+        # (toolkit.depth_consistency) records the cache path + bucket key here
+        # WITHOUT reading the tensor; the heavy per-file read is deferred to
+        # get_depth_gt(), called from load_and_process_image() in the
+        # DataLoader worker. This mirrors the latent / text-embedding caches,
+        # whose hit path is a bare os.path.exists() — keeping the up-front pass
+        # header/stat-bound instead of materializing every map into RAM
+        # serially on the main process.
+        self.depth_gt: Union[torch.Tensor, None] = None
+        self.is_depth_cached = False
+        self._depth_cache_path: Union[str, None] = None
+        self._depth_cache_key: Union[str, None] = None
+        # video counterpart: (T, H, W) GT depth cube, same lazy contract
+        self.depth_gt_video: Union[torch.Tensor, None] = None
+        self.is_depth_video_cached = False
+        self._depth_video_cache_path: Union[str, None] = None
+        self._depth_video_cache_key: Union[str, None] = None
+
+    @staticmethod
+    def _read_depth_key(cache_path, key):
+        # Read a single tensor by key without loading the rest of the file.
+        # The depth cache lives in _face_id_cache/{stem}.safetensors alongside
+        # face/body/shape embeddings and every bucket's depth map, so load_file
+        # would pull all of that; safe_open reads only the header for keys()
+        # and only the requested tensor's bytes for get_tensor(). The file is
+        # closed on context exit so no mmap lingers. Returns None on a missing
+        # key / unreadable file (caller treats it as "not cached").
+        if cache_path is None or key is None:
+            return None
+        try:
+            with safe_open(cache_path, framework="pt", device="cpu") as f:
+                if key in f.keys():
+                    return f.get_tensor(key)
+        except Exception:  # noqa: BLE001 — unreadable/corrupt cache
+            return None
+        return None
+
+    def get_depth_gt(self: 'FileItemDTO'):
+        """Lazily load this item's cached GT depth map (image path).
+
+        Returns None when the item isn't depth-cached. Reads from disk only on
+        first access; the result is held on self.depth_gt until cleanup_depth()
+        releases it between batches (mirrors get_latent's disk-cache contract).
+        """
+        if not self.is_depth_cached:
+            return self.depth_gt
+        if self.depth_gt is None:
+            self.depth_gt = self._read_depth_key(self._depth_cache_path, self._depth_cache_key)
+        return self.depth_gt
+
+    def get_depth_gt_video(self: 'FileItemDTO'):
+        """Lazily load this item's cached GT depth cube (video path)."""
+        if not self.is_depth_video_cached:
+            return self.depth_gt_video
+        if self.depth_gt_video is None:
+            self.depth_gt_video = self._read_depth_key(
+                self._depth_video_cache_path, self._depth_video_cache_key
+            )
+        return self.depth_gt_video
+
+    def cleanup_depth(self: 'FileItemDTO'):
+        # Release the resident map(s) between batches when backed by a disk
+        # cache — they're re-read on next access in the worker. Without this,
+        # deferred maps re-accumulate into the all-resident RAM footprint the
+        # lazy load was meant to eliminate.
+        if self.is_depth_cached:
+            self.depth_gt = None
+        if self.is_depth_video_cached:
+            self.depth_gt_video = None
 
 
 class LatentCachingMixin:

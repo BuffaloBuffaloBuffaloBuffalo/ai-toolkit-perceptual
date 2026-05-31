@@ -213,43 +213,67 @@ function UploadCard({ onUploaded }: { onUploaded: () => void }) {
   const [error, setError] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
-  const upload = () => {
+  const upload = async () => {
     if (!file || uploading) return;
+    const f = file;
     setError(null);
     setProgress(0);
     setUploading(true);
-    const xhr = new XMLHttpRequest();
-    xhr.upload.addEventListener('progress', e => {
-      if (e.lengthComputable) setProgress(e.loaded / e.total);
-    });
-    xhr.addEventListener('load', () => {
-      setUploading(false);
-      if (xhr.status >= 200 && xhr.status < 300) {
-        setFile(null);
-        setProgress(0);
-        if (inputRef.current) inputRef.current.value = '';
-        onUploaded();
-      } else {
-        try {
-          const body = JSON.parse(xhr.responseText);
-          setError(body.error || `HTTP ${xhr.status}`);
-        } catch {
-          setError(`HTTP ${xhr.status}`);
-        }
-      }
-    });
-    xhr.addEventListener('error', () => {
-      setUploading(false);
-      setError('Network error');
-    });
-    xhr.open('POST', '/api/models/upload');
+
+    // Upload in sub-cap chunks: RunPod fronts pods with Cloudflare, which 400s a
+    // single multi-GB request body at the edge. Each chunk is its own request
+    // (well under the limit); the server appends them at their byte offset and
+    // renames into place on the last one.
+    const CHUNK_BYTES = 50 * 1024 * 1024; // 50 MiB — safely under the ~100MB edge cap
     // Mirror what apiClient adds — the project's auth interceptor lives in
     // axios, not in raw XHR, so we have to plumb the token through ourselves.
     const token = typeof window !== 'undefined' ? localStorage.getItem('AI_TOOLKIT_AUTH') : null;
-    if (token) xhr.setRequestHeader('Authorization', `Bearer ${token}`);
-    xhr.setRequestHeader('X-Filename', file.name);
-    xhr.setRequestHeader('Content-Type', 'application/octet-stream');
-    xhr.send(file);
+    const totalChunks = Math.max(1, Math.ceil(f.size / CHUNK_BYTES));
+
+    const sendChunk = (index: number) =>
+      new Promise<void>((resolve, reject) => {
+        const start = index * CHUNK_BYTES;
+        const end = Math.min(f.size, start + CHUNK_BYTES);
+        const xhr = new XMLHttpRequest();
+        xhr.upload.addEventListener('progress', e => {
+          if (e.lengthComputable) setProgress((start + e.loaded) / f.size);
+        });
+        xhr.addEventListener('load', () => {
+          if (xhr.status >= 200 && xhr.status < 300) {
+            setProgress(end / f.size);
+            resolve();
+          } else {
+            try {
+              reject(new Error(JSON.parse(xhr.responseText).error || `HTTP ${xhr.status}`));
+            } catch {
+              reject(new Error(`HTTP ${xhr.status}`));
+            }
+          }
+        });
+        xhr.addEventListener('error', () => reject(new Error('Network error')));
+        xhr.open('POST', '/api/models/upload');
+        if (token) xhr.setRequestHeader('Authorization', `Bearer ${token}`);
+        xhr.setRequestHeader('X-Filename', f.name);
+        xhr.setRequestHeader('X-Total-Chunks', String(totalChunks));
+        xhr.setRequestHeader('X-Chunk-Index', String(index));
+        xhr.setRequestHeader('X-Chunk-Offset', String(start));
+        xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+        xhr.send(f.slice(start, end));
+      });
+
+    try {
+      for (let i = 0; i < totalChunks; i++) {
+        await sendChunk(i);
+      }
+      setFile(null);
+      setProgress(0);
+      if (inputRef.current) inputRef.current.value = '';
+      setUploading(false);
+      onUploaded();
+    } catch (e: any) {
+      setUploading(false);
+      setError(e?.message || 'Upload failed');
+    }
   };
 
   return (

@@ -1564,12 +1564,20 @@ class SDTrainer(BaseSDTrainProcess):
             _vae_scale = float(_vae_cfg.get('scaling_factor', 1.0)) if hasattr(_vae_cfg, 'get') else 1.0
             _vae_shift = float(_vae_cfg.get('shift_factor', 0.0) or 0.0) if hasattr(_vae_cfg, 'get') else 0.0
             _vae_dtype = self.sd.vae.dtype
+            # LTX-2 / Wan VAEs are video autoencoders: encode/decode want a 5D
+            # (B, C, T, H, W) tensor even for a single image. Mirror the LTX
+            # `encode_images` convention (ltx2.py:576) — add a singleton temporal
+            # axis going in and drop it coming out — so the depth GT roundtrip
+            # works for these models. Image-latent VAEs (SD/SDXL/Flux) stay 4D.
+            _vae_wants_5d = (getattr(self.sd.model_config, 'arch', '') or '').startswith(('ltx', 'wan'))
 
             def _vae_roundtrip_for_depth(arr: torch.Tensor) -> torch.Tensor:
                 """[0,1] pixels → VAE encode → trainer decoder → [0,1] pixels."""
                 if next(self.sd.vae.parameters()).device != self.device_torch:
                     self.sd.vae.to(self.device_torch)
                 arr_norm = (arr * 2.0 - 1.0).to(_vae_dtype)
+                if _vae_wants_5d and arr_norm.dim() == 4:
+                    arr_norm = arr_norm.unsqueeze(2)  # (B, C, H, W) -> (B, C, 1, H, W)
                 posterior = self.sd.vae.encode(arr_norm)
                 # Flux 2's VAE.encode returns a Tensor directly; standard
                 # diffusers VAEs return an object with `.latent_dist`. Cover both.
@@ -1605,6 +1613,10 @@ class SDTrainer(BaseSDTrainProcess):
                         unscaled = unscaled + _vae_shift
                     pixels = self.sd.vae.decode(unscaled.to(_vae_dtype)).sample.float()
                     pixels = (pixels + 1.0) * 0.5
+                if pixels.dim() == 5:
+                    # Video VAE decoded back to (B, C, T, H, W); collapse the
+                    # single frame to (B, C, H, W) for the 2D depth encoder.
+                    pixels = pixels[:, :, 0]
                 return pixels.clamp(0, 1)
 
             def _cache_dataset_depth(ds):
@@ -1615,10 +1627,18 @@ class SDTrainer(BaseSDTrainProcess):
                         num_frames=ds.dataset_config.num_frames,
                     )
                 else:
+                    # Video-latent models (LTX-2 / Wan) emit 5D latents even for
+                    # still images, so the live depth loss runs through the 5D
+                    # (video) block, not the 4D image block. Cache the per-image
+                    # v3 roundtrip GT as a single-frame depth cube under the video
+                    # key so that block can consume it; otherwise depth_gt would
+                    # be cached but never read. Image-latent models keep the 4D
+                    # path unchanged.
                     cache_depth_gt_embeddings(
                         ds.file_list, self.depth_consistency_config,
                         device=self.device_torch,
                         vae_roundtrip_fn=_vae_roundtrip_for_depth,
+                        store_as_single_frame_video=_vae_wants_5d,
                     )
 
             if self.data_loader is not None:

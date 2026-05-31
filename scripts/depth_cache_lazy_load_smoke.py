@@ -209,6 +209,86 @@ def smoke_6_deepcopy_is_cheap() -> None:
     print("[6] shared original stays tensor-free; deepcopy clones metadata only OK")
 
 
+def smoke_7_single_frame_video_cache_mode() -> None:
+    """``cache_depth_gt_embeddings(store_as_single_frame_video=True)`` — the
+    LTX/Wan still-image path. The same v3 GT must land under the *video* cache
+    namespace (key + version + is_depth_video_cached) as a ``(1, H, W)`` cube,
+    so the 5D video depth block reads it; the default image mode is unchanged.
+    DA2 is stubbed so this stays CPU-only and never downloads a model."""
+    import toolkit.depth_consistency as dc
+    from PIL import Image as _PILImage
+
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    from safetensors.torch import load_file
+    from toolkit.dataloader_mixins import DepthCachingFileItemDTOMixin as Mixin
+
+    class _StubDA2:  # returns a fixed (b, 16, 20) depth; ignores pixels
+        def __init__(self, *a, **k):
+            pass
+
+        def __call__(self, arr):
+            return torch.ones(arr.shape[0], 16, 20)
+
+    class _Cfg:
+        model_id = "stub"
+        input_size = 384
+        pixel_blur_sigma = 0.0
+
+    def _run(td, store_as_video):
+        # a real (W=64, H=48) image on disk; the stub ignores its content
+        png = os.path.join(td, "img.png")
+        _PILImage.new("RGB", (64, 48), (123, 222, 64)).save(png)
+        item = Mixin()
+        item.path = png
+        item.crop_height, item.crop_width = 48, 64  # → bucket-keyed cache
+        # the roundtrip is the trainer's; here assert its 4D contract and pass through
+        seen = {}
+
+        def _rt(x):
+            seen["dim"] = x.dim()
+            return x
+
+        dc.cache_depth_gt_embeddings(
+            [item], _Cfg(), device=torch.device("cpu"),
+            vae_roundtrip_fn=_rt, store_as_single_frame_video=store_as_video,
+        )
+        assert seen["dim"] == 4, "roundtrip fn must receive 4D (1,3,H,W) pixels"
+        cache_path = os.path.join(td, "_face_id_cache", "img.safetensors")
+        return item, load_file(cache_path)
+
+    _orig = dc.DifferentiableDepthEncoder
+    dc.DifferentiableDepthEncoder = _StubDA2
+    try:
+        # --- video mode (LTX/Wan still image) ---
+        with tempfile.TemporaryDirectory() as td:
+            item, saved = _run(td, store_as_video=True)
+            assert item.is_depth_video_cached is True
+            assert item.is_depth_cached is False, "must not set the image flag"
+            assert item._depth_video_cache_key == "depth_gt_video_48x64", item._depth_video_cache_key
+            assert "depth_gt_video_48x64" in saved and dc.CACHE_VERSION_VIDEO_KEY in saved
+            assert "depth_gt_48x64" not in saved and dc.CACHE_VERSION_KEY not in saved
+            cube = saved["depth_gt_video_48x64"]
+            assert tuple(cube.shape) == (1, 16, 20), cube.shape  # 1-frame cube
+            assert item.depth_gt_video is None, "must not retain the tensor"
+            # lazy read-back via the worker path returns the same cube
+            assert tuple(item.get_depth_gt_video().shape) == (1, 16, 20)
+
+        # --- default image mode (regression: unchanged) ---
+        with tempfile.TemporaryDirectory() as td:
+            item, saved = _run(td, store_as_video=False)
+            assert item.is_depth_cached is True and item.is_depth_video_cached is False
+            assert item._depth_cache_key == "depth_gt_48x64", item._depth_cache_key
+            assert "depth_gt_48x64" in saved and dc.CACHE_VERSION_KEY in saved
+            assert "depth_gt_video_48x64" not in saved
+            assert tuple(saved["depth_gt_48x64"].shape) == (16, 20)  # 2D map
+            assert tuple(item.get_depth_gt().shape) == (16, 20)
+    finally:
+        dc.DifferentiableDepthEncoder = _orig
+    print("[7] single-frame-video cache mode (LTX/Wan) + image-mode regression OK")
+
+
 def main() -> None:
     smoke_1_header_shape_presence()
     smoke_2_header_shape_corrupt()
@@ -216,6 +296,7 @@ def main() -> None:
     smoke_4_image_lazy_contract()
     smoke_5_video_lazy_contract()
     smoke_6_deepcopy_is_cheap()
+    smoke_7_single_frame_video_cache_mode()
     print("\n[done] depth-cache lazy-load smoke tests passed")
 
 

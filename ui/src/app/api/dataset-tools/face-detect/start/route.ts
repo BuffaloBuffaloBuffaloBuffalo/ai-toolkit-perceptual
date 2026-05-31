@@ -67,6 +67,7 @@ export async function POST(request: NextRequest) {
       '--face-model', String(cfg.face_model ?? 'buffalo_l'),
       '--det-size', String(cfg.det_size ?? 640),
       '--limit', String(cfg.limit ?? 0),
+      '--video-frames', String(cfg.video_frames ?? 4),
     ];
 
     const subprocess = spawn(pythonPath, args, {

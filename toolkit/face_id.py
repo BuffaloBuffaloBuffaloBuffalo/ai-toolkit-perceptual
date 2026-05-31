@@ -669,6 +669,7 @@ def cache_video_identity_embeddings(
     device: Optional[torch.device] = None,
     num_frames: Optional[int] = None,
     arch: str = "ltx2.3",
+    include_images: bool = False,
 ):
     """Cache per-frame GT ArcFace identity embeddings from the DECODED clip.
 
@@ -692,11 +693,16 @@ def cache_video_identity_embeddings(
     Versioned by ``CACHE_VERSION_IDENTITY_VIDEO_KEY``.
 
     Args:
-        file_items: items whose ``is_video`` is truthy are processed.
+        file_items: items whose ``is_video`` is truthy are processed (plus all
+            items when ``include_images`` is set).
         face_id_config: InsightFace model name + ``identity_loss_decoded_det_threshold``.
         device: CUDA device for extraction.
         num_frames: uniformly subsample to this many frames (round-trip fallback).
         arch: model arch, selects the tiny decoder (LTX vs Wan).
+        include_images: also process non-video items (LTX/Wan still images, where
+            num_frames=1). Each image's cached 5D latent decodes as a T=1 clip via
+            ``_decode_clip``, so the identity loss can run through the 5D video
+            block. The GT is still the decoded-then-ArcFace embedding (zero-floor).
     """
     import cv2
     from PIL import Image
@@ -710,7 +716,13 @@ def cache_video_identity_embeddings(
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    video_items = [f for f in file_items if getattr(f, "is_video", False)]
+    # include_images routes LTX/Wan still-image datasets (num_frames=1) here too:
+    # _decode_clip uses each item's cached 5D latent, so a single image is a T=1
+    # clip and the identity loss can run through the 5D video block.
+    if include_images:
+        video_items = list(file_items)
+    else:
+        video_items = [f for f in file_items if getattr(f, "is_video", False)]
     if not video_items:
         return
 

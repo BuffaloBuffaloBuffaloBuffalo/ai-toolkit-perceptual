@@ -210,68 +210,139 @@ function UploadCard({ onUploaded }: { onUploaded: () => void }) {
   const [file, setFile] = useState<File | null>(null);
   const [progress, setProgress] = useState(0);
   const [uploading, setUploading] = useState(false);
+  const [status, setStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+
+  // The RunPod edge (Cloudflare) rejects a request body over some size with a 400
+  // before it reaches the app — a whole multi-GB file, and even a 50 MiB chunk,
+  // both fail. We don't hardcode the cap (RunPod can change it): start optimistic
+  // and, whenever the edge bounces a chunk, halve the chunk size and retry the
+  // same bytes until it goes through, then keep that size. Each chunk POSTs to its
+  // byte offset; the server appends, reports the authoritative offset (so we can
+  // resume after a hiccup or reload), and renames into place once the .part
+  // reaches the full file size.
+  const START_CHUNK = 8 * 1024 * 1024; // 8 MiB — observed to clear the edge
+  const MIN_CHUNK = 512 * 1024; // floor; below this we stop shrinking and back off
+  const MAX_RETRIES = 8; // consecutive transient failures before giving up
 
   const upload = async () => {
     if (!file || uploading) return;
     const f = file;
     setError(null);
+    setStatus(null);
     setProgress(0);
     setUploading(true);
 
-    // Upload in sub-cap chunks: RunPod fronts pods with Cloudflare, which 400s a
-    // single multi-GB request body at the edge. Each chunk is its own request
-    // (well under the limit); the server appends them at their byte offset and
-    // renames into place on the last one.
-    const CHUNK_BYTES = 50 * 1024 * 1024; // 50 MiB — safely under the ~100MB edge cap
-    // Mirror what apiClient adds — the project's auth interceptor lives in
-    // axios, not in raw XHR, so we have to plumb the token through ourselves.
+    // Mirror what apiClient adds — the project's auth interceptor lives in axios,
+    // not in raw XHR, so we plumb the bearer token through ourselves on the POSTs.
     const token = typeof window !== 'undefined' ? localStorage.getItem('AI_TOOLKIT_AUTH') : null;
-    const totalChunks = Math.max(1, Math.ceil(f.size / CHUNK_BYTES));
+    const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
-    const sendChunk = (index: number) =>
-      new Promise<void>((resolve, reject) => {
-        const start = index * CHUNK_BYTES;
-        const end = Math.min(f.size, start + CHUNK_BYTES);
+    type ChunkResult = { uploaded: number; complete: boolean };
+    type ChunkError = Error & { kind: 'edge' | 'transient' | 'app'; status: number };
+    const fail = (kind: ChunkError['kind'], message: string, httpStatus = 0): ChunkError =>
+      Object.assign(new Error(message), { kind, status: httpStatus });
+
+    const sendChunk = (offset: number, size: number) =>
+      new Promise<ChunkResult>((resolve, reject) => {
+        const end = Math.min(f.size, offset + size);
         const xhr = new XMLHttpRequest();
         xhr.upload.addEventListener('progress', e => {
-          if (e.lengthComputable) setProgress((start + e.loaded) / f.size);
+          if (e.lengthComputable) setProgress(Math.min(1, f.size ? (offset + e.loaded) / f.size : 1));
         });
         xhr.addEventListener('load', () => {
-          if (xhr.status >= 200 && xhr.status < 300) {
-            setProgress(end / f.size);
-            resolve();
-          } else {
-            try {
-              reject(new Error(JSON.parse(xhr.responseText).error || `HTTP ${xhr.status}`));
-            } catch {
-              reject(new Error(`HTTP ${xhr.status}`));
-            }
+          const s = xhr.status;
+          let body: any = null;
+          try { body = JSON.parse(xhr.responseText); } catch { /* not JSON */ }
+          if (s >= 200 && s < 300) {
+            resolve({ uploaded: typeof body?.uploaded === 'number' ? body.uploaded : end, complete: !!body?.complete });
+            return;
           }
+          if (body && typeof body.error === 'string') {
+            // The app answered — trust its verdict. Resync/transient codes retry;
+            // hard 4xx (already exists, unsupported, unauthorized) abort.
+            if (body.code === 'OFFSET_GAP' || s === 429 || s >= 500) { reject(fail('transient', body.error, s)); return; }
+            reject(fail('app', body.error, s));
+            return;
+          }
+          // No JSON (Cloudflare's HTML 400, or an opaque status) — the edge bounced
+          // the body before the app saw it. Shrinking the chunk is the fix.
+          reject(fail('edge', `Edge rejected a ${formatBytes(end - offset)} chunk (HTTP ${s || 0})`, s));
         });
-        xhr.addEventListener('error', () => reject(new Error('Network error')));
+        xhr.addEventListener('error', () => reject(fail('edge', 'Network/edge error', 0)));
+        xhr.addEventListener('timeout', () => reject(fail('transient', 'Chunk timed out', 0)));
         xhr.open('POST', '/api/models/upload');
         if (token) xhr.setRequestHeader('Authorization', `Bearer ${token}`);
         xhr.setRequestHeader('X-Filename', f.name);
-        xhr.setRequestHeader('X-Total-Chunks', String(totalChunks));
-        xhr.setRequestHeader('X-Chunk-Index', String(index));
-        xhr.setRequestHeader('X-Chunk-Offset', String(start));
+        xhr.setRequestHeader('X-Chunk-Offset', String(offset));
+        xhr.setRequestHeader('X-File-Size', String(f.size));
         xhr.setRequestHeader('Content-Type', 'application/octet-stream');
-        xhr.send(f.slice(start, end));
+        xhr.send(f.slice(offset, end));
       });
 
+    // Ask the server how much already landed, so a reload or retry resumes instead
+    // of restarting. Throws 'app' if the model is already fully present.
+    const serverOffset = async (): Promise<number> => {
+      const res = await apiClient.get('/api/models/upload', { params: { filename: f.name } });
+      if (res.data?.exists) throw fail('app', 'A model with that filename already exists', 409);
+      const up = Number(res.data?.uploaded);
+      return Number.isFinite(up) && up > 0 && up <= f.size ? up : 0;
+    };
+
     try {
-      for (let i = 0; i < totalChunks; i++) {
-        await sendChunk(i);
+      let offset = await serverOffset();
+      if (offset > 0) setStatus(`Resuming at ${formatBytes(offset)} of ${formatBytes(f.size)}`);
+      setProgress(f.size ? Math.min(1, offset / f.size) : 0);
+      let chunk = START_CHUNK;
+      let fails = 0;
+
+      // Loop until the server confirms completion (renamed into place). Sending a
+      // zero-length chunk once offset has reached the end finalizes a full-but-
+      // unrenamed .part or a 0-byte file.
+      for (;;) {
+        const before = offset;
+        try {
+          const res = await sendChunk(offset, offset < f.size ? chunk : 0);
+          offset = res.uploaded;
+          setProgress(Math.min(1, f.size ? offset / f.size : 1));
+          if (res.complete) break;
+          if (offset <= before) {
+            // No forward progress on a success — avoid a hot loop.
+            if (++fails > MAX_RETRIES) throw new Error('Upload stalled (no progress)');
+            await sleep(Math.min(8000, 500 * 2 ** (fails - 1)));
+          } else {
+            fails = 0;
+            setStatus(null);
+          }
+        } catch (err) {
+          const e = err as ChunkError;
+          if (e.kind === 'app') throw e; // unrecoverable — surface the message
+          if (e.kind === 'edge' && chunk > MIN_CHUNK) {
+            // Too big for the edge: halve and retry the same bytes. This is the
+            // adaptive self-tune, not a real failure, so it spends no retry budget.
+            chunk = Math.max(MIN_CHUNK, Math.floor(chunk / 2));
+            setStatus(`Edge rejected a larger chunk; retrying at ${formatBytes(chunk)}…`);
+            continue;
+          }
+          if (++fails > MAX_RETRIES) throw new Error(`${e.message} — gave up after ${MAX_RETRIES} retries`);
+          // Transient (or edge already at the floor): back off, resync to the
+          // server's offset, and retry so we never re-send bytes that landed.
+          setStatus(`Hiccup (${e.message}); retry ${fails}/${MAX_RETRIES}…`);
+          await sleep(Math.min(8000, 500 * 2 ** (fails - 1)));
+          try { offset = await serverOffset(); setProgress(f.size ? Math.min(1, offset / f.size) : 0); } catch { /* keep offset */ }
+        }
       }
+
       setFile(null);
       setProgress(0);
+      setStatus(null);
       if (inputRef.current) inputRef.current.value = '';
       setUploading(false);
       onUploaded();
     } catch (e: any) {
       setUploading(false);
+      setStatus(null);
       setError(e?.message || 'Upload failed');
     }
   };
@@ -285,7 +356,8 @@ function UploadCard({ onUploaded }: { onUploaded: () => void }) {
       <p className="text-xs text-gray-500 mb-3">
         Pick a <code className="text-gray-400">.safetensors</code>, <code className="text-gray-400">.ckpt</code>,{' '}
         <code className="text-gray-400">.pt</code>, <code className="text-gray-400">.bin</code>, or{' '}
-        <code className="text-gray-400">.gguf</code> file. The file streams to disk — multi-GB uploads are fine.
+        <code className="text-gray-400">.gguf</code> file. Big multi-GB models are fine; they upload in
+        chunks that auto-size to the connection and resume if it drops.
       </p>
       <input
         ref={inputRef}
@@ -310,6 +382,7 @@ function UploadCard({ onUploaded }: { onUploaded: () => void }) {
           <div className="text-xs text-gray-400 mt-1">
             {(progress * 100).toFixed(1)}% · {formatBytes(progress * (file?.size ?? 0))} of {formatBytes(file?.size ?? 0)}
           </div>
+          {status && <div className="text-xs text-gray-500 mt-1">{status}</div>}
         </div>
       )}
       {error && <div className="text-xs text-red-400 mb-3">{error}</div>}

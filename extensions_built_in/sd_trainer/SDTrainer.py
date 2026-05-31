@@ -40,8 +40,8 @@ from toolkit.util.losses import wavelet_loss, stepped_loss
 import torch.nn.functional as F
 from toolkit.unloader import unload_text_encoder
 from toolkit.config_modules import FaceIDConfig, BodyIDConfig, SubjectMaskConfig, DepthConsistencyConfig
-from toolkit.face_id import FaceIDProjector, VisionFaceProjector, DifferentiableFaceEncoder, DifferentiableLandmarkEncoder, cache_face_embeddings
-from toolkit.body_id import BodyIDProjector, DifferentiableBodyProportionEncoder, cache_body_embeddings, cache_body_proportion_embeddings
+from toolkit.face_id import FaceIDProjector, VisionFaceProjector, DifferentiableFaceEncoder, DifferentiableLandmarkEncoder, cache_face_embeddings, cache_video_identity_embeddings
+from toolkit.body_id import BodyIDProjector, DifferentiableBodyProportionEncoder, cache_body_embeddings, cache_body_proportion_embeddings, cache_video_body_proportion_embeddings
 from toolkit.body_shape import DifferentiableBodyShapeEncoder, cache_body_shape_embeddings
 from toolkit.normal_id import DifferentiableNormalEncoder, cache_normal_embeddings
 from toolkit.vae_anchor import VAEAnchorEncoder, cache_vae_anchor_features
@@ -154,9 +154,14 @@ class SDTrainer(BaseSDTrainProcess):
         self.vae_anchor_encoder: Optional[VAEAnchorEncoder] = None
         self.vae_anchor_projector = None
         self.depth_encoder: Optional[DifferentiableDepthEncoder] = None
-        # Wan 2.1 video path: TAEHV tiny decoder for x0 → frames. Lazy-loaded
-        # the first time a 5D noise_pred arrives through the depth block.
+        # Video perceptor path: TAEHV tiny decoder for x0 → frames (LTX-2/2.3 or
+        # Wan 2.1). Lazy-loaded the first time a 5D noise_pred arrives through any
+        # video perceptor (depth / identity / body-proportion).
         self._wan_depth_decoder = None
+        # Decoded x0 frames memoized per training step so the (expensive) TAEHV
+        # decode over all frames runs at most once even when several video
+        # perceptors are active. See `_get_video_x0_frames`.
+        self._video_x0_frames_cache = None
         self._last_depth_consistency_loss: Optional[float] = None
         self._last_depth_consistency_loss_applied: Optional[float] = None
         self._last_depth_consistency_ssi: Optional[float] = None
@@ -636,6 +641,114 @@ class SDTrainer(BaseSDTrainProcess):
         if do_log:
             self._last_weight_noise_norm = noise_sq ** 0.5
 
+    @staticmethod
+    def _scale_bbox_to_pixels(raw_bbox, file_item, px_h, px_w):
+        """Map a bbox from original-image coords into decoded-pixel coords.
+
+        Replays the dataloader's deterministic flip → scale → crop, then scales
+        into the ``(px_h, px_w)`` decode resolution and clamps to the frame.
+        Returns ``[x1, y1, x2, y2]`` (python floats) or ``None`` when the box is
+        absent, all-zero (the "no detection" sentinel), or falls entirely
+        outside the crop. Shared by the face-identity, body-proportion and
+        body-shape paths — for image ``x0_pixels`` and per-frame video frames
+        alike.
+        """
+        if raw_bbox is None:
+            return None
+        coords = [float(v) for v in raw_bbox]
+        if sum(abs(c) for c in coords) == 0.0:
+            return None
+        bx1, by1, bx2, by2 = coords
+        fi = file_item
+        orig_w = float(fi.width)
+        orig_h = float(fi.height)
+
+        # Dataloader flips happen before scale+crop; mirror in raw coords so the
+        # box lands in the correct half of the training tensor.
+        if getattr(fi, 'flip_x', False):
+            bx1, bx2 = orig_w - bx2, orig_w - bx1
+        if getattr(fi, 'flip_y', False):
+            by1, by2 = orig_h - by2, orig_h - by1
+
+        stw = float(getattr(fi, 'scale_to_width', None) or orig_w)
+        sth = float(getattr(fi, 'scale_to_height', None) or orig_h)
+        bx1 *= (stw / orig_w); bx2 *= (stw / orig_w)
+        by1 *= (sth / orig_h); by2 *= (sth / orig_h)
+
+        cx = float(getattr(fi, 'crop_x', None) or 0)
+        cy = float(getattr(fi, 'crop_y', None) or 0)
+        cw = float(getattr(fi, 'crop_width', None) or stw)
+        ch = float(getattr(fi, 'crop_height', None) or sth)
+        bx1 -= cx; bx2 -= cx; by1 -= cy; by2 -= cy
+
+        if bx2 <= 0 or by2 <= 0 or bx1 >= cw or by1 >= ch:
+            return None
+
+        bx1 *= (px_w / cw); bx2 *= (px_w / cw)
+        by1 *= (px_h / ch); by2 *= (px_h / ch)
+
+        bx1 = max(0.0, min(bx1, float(px_w)))
+        bx2 = max(0.0, min(bx2, float(px_w)))
+        by1 = max(0.0, min(by1, float(px_h)))
+        by2 = max(0.0, min(by2, float(px_h)))
+        return [bx1, by1, bx2, by2]
+
+    def _get_video_x0_frames(self, noise_pred, noisy_latents, timesteps, needs_grad):
+        """Decode the x0 prediction to ``(B, 3, T, H, W)`` pixel frames in [0, 1].
+
+        Shared entry point for every video perceptor loss (depth, identity,
+        body-proportion) so the expensive TAEHV decode over all frames happens
+        at most once per training step. The decoded frames are memoized on
+        ``self._video_x0_frames_cache`` keyed by ``self.step_num``.
+
+        Grad-aware: a cached decode produced under ``no_grad`` (e.g. by a
+        preview-only consumer) is recomputed if a later consumer needs
+        gradients, and the grad-enabled result is then reused by all.
+
+        Returns ``None`` for non-flow-matching models (callers skip cleanly).
+        """
+        if not self.sd.is_flow_matching:
+            # Non-flow video is unusual; mirrors the depth path's skip.
+            return None
+
+        # Lazy-load the tiny decoder matching the model's latent space:
+        # LTX-2/2.3 (128-ch, taeltx) vs Wan 2.1 (16-ch).
+        if self._wan_depth_decoder is None:
+            _arch = (getattr(self.sd.model_config, 'arch', '') or '')
+            if _arch.startswith('ltx'):
+                _ltx_ver = str(getattr(self.sd, 'ltx_version', '2.3'))
+                print_acc(f"VideoPerceptor: loading TAEHV LTX-{_ltx_ver} tiny decoder...")
+                self._wan_depth_decoder = load_taehv_ltx2(
+                    device=self.device_torch,
+                    dtype=get_torch_dtype(self.train_config.dtype),
+                    version=_ltx_ver,
+                )
+            else:
+                print_acc("VideoPerceptor: loading TAEHV tiny decoder...")
+                self._wan_depth_decoder = load_taehv_wan21(
+                    device=self.device_torch,
+                    dtype=get_torch_dtype(self.train_config.dtype),
+                )
+
+        cache = self._video_x0_frames_cache
+        if (cache is not None and cache['step'] == self.step_num
+                and (cache['has_grad'] or not needs_grad)):
+            return cache['frames']
+
+        from contextlib import nullcontext as _nullctx
+        _ctx = _nullctx() if needs_grad else torch.no_grad()
+        with _ctx:
+            # Flow-matching x0 recovery: x0 = x_t - sigma * v_pred, sigma = t.
+            _sigma = (timesteps.float() / float(self.sd.noise_scheduler.config.num_train_timesteps)).view(-1, 1, 1, 1, 1)
+            _x0 = noisy_latents - _sigma * noise_pred
+            frames = decode_wan_x0_to_frames(_x0, self._wan_depth_decoder)
+        self._video_x0_frames_cache = {
+            'step': self.step_num,
+            'frames': frames,
+            'has_grad': bool(needs_grad),
+        }
+        return frames
+
     def _snapshot_metrics_to_buffer(self) -> None:
         """Mirror every freshly-written ``self._last_<attr>`` scalar into
         ``self._metric_buffer`` so cross-microbatch means are correct under
@@ -980,14 +1093,33 @@ class SDTrainer(BaseSDTrainProcess):
             if _face_cache_config is None and _any_face_suppression:
                 _face_cache_config = FaceIDConfig()
             print_acc("LoRA+ID: Extracting and caching face embeddings...")
+            # Video datasets get per-frame ArcFace identity GT (the other face
+            # features are image-only); image datasets use the full image path.
+            _video_identity_needed = (
+                _face_cache_config is not None
+                and (_face_cache_config.identity_loss_weight > 0
+                     or _face_cache_config.identity_metrics
+                     or _ds_identity)
+            )
+
+            def _cache_face_for_dataset(ds):
+                if getattr(ds, 'is_video', False):
+                    if _video_identity_needed:
+                        cache_video_identity_embeddings(
+                            ds.file_list, _face_cache_config,
+                            device=self.device_torch,
+                            num_frames=ds.dataset_config.num_frames,
+                            arch=getattr(self.sd.model_config, 'arch', '') or '',
+                        )
+                else:
+                    cache_face_embeddings(ds.file_list, _face_cache_config)
+
             if self.data_loader is not None:
-                datasets = get_dataloader_datasets(self.data_loader)
-                for dataset in datasets:
-                    cache_face_embeddings(dataset.file_list, _face_cache_config)
+                for dataset in get_dataloader_datasets(self.data_loader):
+                    _cache_face_for_dataset(dataset)
             if self.data_loader_reg is not None:
-                datasets = get_dataloader_datasets(self.data_loader_reg)
-                for dataset in datasets:
-                    cache_face_embeddings(dataset.file_list, _face_cache_config)
+                for dataset in get_dataloader_datasets(self.data_loader_reg):
+                    _cache_face_for_dataset(dataset)
 
         # Compute per-dataset average identity embeddings
         self._identity_mean_embed = None  # (512,) ArcFace bias direction, set after model load
@@ -1052,14 +1184,23 @@ class SDTrainer(BaseSDTrainProcess):
         # Body proportions: cache ViTPose bone-length ratios for all datasets
         if self.face_id_config is not None and (self.face_id_config.body_proportion_loss_weight > 0 or _ds_body_prop):
             print_acc("LoRA+ID: Extracting and caching body proportion embeddings...")
+
+            def _cache_bp_for_dataset(ds):
+                if getattr(ds, 'is_video', False):
+                    cache_video_body_proportion_embeddings(
+                        ds.file_list, self.face_id_config,
+                        device=self.device_torch,
+                        num_frames=ds.dataset_config.num_frames,
+                    )
+                else:
+                    cache_body_proportion_embeddings(ds.file_list, self.face_id_config)
+
             if self.data_loader is not None:
-                datasets = get_dataloader_datasets(self.data_loader)
-                for dataset in datasets:
-                    cache_body_proportion_embeddings(dataset.file_list, self.face_id_config)
+                for dataset in get_dataloader_datasets(self.data_loader):
+                    _cache_bp_for_dataset(dataset)
             if self.data_loader_reg is not None:
-                datasets = get_dataloader_datasets(self.data_loader_reg)
-                for dataset in datasets:
-                    cache_body_proportion_embeddings(dataset.file_list, self.face_id_config)
+                for dataset in get_dataloader_datasets(self.data_loader_reg):
+                    _cache_bp_for_dataset(dataset)
 
         # Body shape (HybrIK): cache SMPL betas for body shape loss
         if self.face_id_config is not None and (self.face_id_config.body_shape_loss_weight > 0 or _ds_body_shape):
@@ -2579,56 +2720,13 @@ class SDTrainer(BaseSDTrainProcess):
                 scaled_bboxes = None
                 if batch.face_bboxes is not None:
                     _, _, px_h, px_w = x0_pixels.shape
-                    scaled_bboxes = []
-                    for idx in range(x0_pixels.shape[0]):
-                        raw_bbox = batch.face_bboxes[idx] if idx < len(batch.face_bboxes) else None
-                        if raw_bbox is not None:
-                            fi = batch.file_items[idx]
-                            orig_w = float(fi.width)
-                            orig_h = float(fi.height)
-                            bx1, by1, bx2, by2 = raw_bbox.float()
-
-                            # Dataloader applies deterministic flips before
-                            # scale+crop; mirror that here in raw coords so the
-                            # bbox lands in the correct half of the training tensor.
-                            if getattr(fi, 'flip_x', False):
-                                bx1, bx2 = orig_w - bx2, orig_w - bx1
-                            if getattr(fi, 'flip_y', False):
-                                by1, by2 = orig_h - by2, orig_h - by1
-
-                            stw = float(getattr(fi, 'scale_to_width', None) or orig_w)
-                            sth = float(getattr(fi, 'scale_to_height', None) or orig_h)
-                            bx1 = bx1 * (stw / orig_w)
-                            by1 = by1 * (sth / orig_h)
-                            bx2 = bx2 * (stw / orig_w)
-                            by2 = by2 * (sth / orig_h)
-
-                            cx = float(getattr(fi, 'crop_x', None) or 0)
-                            cy = float(getattr(fi, 'crop_y', None) or 0)
-                            cw = float(getattr(fi, 'crop_width', None) or stw)
-                            ch = float(getattr(fi, 'crop_height', None) or sth)
-                            bx1 = bx1 - cx
-                            by1 = by1 - cy
-                            bx2 = bx2 - cx
-                            by2 = by2 - cy
-
-                            if bx2 <= 0 or by2 <= 0 or bx1 >= cw or by1 >= ch:
-                                scaled_bboxes.append(None)
-                                continue
-
-                            bx1 = bx1 * (px_w / cw)
-                            by1 = by1 * (px_h / ch)
-                            bx2 = bx2 * (px_w / cw)
-                            by2 = by2 * (px_h / ch)
-
-                            bx1 = max(0.0, min(bx1, float(px_w)))
-                            by1 = max(0.0, min(by1, float(px_h)))
-                            bx2 = max(0.0, min(bx2, float(px_w)))
-                            by2 = max(0.0, min(by2, float(px_h)))
-
-                            scaled_bboxes.append([bx1, by1, bx2, by2])
-                        else:
-                            scaled_bboxes.append(None)
+                    scaled_bboxes = [
+                        self._scale_bbox_to_pixels(
+                            batch.face_bboxes[idx] if idx < len(batch.face_bboxes) else None,
+                            batch.file_items[idx], px_h, px_w,
+                        )
+                        for idx in range(x0_pixels.shape[0])
+                    ]
 
                 # --- Identity loss (ArcFace cosine similarity) ---
                 if _need_id_loss:
@@ -2980,53 +3078,13 @@ class SDTrainer(BaseSDTrainProcess):
                     scaled_person_bboxes = None
                     if batch.person_bboxes is not None:
                         _, _, px_h, px_w = x0_pixels.shape
-                        scaled_person_bboxes = []
-                        for idx in range(x0_pixels.shape[0]):
-                            raw_bbox = batch.person_bboxes[idx] if idx < len(batch.person_bboxes) else None
-                            if raw_bbox is not None and raw_bbox.abs().sum() > 0:
-                                fi = batch.file_items[idx]
-                                orig_w = float(fi.width)
-                                orig_h = float(fi.height)
-                                pbx1, pby1, pbx2, pby2 = raw_bbox.float()
-
-                                if getattr(fi, 'flip_x', False):
-                                    pbx1, pbx2 = orig_w - pbx2, orig_w - pbx1
-                                if getattr(fi, 'flip_y', False):
-                                    pby1, pby2 = orig_h - pby2, orig_h - pby1
-
-                                stw = float(getattr(fi, 'scale_to_width', None) or orig_w)
-                                sth = float(getattr(fi, 'scale_to_height', None) or orig_h)
-                                pbx1 = pbx1 * (stw / orig_w)
-                                pby1 = pby1 * (sth / orig_h)
-                                pbx2 = pbx2 * (stw / orig_w)
-                                pby2 = pby2 * (sth / orig_h)
-
-                                cx = float(getattr(fi, 'crop_x', None) or 0)
-                                cy = float(getattr(fi, 'crop_y', None) or 0)
-                                cw = float(getattr(fi, 'crop_width', None) or stw)
-                                ch = float(getattr(fi, 'crop_height', None) or sth)
-                                pbx1 = pbx1 - cx
-                                pby1 = pby1 - cy
-                                pbx2 = pbx2 - cx
-                                pby2 = pby2 - cy
-
-                                if pbx2 <= 0 or pby2 <= 0 or pbx1 >= cw or pby1 >= ch:
-                                    scaled_person_bboxes.append(None)
-                                    continue
-
-                                pbx1 = pbx1 * (px_w / cw)
-                                pby1 = pby1 * (px_h / ch)
-                                pbx2 = pbx2 * (px_w / cw)
-                                pby2 = pby2 * (px_h / ch)
-
-                                pbx1 = max(0.0, min(pbx1, float(px_w)))
-                                pby1 = max(0.0, min(pby1, float(px_h)))
-                                pbx2 = max(0.0, min(pbx2, float(px_w)))
-                                pby2 = max(0.0, min(pby2, float(px_h)))
-
-                                scaled_person_bboxes.append([pbx1, pby1, pbx2, pby2])
-                            else:
-                                scaled_person_bboxes.append(None)
+                        scaled_person_bboxes = [
+                            self._scale_bbox_to_pixels(
+                                batch.person_bboxes[idx] if idx < len(batch.person_bboxes) else None,
+                                batch.file_items[idx], px_h, px_w,
+                            )
+                            for idx in range(x0_pixels.shape[0])
+                        ]
 
                     # ViTPose works best with full images — no person cropping needed
                     gen_ratios, gen_vis = self.body_proportion_model(
@@ -3185,38 +3243,13 @@ class SDTrainer(BaseSDTrainProcess):
                     scaled_person_bboxes_bsh = None
                     if batch.person_bboxes is not None:
                         _, _, px_h, px_w = x0_pixels.shape
-                        scaled_person_bboxes_bsh = []
-                        for idx in range(x0_pixels.shape[0]):
-                            raw_pb = batch.person_bboxes[idx] if idx < len(batch.person_bboxes) else None
-                            if raw_pb is not None:
-                                fi = batch.file_items[idx]
-                                orig_w, orig_h = float(fi.width), float(fi.height)
-                                pbx1, pby1, pbx2, pby2 = raw_pb.float()
-                                if getattr(fi, 'flip_x', False):
-                                    pbx1, pbx2 = orig_w - pbx2, orig_w - pbx1
-                                if getattr(fi, 'flip_y', False):
-                                    pby1, pby2 = orig_h - pby2, orig_h - pby1
-                                stw = float(getattr(fi, 'scale_to_width', None) or orig_w)
-                                sth = float(getattr(fi, 'scale_to_height', None) or orig_h)
-                                pbx1 = pbx1 * (stw / orig_w)
-                                pby1 = pby1 * (sth / orig_h)
-                                pbx2 = pbx2 * (stw / orig_w)
-                                pby2 = pby2 * (sth / orig_h)
-                                cx = float(getattr(fi, 'crop_x', None) or 0)
-                                cy = float(getattr(fi, 'crop_y', None) or 0)
-                                cw = float(getattr(fi, 'crop_width', None) or stw)
-                                ch = float(getattr(fi, 'crop_height', None) or sth)
-                                pbx1 -= cx; pby1 -= cy; pbx2 -= cx; pby2 -= cy
-                                if pbx2 <= 0 or pby2 <= 0 or pbx1 >= cw or pby1 >= ch:
-                                    scaled_person_bboxes_bsh.append(None)
-                                    continue
-                                pbx1 = max(0.0, pbx1 * (px_w / cw))
-                                pby1 = max(0.0, pby1 * (px_h / ch))
-                                pbx2 = min(float(px_w), pbx2 * (px_w / cw))
-                                pby2 = min(float(px_h), pby2 * (px_h / ch))
-                                scaled_person_bboxes_bsh.append([pbx1, pby1, pbx2, pby2])
-                            else:
-                                scaled_person_bboxes_bsh.append(None)
+                        scaled_person_bboxes_bsh = [
+                            self._scale_bbox_to_pixels(
+                                batch.person_bboxes[idx] if idx < len(batch.person_bboxes) else None,
+                                batch.file_items[idx], px_h, px_w,
+                            )
+                            for idx in range(x0_pixels.shape[0])
+                        ]
 
                     # Run HybrIK on decoded x0
                     gen_betas = self.body_shape_model(
@@ -3855,45 +3888,20 @@ class SDTrainer(BaseSDTrainProcess):
             _dc_pure_preview = (not _dc_active.any().item()) and _dc_preview_only_active.any().item()
 
             if _dc_any_to_process.any():
-                # Lazy-load the tiny video decoder on first video step (keeps
-                # image-only runs lean). Pick the decoder matching the model's
-                # latent space: LTX-2/2.3 (128-ch, taeltx) vs Wan 2.1 (16-ch).
-                if self._wan_depth_decoder is None:
-                    _dc_arch = (getattr(self.sd.model_config, 'arch', '') or '')
-                    if _dc_arch.startswith('ltx'):
-                        _dc_ltx_ver = str(getattr(self.sd, 'ltx_version', '2.3'))
-                        print_acc(f"DepthConsistency (video): loading TAEHV LTX-{_dc_ltx_ver} tiny decoder...")
-                        self._wan_depth_decoder = load_taehv_ltx2(
-                            device=self.device_torch,
-                            dtype=get_torch_dtype(self.train_config.dtype),
-                            version=_dc_ltx_ver,
-                        )
-                    else:
-                        print_acc("DepthConsistency (video): loading TAEHV tiny decoder...")
-                        self._wan_depth_decoder = load_taehv_wan21(
-                            device=self.device_torch,
-                            dtype=get_torch_dtype(self.train_config.dtype),
-                        )
+                # Decode x0 → frames once per step (shared with the identity /
+                # body-proportion video perceptors via `_get_video_x0_frames`).
+                # Grad flows through the tiny decoder unless this is a pure
+                # preview-only step (no loss-active samples), in which case the
+                # decode + perceptor run under no_grad (no autograd graph).
+                _dc_frames = self._get_video_x0_frames(
+                    noise_pred, noisy_latents, timesteps,
+                    needs_grad=not _dc_pure_preview,
+                )
 
-                # x0 recovery (flow-matching only — Wan 2.1 uses flowmatch).
-                if self.sd.is_flow_matching:
-                    _dc_sigma = _dc_t.view(-1, 1, 1, 1, 1)
-                    _dc_x0_pred = noisy_latents - _dc_sigma * noise_pred
-                else:
-                    # Non-flow video is unusual; skip cleanly if it ever happens.
-                    _dc_x0_pred = None
-
-                if _dc_x0_pred is not None:
-                    # In pure preview-only mode (no loss-active samples), the
-                    # decoder + perceptor can run under no_grad — we never
-                    # backward, so an autograd graph is dead weight.
+                if _dc_frames is not None:
                     from contextlib import nullcontext as _nullctx
                     _dc_grad_ctx = torch.no_grad() if _dc_pure_preview else _nullctx()
                     with _dc_grad_ctx:
-                        # Decode to (B, 3, T, H, W) in [0, 1].
-                        _dc_frames = decode_wan_x0_to_frames(
-                            _dc_x0_pred, self._wan_depth_decoder
-                        )
                         B_vid, _, T_out, H_out, W_out = _dc_frames.shape
                         # (B, 3, T, H, W) → (B, T, 3, H, W) → (B*T, 3, H, W).
                         _dc_flat = _dc_frames.permute(0, 2, 1, 3, 4).reshape(
@@ -4059,6 +4067,251 @@ class SDTrainer(BaseSDTrainProcess):
                             )
                         except Exception as e:  # noqa: BLE001
                             print_acc(f"  video depth preview failed: {e}")
+
+        # === Identity loss (ArcFace) — 5D video path ===
+        # Decode x0 → frames (shared decode), then run the SAME ArcFace encoder
+        # used by the image path on per-frame face crops, pushing each generated
+        # frame's identity toward its cached per-frame GT embedding. Frames are
+        # processed flattened (B*T, 3, H, W) through the unchanged 4D encoder,
+        # chunked under gradient checkpointing to bound VRAM. The per-frame GT
+        # embedding + normalized bbox come from cache_video_identity_embeddings.
+        if (self.id_loss_model is not None
+                and len(noise_pred.shape) == 5
+                and getattr(batch, 'identity_gt_video_list', None) is not None
+                and (self.face_id_config.identity_loss_weight > 0
+                     or any(w is not None and w > 0 for w in batch.identity_loss_weight_list)
+                     or self.face_id_config.identity_metrics)):
+            _idv_cfg = self.face_id_config
+            _idv_nt = float(self.sd.noise_scheduler.config.num_train_timesteps)
+            _idv_t = timesteps.float() / _idv_nt  # (B,)
+
+            _idv_min_list = getattr(batch, 'identity_loss_min_t_list', None) or [None] * _idv_t.shape[0]
+            _idv_max_list = getattr(batch, 'identity_loss_max_t_list', None) or [None] * _idv_t.shape[0]
+            _idv_min = torch.tensor(
+                [v if v is not None else _idv_cfg.identity_loss_min_t for v in _idv_min_list],
+                device=_idv_t.device, dtype=_idv_t.dtype,
+            )
+            _idv_max = torch.tensor(
+                [v if v is not None else _idv_cfg.identity_loss_max_t for v in _idv_max_list],
+                device=_idv_t.device, dtype=_idv_t.dtype,
+            )
+            _idv_in_band = (_idv_t >= _idv_min) & (_idv_t <= _idv_max)
+            _idv_in_band = _idv_in_band & (~is_reg_per_sample.to(_idv_in_band.device))
+
+            _idv_w = torch.tensor(
+                [w if w is not None else _idv_cfg.identity_loss_weight
+                 for w in batch.identity_loss_weight_list],
+                device=_idv_t.device, dtype=_idv_t.dtype,
+            )
+            _idv_active = _idv_in_band & (_idv_w > 0)
+            # Metrics-only: identity_metrics on but no loss-active sample → no_grad.
+            _idv_metrics_only = (not _idv_active.any().item()) and _idv_cfg.identity_metrics
+
+            if _idv_active.any() or _idv_metrics_only:
+                _idv_frames = self._get_video_x0_frames(
+                    noise_pred, noisy_latents, timesteps,
+                    needs_grad=not _idv_metrics_only,
+                )
+                if _idv_frames is not None:
+                    from contextlib import nullcontext as _idv_nullctx
+                    _idv_grad_ctx = torch.no_grad() if _idv_metrics_only else _idv_nullctx()
+                    B_vid, _, T_out, _Hf, _Wf = _idv_frames.shape
+
+                    # Assemble GT cube / normalized bbox / valid mask aligned to the
+                    # decoded T (linspace-resample if the VAE changed the frame count).
+                    _gt_l = batch.identity_gt_video_list
+                    _bb_l = batch.identity_gt_video_bbox_list
+                    _vd_l = batch.identity_gt_video_valid_list
+                    _gt_a, _bb_a, _vd_a = [], [], []
+                    for _b in range(B_vid):
+                        g = _gt_l[_b] if _gt_l is not None and _b < len(_gt_l) else None
+                        if g is None:
+                            _gt_a.append(torch.zeros(T_out, 512))
+                            _bb_a.append(torch.zeros(T_out, 4))
+                            _vd_a.append(torch.zeros(T_out))
+                            continue
+                        g = g.float(); bb = _bb_l[_b].float(); vd = _vd_l[_b].float()
+                        if g.shape[0] != T_out:
+                            _ix = torch.linspace(0, g.shape[0] - 1, T_out).round().long()
+                            g, bb, vd = g[_ix], bb[_ix], vd[_ix]
+                        _gt_a.append(g); _bb_a.append(bb); _vd_a.append(vd)
+                    _idv_gt = torch.stack(_gt_a).to(_idv_frames.device)   # (B, T, 512)
+                    _idv_bb = torch.stack(_bb_a).to(_idv_frames.device)   # (B, T, 4)
+                    _idv_vd = torch.stack(_vd_a).to(_idv_frames.device)   # (B, T)
+
+                    with _idv_grad_ctx:
+                        _idv_flat = _idv_frames.permute(0, 2, 1, 3, 4).reshape(
+                            B_vid * T_out, 3, _Hf, _Wf)
+                        # Per-frame pixel bbox from the normalized GT box (None where
+                        # no face → encoder uses a full-frame crop, masked out below).
+                        _flat_bb = []
+                        for _b in range(B_vid):
+                            for _t in range(T_out):
+                                if _idv_vd[_b, _t] > 0:
+                                    nb = _idv_bb[_b, _t]
+                                    _flat_bb.append([
+                                        float(nb[0]) * _Wf, float(nb[1]) * _Hf,
+                                        float(nb[2]) * _Wf, float(nb[3]) * _Hf,
+                                    ])
+                                else:
+                                    _flat_bb.append(None)
+
+                        from torch.utils.checkpoint import checkpoint as _idv_ckpt
+                        _idv_chunk = max(1, int(getattr(_idv_cfg, 'identity_loss_frames_per_chunk', 4)))
+                        _emb_chunks = []
+                        for _cs in range(0, _idv_flat.shape[0], _idv_chunk):
+                            _sub = _idv_flat[_cs:_cs + _idv_chunk]
+                            _sub_bb = _flat_bb[_cs:_cs + _idv_chunk]
+
+                            def _idv_enc(x, _bb=_sub_bb):
+                                return self.id_loss_model(x, bboxes=_bb, return_crops=False)
+
+                            if _idv_metrics_only:
+                                _emb_chunks.append(_idv_enc(_sub))
+                            else:
+                                _emb_chunks.append(_idv_ckpt(_idv_enc, _sub, use_reentrant=False))
+                        _gen_emb = torch.cat(_emb_chunks, dim=0)  # (B*T, 512)
+
+                        # ArcFace bias correction (same as the image path), then cosine.
+                        _gt_flat = _idv_gt.reshape(B_vid * T_out, 512).to(_gen_emb.dtype)
+                        if self._identity_mean_embed is not None:
+                            _mean = self._identity_mean_embed.to(_gen_emb.device, dtype=_gen_emb.dtype)
+                            _gen_c = F.normalize(_gen_emb - _mean.unsqueeze(0), p=2, dim=-1)
+                            _gt_c = F.normalize(_gt_flat - _mean.unsqueeze(0), p=2, dim=-1)
+                        else:
+                            _gen_c, _gt_c = _gen_emb, _gt_flat
+                        _cos = F.cosine_similarity(_gen_c, _gt_c, dim=-1).reshape(B_vid, T_out)  # (B, T)
+
+                        _min_cos = torch.tensor(
+                            [v if v is not None else _idv_cfg.identity_loss_min_cos
+                             for v in batch.identity_loss_min_cos_list],
+                            device=_cos.device, dtype=_cos.dtype,
+                        )  # (B,)
+                        # Per-frame mask: GT face present, timestep in band, sample
+                        # weighted, and the generated frame already resembles GT (the
+                        # min_cos gate stands in for the 4D per-crop SCRFD detector).
+                        _idv_mask = (
+                            (_idv_vd > 0)
+                            & _idv_in_band.view(-1, 1)
+                            & (_idv_w.view(-1, 1) > 0)
+                            & (_cos.detach() > _min_cos.view(-1, 1))
+                        )
+                        _idv_n = _idv_mask.float().sum().clamp(min=1.0)
+                        _id_raw = ((1.0 - _cos) * _idv_mask.float()).sum() / _idv_n
+                        _sim_raw = (_cos * _idv_mask.float()).sum() / _idv_n
+
+                    if not _idv_metrics_only and _idv_mask.any():
+                        _id_applied = ((1.0 - _cos) * _idv_w.view(-1, 1)
+                                       * _idv_mask.float()).sum() / _idv_n
+                        loss = loss + _id_applied
+                        self._last_identity_loss_applied = _id_applied.detach().item()
+                    if _idv_mask.any():
+                        self._last_identity_loss = _id_raw.detach().item()
+                        self._last_id_sim = _sim_raw.detach().item()
+
+        # === Body-proportion loss (ViTPose) — 5D video path ===
+        # Decode x0 → frames (shared decode), run the SAME ViTPose encoder per
+        # frame (full-frame, flattened B*T) under gradient checkpointing, and
+        # compare bone-length ratios to the cached per-frame GT cube using the
+        # image path's visibility-weighted L1 + missing-keypoint penalty.
+        if (self.body_proportion_model is not None
+                and len(noise_pred.shape) == 5
+                and getattr(batch, 'body_proportion_gt_video_list', None) is not None
+                and (self.face_id_config.body_proportion_loss_weight > 0
+                     or any(w is not None and w > 0 for w in batch.body_proportion_loss_weight_list))):
+            _bpv_cfg = self.face_id_config
+            _bpv_nt = float(self.sd.noise_scheduler.config.num_train_timesteps)
+            _bpv_t = timesteps.float() / _bpv_nt  # (B,)
+
+            _bpv_min_list = getattr(batch, 'body_proportion_loss_min_t_list', None) or [None] * _bpv_t.shape[0]
+            _bpv_max_list = getattr(batch, 'body_proportion_loss_max_t_list', None) or [None] * _bpv_t.shape[0]
+            _bpv_min = torch.tensor(
+                [v if v is not None else _bpv_cfg.body_proportion_loss_min_t for v in _bpv_min_list],
+                device=_bpv_t.device, dtype=_bpv_t.dtype,
+            )
+            _bpv_max = torch.tensor(
+                [v if v is not None else _bpv_cfg.body_proportion_loss_max_t for v in _bpv_max_list],
+                device=_bpv_t.device, dtype=_bpv_t.dtype,
+            )
+            _bpv_in_band = (_bpv_t >= _bpv_min) & (_bpv_t <= _bpv_max)
+            _bpv_in_band = _bpv_in_band & (~is_reg_per_sample.to(_bpv_in_band.device))
+
+            _bpv_w = torch.tensor(
+                [w if w is not None else _bpv_cfg.body_proportion_loss_weight
+                 for w in batch.body_proportion_loss_weight_list],
+                device=_bpv_t.device, dtype=_bpv_t.dtype,
+            )
+            _bpv_active = _bpv_in_band & (_bpv_w > 0)
+
+            if _bpv_active.any():
+                _bpv_frames = self._get_video_x0_frames(
+                    noise_pred, noisy_latents, timesteps, needs_grad=True,
+                )
+                if _bpv_frames is not None:
+                    B_vid, _, T_out, _Hf, _Wf = _bpv_frames.shape
+                    _inc_head = bool(getattr(_bpv_cfg, 'body_proportion_include_head', False))
+
+                    # Assemble GT cube (B, T_out, 2N) aligned to the decoded T.
+                    _gt_l = batch.body_proportion_gt_video_list
+                    _gt_raw, _bpn = [], None
+                    for _b in range(B_vid):
+                        g = _gt_l[_b] if _gt_l is not None and _b < len(_gt_l) else None
+                        if g is not None:
+                            g = g.float()
+                            if g.shape[0] != T_out:
+                                _ix = torch.linspace(0, g.shape[0] - 1, T_out).round().long()
+                                g = g[_ix]
+                            _bpn = g.shape[-1] // 2
+                        _gt_raw.append(g)
+                    if _bpn is None:
+                        _bpn = 10 if _inc_head else 8
+                    _gt_a = [g if g is not None else torch.zeros(T_out, _bpn * 2) for g in _gt_raw]
+                    _bpv_gt = torch.stack(_gt_a).to(_bpv_frames.device)  # (B, T, 2N)
+                    _ref_ratios = _bpv_gt[..., :_bpn]   # (B, T, N)
+                    _ref_vis = _bpv_gt[..., _bpn:]      # (B, T, N)
+
+                    _bpv_flat = _bpv_frames.permute(0, 2, 1, 3, 4).reshape(B_vid * T_out, 3, _Hf, _Wf)
+                    _ref_ratios_flat = _ref_ratios.reshape(B_vid * T_out, _bpn)
+
+                    from torch.utils.checkpoint import checkpoint as _bpv_ckpt
+                    _bpv_chunk = max(1, int(getattr(_bpv_cfg, 'body_proportion_frames_per_chunk', 2)))
+                    _gr_chunks, _gv_chunks = [], []
+                    for _cs in range(0, _bpv_flat.shape[0], _bpv_chunk):
+                        _sub = _bpv_flat[_cs:_cs + _bpv_chunk]
+                        _sub_ref = _ref_ratios_flat[_cs:_cs + _bpv_chunk]
+
+                        def _bpv_enc(x, _r=_sub_ref):
+                            return self.body_proportion_model(x, ref_ratios=_r, include_head=_inc_head)
+
+                        _gr, _gv = _bpv_ckpt(_bpv_enc, _sub, use_reentrant=False)
+                        _gr_chunks.append(_gr)
+                        _gv_chunks.append(_gv)
+                    _gen_ratios = torch.cat(_gr_chunks, dim=0).reshape(B_vid, T_out, _bpn)
+                    _gen_vis = torch.cat(_gv_chunks, dim=0).reshape(B_vid, T_out, _bpn)
+
+                    # Per-frame visibility-weighted ratio L1 + missing-keypoint penalty.
+                    _comb_vis = torch.min(_ref_vis, _gen_vis)
+                    _wdiff = (_gen_ratios - _ref_ratios).abs() * _comb_vis
+                    _bpv_per_frame = _wdiff.sum(dim=-1) / _comb_vis.sum(dim=-1).clamp(min=1e-6)  # (B, T)
+                    _missing = (_ref_vis >= 0.5) & (_gen_vis < 0.2)
+                    _miss_frac = _missing.float().sum(dim=-1) / (_ref_vis >= 0.5).float().sum(dim=-1).clamp(min=1.0)
+                    _bpv_per_frame = _bpv_per_frame + _miss_frac  # (B, T)
+
+                    # Per-frame valid: GT present, sample in band and weighted.
+                    _bpv_valid = (
+                        (_bpv_gt.abs().sum(dim=-1) > 0)
+                        & _bpv_in_band.view(-1, 1)
+                        & (_bpv_w.view(-1, 1) > 0)
+                    )
+                    _bpv_n = _bpv_valid.float().sum().clamp(min=1.0)
+                    if _bpv_valid.any():
+                        _bp_applied = (_bpv_per_frame * _bpv_w.view(-1, 1)
+                                       * _bpv_valid.float()).sum() / _bpv_n
+                        loss = loss + _bp_applied
+                        self._last_body_proportion_loss_applied = _bp_applied.detach().item()
+                        self._last_body_proportion_loss = (
+                            (_bpv_per_frame * _bpv_valid.float()).sum() / _bpv_n
+                        ).detach().item()
 
         # E-LatentLPIPS perceptual loss in latent space
         if self.latent_perceptual_model is not None:

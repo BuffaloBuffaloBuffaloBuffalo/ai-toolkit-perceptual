@@ -218,6 +218,23 @@ class DifferentiableBodyProportionEncoder(nn.Module):
     VIS_THRESHOLD = 0.2  # minimum visibility to trust a keypoint
 
     @staticmethod
+    def _heatmaps_to_coords(heatmaps: torch.Tensor) -> torch.Tensor:
+        """Differentiable soft-argmax for ViTPose's (unnormalized, ~Gaussian) heatmaps.
+
+        ViTPose heatmaps are non-negative blobs that sum to ~20, NOT a probability
+        distribution, so ``dsntnn.dsnt(heatmaps)`` directly computes a meaningless
+        centroid (~800 px off the true peak in a 256x192 input — every keypoint
+        wrong). Integral regression fixes it: clamp to >=0, normalize each
+        keypoint's heatmap to a spatial distribution, then take its expectation.
+        Matches the argmax peak to ~3 px (within the 4-px heatmap grid) while
+        staying smoothly differentiable. Returns ``(B, K, 2)`` in [-1, 1].
+        """
+        import dsntnn
+        hm = heatmaps.clamp(min=0)
+        hm = hm / hm.sum(dim=(2, 3), keepdim=True).clamp(min=1e-6)
+        return dsntnn.dsnt(hm)
+
+    @staticmethod
     def _compute_ratios(
         keypoints: torch.Tensor,
         visibilities: torch.Tensor,
@@ -347,7 +364,7 @@ class DifferentiableBodyProportionEncoder(nn.Module):
         heatmaps = outputs.heatmaps.float()  # (1, 17, 64, 48)
 
         # Differentiable coordinates in [-1, 1]
-        coords = dsntnn.dsnt(heatmaps)  # (1, 17, 2)
+        coords = self._heatmaps_to_coords(heatmaps)  # (1, 17, 2) integral regression
         # Confidence from heatmap peaks
         confidence = heatmaps.flatten(2).max(dim=2).values  # (1, 17)
 
@@ -427,7 +444,7 @@ class DifferentiableBodyProportionEncoder(nn.Module):
                 heatmaps = self.model(sample.to(model_dtype), dataset_index=torch.tensor([0], device=sample.device)).heatmaps.float()
 
                 # Differentiable coordinates in [-1, 1]
-                coords = dsntnn.dsnt(heatmaps)  # (1, 17, 2)
+                coords = self._heatmaps_to_coords(heatmaps)  # (1, 17, 2) integral regression
                 confidence = heatmaps.flatten(2).max(dim=2).values.detach()  # (1, 17) — detach to prevent gradient through peak values (causes green dot artifacts)
 
                 all_kp.append(coords)
@@ -542,7 +559,9 @@ def cache_body_proportion_embeddings(
 
     include_head = getattr(face_id_config, 'body_proportion_include_head', False)
     # Cache version key: v3 = with head ratios, v2 = body only
-    CACHE_VERSION_KEY = 'body_proportion_v3_head' if include_head else 'body_proportion_v2'
+    # v4/v3: integral-regression keypoints (fixed the dsnt-on-raw-heatmaps bug);
+    # old caches stored garbage ratios and must be recomputed.
+    CACHE_VERSION_KEY = 'body_proportion_v4_head' if include_head else 'body_proportion_v3'
 
     for file_item in tqdm(file_items, desc="Caching body proportion embeddings"):
         img_dir = os.path.dirname(file_item.path)
@@ -618,6 +637,113 @@ def cache_body_proportion_embeddings(
 
     if no_body_count > 0:
         print(f"  -  Warning: no body detected in {no_body_count}/{len(file_items)} images (using zero vector)")
+
+
+def cache_video_body_proportion_embeddings(
+    file_items: List['FileItemDTO'],
+    face_id_config: 'FaceIDConfig',
+    device: Optional[torch.device] = None,
+    num_frames: Optional[int] = None,
+):
+    """Extract and cache per-frame GT body-proportion ratios for video items.
+
+    For each video, reads the training frames (same flip → scale → crop the
+    dataloader applies) and runs ViTPose per frame full-frame (as the image
+    path does) to store a ``(T, 2N)`` cube — first N bone-length ratios, last N
+    visibilities (N=8, or 10 with ``body_proportion_include_head``). Frames with
+    no detectable body come back as a zero row (masked out by the loss).
+
+    Cached at ``{video_dir}/_face_id_cache/{stem}.safetensors`` under
+    ``body_proportion_gt_video[_head]`` with a ``..._v1`` version marker; sets
+    ``file_item.body_proportion_gt_video``. No person detector is needed: the
+    encoder zeros out low-confidence frames on its own.
+
+    Args:
+        file_items: items whose ``is_video`` is truthy are processed.
+        face_id_config: supplies ``body_proportion_include_head``.
+        device: CUDA device for extraction.
+        num_frames: uniformly subsample to this many frames; must match the
+            training ``num_frames`` so cached T lines up with the decoded x0 T.
+    """
+    from PIL import Image
+    from toolkit.video_frames import read_video_frames_with_transform
+
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    video_items = [f for f in file_items if getattr(f, "is_video", False)]
+    if not video_items:
+        return
+
+    include_head = getattr(face_id_config, 'body_proportion_include_head', False)
+    gt_key = "body_proportion_gt_video_head" if include_head else "body_proportion_gt_video"
+    version_key = f"{gt_key}_v2"  # v2: integral-regression keypoints (dsnt bug fix)
+
+    print(f"  -  Loading ViTPose for GT video body-proportion caching ({len(video_items)} videos)...")
+    encoder = DifferentiableBodyProportionEncoder()
+    encoder.to(device)
+    encoder.eval()
+
+    no_body_frames = 0
+    total_frames = 0
+
+    for file_item in tqdm(video_items, desc="Caching GT body-proportion (video)"):
+        vid_dir = os.path.dirname(file_item.path)
+        cache_dir = os.path.join(vid_dir, "_face_id_cache")
+        stem = os.path.splitext(os.path.basename(file_item.path))[0]
+        cache_path = os.path.join(cache_dir, f"{stem}.safetensors")
+
+        if os.path.exists(cache_path):
+            data = load_file(cache_path)
+            if (gt_key in data and version_key in data
+                    and (num_frames is None or data[gt_key].shape[0] == num_frames)):
+                file_item.body_proportion_gt_video = data[gt_key].clone()
+                continue
+
+        frames = read_video_frames_with_transform(file_item, num_frames)
+        if frames is None:
+            print(f"  -  Warning: cannot read video frames: {file_item.path}")
+            continue
+
+        rows = []
+        for t in range(frames.shape[0]):
+            # Encode via the SAME forward() path the loss uses at train time (the
+            # differentiable affine-warp preprocessing), so a perfect
+            # reconstruction scores ratio L1 ~0 with no GT/train preprocessing gap.
+            frame_t = frames[t].unsqueeze(0).to(device)  # (1, 3, H, W) in [0, 1]
+            with torch.no_grad():
+                _r, _v = encoder(frame_t, ref_ratios=None, include_head=include_head)
+            if float(_v.mean()) < 0.1:  # no body — mirror encode()'s low-vis → zeros
+                vec = torch.zeros(_r.shape[-1] * 2, dtype=torch.float32)
+                no_body_frames += 1
+            else:
+                vec = torch.cat([_r.squeeze(0), _v.squeeze(0)], dim=0).detach().cpu().float()  # (2N,)
+            rows.append(vec)
+            total_frames += 1
+        gt_video = torch.stack(rows)  # (T, 2N)
+
+        file_item.body_proportion_gt_video = gt_video
+
+        save_data = {}
+        if os.path.exists(cache_path):
+            try:
+                save_data = {k: v.clone() for k, v in load_file(cache_path).items()}
+            except Exception:  # noqa: BLE001 — corrupt cache → rewrite
+                save_data = {}
+        save_data[gt_key] = gt_video
+        save_data[version_key] = torch.ones(1)
+        os.makedirs(cache_dir, exist_ok=True)
+        save_file(save_data, cache_path)
+
+    del encoder
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    if no_body_frames > 0:
+        print(
+            f"  -  Note: no body in {no_body_frames}/{total_frames} video frames "
+            f"(masked out of the body-proportion loss)"
+        )
 
 
 def cache_body_embeddings(

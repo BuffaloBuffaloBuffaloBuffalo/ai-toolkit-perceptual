@@ -649,3 +649,200 @@ def cache_face_embeddings(
 
     if no_face_count > 0:
         print(f"  -  Warning: no face detected in {no_face_count}/{len(file_items)} images (using zero vector)")
+
+
+# Bump to invalidate cached per-frame video identity GT (e.g. if the crop
+# padding or the encoder normalization changes).
+# v2: GT is computed on the DECODED frames (same tiny decoder the loss uses),
+# not the sharp originals, so a perfect reconstruction scores cosine 1.0 and the
+# target is reachable. Frames whose face does not survive decoding are gated out.
+CACHE_VERSION_IDENTITY_VIDEO_KEY = "identity_gt_video_v2"
+
+
+def _ltx_taehv_version(arch: str) -> str:
+    return "2.3" if "2.3" in str(arch) else "2.0"
+
+
+def cache_video_identity_embeddings(
+    file_items: List['FileItemDTO'],
+    face_id_config: 'FaceIDConfig',
+    device: Optional[torch.device] = None,
+    num_frames: Optional[int] = None,
+    arch: str = "ltx2.3",
+):
+    """Cache per-frame GT ArcFace identity embeddings from the DECODED clip.
+
+    The identity loss compares ``ArcFace(TAEHV-decode(x0))`` against this GT, so
+    the GT is computed the SAME way: decode the clip through the same tiny
+    decoder the loss uses (the cached latent if available, else a TAEHV
+    round-trip of the frames), then run ArcFace on the decoded faces. This makes
+    a perfect reconstruction score cosine 1.0 — unlike a GT taken from the sharp
+    original, where even a perfect x0 only scored ~0.2 against the blurry decode.
+
+    A frame is only used (``valid = 1``) if the detector finds a face in the
+    DECODED frame with ``det_score >= identity_loss_decoded_det_threshold`` —
+    frames the codec blurs past recognition are dropped (the user's "sensitivity"
+    knob). Cached at ``{video_dir}/_face_id_cache/{stem}.safetensors``:
+
+      - ``identity_gt_video``       ``(T, 512)`` fp16, L2-normalized; zeros where gated out.
+      - ``identity_gt_video_bbox``  ``(T, 4)``  float32, normalized [0,1] box in the decoded
+                                    frame (loss scales it to the decoded x0 resolution).
+      - ``identity_gt_video_valid`` ``(T,)``    float32 (1.0 where the decoded face passed the gate).
+
+    Versioned by ``CACHE_VERSION_IDENTITY_VIDEO_KEY``.
+
+    Args:
+        file_items: items whose ``is_video`` is truthy are processed.
+        face_id_config: InsightFace model name + ``identity_loss_decoded_det_threshold``.
+        device: CUDA device for extraction.
+        num_frames: uniformly subsample to this many frames (round-trip fallback).
+        arch: model arch, selects the tiny decoder (LTX vs Wan).
+    """
+    import cv2
+    from PIL import Image
+    from toolkit.depth_consistency import (
+        decode_wan_x0_to_frames,
+        load_taehv_ltx2,
+        load_taehv_wan21,
+    )
+    from toolkit.video_frames import read_video_frames_with_transform
+
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    video_items = [f for f in file_items if getattr(f, "is_video", False)]
+    if not video_items:
+        return
+
+    det_thresh = float(getattr(face_id_config, 'identity_loss_decoded_det_threshold', 0.5))
+
+    print(
+        f"  -  Loading ArcFace + InsightFace + tiny decoder for GT video identity "
+        f"caching ({len(video_items)} videos, det_thresh={det_thresh})..."
+    )
+    extractor = FaceIDExtractor(model_name=face_id_config.face_model)
+    identity_encoder = DifferentiableFaceEncoder().to(device)
+    if str(arch).startswith("ltx"):
+        decoder = load_taehv_ltx2(device=str(device), dtype=torch.bfloat16,
+                                  version=_ltx_taehv_version(arch))
+    else:
+        decoder = load_taehv_wan21(device=str(device), dtype=torch.bfloat16)
+
+    def _score_bbox(pil):
+        """(det_score, bbox) of the largest face in a PIL frame, or (0.0, None)."""
+        faces, _ = extractor._detect(cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR))
+        if not faces:
+            return 0.0, None
+        f = extractor._get_largest_face(faces)
+        return float(f.det_score), f.bbox.astype(np.float32)
+
+    def _decode_clip(file_item):
+        """Decode the clip through the tiny decoder → (T_out, 3, H, W) in [0,1].
+
+        Prefers the cached real-VAE latent (exact match to what the loss decodes);
+        falls back to a TAEHV round-trip of the read frames.
+        """
+        latent = None
+        try:
+            _l = file_item.get_latent()
+            if _l is not None:
+                _l = _l.to(device, torch.bfloat16)
+                if _l.dim() == 4:
+                    _l = _l.unsqueeze(0)
+                if _l.dim() == 5:
+                    latent = _l
+        except Exception:  # noqa: BLE001 — fall back to round-trip
+            latent = None
+        with torch.no_grad():
+            if latent is not None:
+                dec = decode_wan_x0_to_frames(latent, decoder)
+            else:
+                frames = read_video_frames_with_transform(file_item, num_frames)
+                if frames is None:
+                    return None
+                lat = decoder.encode_video(frames.unsqueeze(0).to(device, torch.bfloat16),
+                                           parallel=True, show_progress_bar=False)
+                dec = decode_wan_x0_to_frames(lat.permute(0, 2, 1, 3, 4).contiguous(), decoder)
+        return dec[0].permute(1, 0, 2, 3).float().clamp(0, 1)  # (T_out, 3, H, W)
+
+    no_face_frames = 0
+    total_frames = 0
+
+    for file_item in tqdm(video_items, desc="Caching GT identity (video, decoded)"):
+        vid_dir = os.path.dirname(file_item.path)
+        cache_dir = os.path.join(vid_dir, "_face_id_cache")
+        stem = os.path.splitext(os.path.basename(file_item.path))[0]
+        cache_path = os.path.join(cache_dir, f"{stem}.safetensors")
+
+        if os.path.exists(cache_path):
+            data = load_file(cache_path)
+            if ('identity_gt_video' in data
+                    and CACHE_VERSION_IDENTITY_VIDEO_KEY in data
+                    and (num_frames is None
+                         or data['identity_gt_video'].shape[0] == num_frames)):
+                file_item.identity_gt_video = data['identity_gt_video'].clone()
+                file_item.identity_gt_video_bbox = data['identity_gt_video_bbox'].clone()
+                file_item.identity_gt_video_valid = data['identity_gt_video_valid'].clone()
+                continue
+
+        decoded = _decode_clip(file_item)
+        if decoded is None:
+            print(f"  -  Warning: cannot read/decode video: {file_item.path}")
+            continue
+
+        embs, bboxes, valids = [], [], []
+        for t in range(decoded.shape[0]):
+            frame = decoded[t]  # (3, H, W) in [0, 1] — the DECODED frame
+            _, H, W = frame.shape
+            pil = Image.fromarray(
+                (frame.permute(1, 2, 0).clamp(0, 1) * 255.0).byte().cpu().numpy()
+            )
+            score, bbox = _score_bbox(pil)
+            total_frames += 1
+            if bbox is not None and score >= det_thresh:
+                bbox_px = [float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])]
+                with torch.no_grad():
+                    emb = identity_encoder(frame.unsqueeze(0).to(device),
+                                           bboxes=[bbox_px], return_crops=False)
+                embs.append(emb.squeeze(0).detach().cpu().to(torch.float16))  # (512,)
+                bboxes.append(torch.tensor(
+                    [bbox_px[0] / W, bbox_px[1] / H, bbox_px[2] / W, bbox_px[3] / H],
+                    dtype=torch.float32,
+                ))
+                valids.append(1.0)
+            else:
+                embs.append(torch.zeros(512, dtype=torch.float16))
+                bboxes.append(torch.zeros(4, dtype=torch.float32))
+                valids.append(0.0)
+                no_face_frames += 1
+
+        identity_gt_video = torch.stack(embs)               # (T, 512) fp16
+        identity_gt_video_bbox = torch.stack(bboxes)        # (T, 4)
+        identity_gt_video_valid = torch.tensor(valids, dtype=torch.float32)  # (T,)
+
+        file_item.identity_gt_video = identity_gt_video
+        file_item.identity_gt_video_bbox = identity_gt_video_bbox
+        file_item.identity_gt_video_valid = identity_gt_video_valid
+
+        save_data = {}
+        if os.path.exists(cache_path):
+            try:
+                save_data = {k: v.clone() for k, v in load_file(cache_path).items()}
+            except Exception:  # noqa: BLE001 — corrupt cache → rewrite
+                save_data = {}
+        save_data['identity_gt_video'] = identity_gt_video
+        save_data['identity_gt_video_bbox'] = identity_gt_video_bbox
+        save_data['identity_gt_video_valid'] = identity_gt_video_valid
+        save_data[CACHE_VERSION_IDENTITY_VIDEO_KEY] = torch.ones(1)
+        os.makedirs(cache_dir, exist_ok=True)
+        save_file(save_data, cache_path)
+
+    del extractor, identity_encoder, decoder
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    if no_face_frames > 0:
+        print(
+            f"  -  Note: face gated out in {no_face_frames}/{total_frames} decoded "
+            f"video frames (det_score < {det_thresh}; excluded from the identity loss)"
+        )

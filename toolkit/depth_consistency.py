@@ -73,26 +73,29 @@ def _load_then_close(cache_path: str) -> dict:
     return copied
 
 
-def _read_cached_tensor(cache_path: str, key: str, version_key: str):
-    """Lean cache-HIT read: pull a single tensor by ``key`` without loading or
-    cloning the rest of the file, and without forcing a GC pass.
+def _cache_header_shape(cache_path: str, key: str, version_key: str):
+    """Header-only cache-HIT validation: return the shape of ``key`` (a list)
+    when both ``key`` and ``version_key`` are present, else None.
 
-    The full-file ``load_file`` + clone-all + ``gc.collect()`` in
-    ``_load_then_close`` exists only to release the mmap before an in-place
-    rewrite (the write path). The read/hit path never rewrites the file, so
-    none of that is needed — and a per-item ``gc.collect()`` turns cache reuse
-    into an O(N^2) heap walk that starves the loop with no GPU work (pure CPU,
-    no VRAM). ``safe_open`` reads only the header for ``keys()`` and only the
-    requested tensor's bytes for ``get_tensor()``; the returned tensor owns its
-    storage and the file is closed on context exit, so no mmap lingers.
+    This is the up-front pass's hit check. It deliberately does NOT read the
+    tensor: ``safe_open`` + ``keys()`` + ``get_slice(key).get_shape()`` touch
+    only the safetensors header (a small JSON blob), never the tensor bytes.
+    The heavy per-map read is deferred to the DataLoader worker
+    (``FileItemDTO.get_depth_gt`` / ``get_depth_gt_video``), so the caching
+    pass stays header-bound — like the latent / text-embedding caches, whose
+    hit path is a bare ``os.path.exists()`` — instead of materializing every
+    map into RAM serially on the main process (the old behaviour, which left
+    the pass crawling even after the per-item ``gc.collect()`` was removed).
 
-    Returns the tensor when both ``key`` and ``version_key`` are present, else
-    None (caller falls through to recompute).
+    Returns None on an unreadable / corrupt file so the caller recomputes.
     """
-    with safe_open(cache_path, framework="pt", device="cpu") as f:
-        keys = f.keys()
-        if key in keys and version_key in keys:
-            return f.get_tensor(key)
+    try:
+        with safe_open(cache_path, framework="pt", device="cpu") as f:
+            keys = f.keys()
+            if key in keys and version_key in keys:
+                return f.get_slice(key).get_shape()
+    except Exception:  # noqa: BLE001 — corrupt/unreadable cache → recompute
+        return None
     return None
 
 
@@ -478,9 +481,17 @@ def cache_depth_gt_embeddings(
             depth_key = f"depth_gt{_blur_sfx}"
 
         if os.path.exists(cache_path):
-            cached = _read_cached_tensor(cache_path, depth_key, CACHE_VERSION_KEY)
-            if cached is not None:
-                file_item.depth_gt = cached
+            # Header-only hit check — record where to read from and defer the
+            # actual tensor load to the DataLoader worker (get_depth_gt). The
+            # bucket-specific depth_key must be validated here (one cache file
+            # holds every bucket's map), but reading the bytes now would
+            # serialize N large reads on the main process and hold them all
+            # resident — the stall this lazy path removes.
+            if _cache_header_shape(cache_path, depth_key, CACHE_VERSION_KEY) is not None:
+                file_item.depth_gt = None
+                file_item._depth_cache_path = cache_path
+                file_item._depth_cache_key = depth_key
+                file_item.is_depth_cached = True
                 continue
 
         # v2: run DA2 on the *dataloader-transformed* pixels so cached depth
@@ -514,7 +525,11 @@ def cache_depth_gt_embeddings(
         if depth.abs().sum() < 1e-6:
             zero_depth_count += 1
 
-        file_item.depth_gt = depth
+        # Don't retain the tensor on the shared file_list item: it would be
+        # deep-copied on every __getitem__ and held resident for every image
+        # at once. The worker re-reads from the cache we're about to write
+        # (get_depth_gt), same as the hit path.
+        file_item.depth_gt = None
 
         save_data = {}
         if os.path.exists(cache_path):
@@ -525,6 +540,13 @@ def cache_depth_gt_embeddings(
         save_data[depth_key] = depth
         save_data[CACHE_VERSION_KEY] = torch.ones(1)
         _atomic_save_file(save_data, cache_path)
+
+        # Record lazy-load metadata so cleanup_depth can release the resident
+        # tensor and the worker re-reads from the just-written cache on later
+        # epochs — same contract as the hit path.
+        file_item._depth_cache_path = cache_path
+        file_item._depth_cache_key = depth_key
+        file_item.is_depth_cached = True
 
     del encoder
     gc.collect()
@@ -699,14 +721,19 @@ def cache_video_depth_gt_embeddings(
         cache_path = os.path.join(cache_dir, f"{stem}.safetensors")
 
         # Cache hit: reuse if version matches AND cached T == requested T.
+        # Header-only — the frame count comes from the stored shape, so the
+        # tensor read defers to the worker (get_depth_gt_video).
         if os.path.exists(cache_path):
-            cached = _read_cached_tensor(
+            _shape = _cache_header_shape(
                 cache_path, video_depth_key, CACHE_VERSION_VIDEO_KEY
             )
-            if cached is not None and (
-                num_frames is None or cached.shape[0] == num_frames
+            if _shape is not None and (
+                num_frames is None or _shape[0] == num_frames
             ):
-                file_item.depth_gt_video = cached
+                file_item.depth_gt_video = None
+                file_item._depth_video_cache_path = cache_path
+                file_item._depth_video_cache_key = video_depth_key
+                file_item.is_depth_video_cached = True
                 continue
 
         # Read + transform frames exactly as the dataloader does (flip → resize
@@ -730,7 +757,9 @@ def cache_video_depth_gt_embeddings(
                 depth_frames.append(d.detach().cpu().to(torch.float16))
         depth_video = torch.cat(depth_frames, dim=0)  # (T, H_out, W_out)
 
-        file_item.depth_gt_video = depth_video
+        # Don't retain on the shared file_list item — re-read in the worker
+        # (get_depth_gt_video) to keep deepcopy cheap and RAM bounded.
+        file_item.depth_gt_video = None
 
         save_data = {}
         if os.path.exists(cache_path):
@@ -741,6 +770,12 @@ def cache_video_depth_gt_embeddings(
         save_data[video_depth_key] = depth_video
         save_data[CACHE_VERSION_VIDEO_KEY] = torch.ones(1)
         _atomic_save_file(save_data, cache_path)
+
+        # Lazy-load metadata so cleanup_depth releases the resident cube and
+        # the worker re-reads from the just-written cache on later epochs.
+        file_item._depth_video_cache_path = cache_path
+        file_item._depth_video_cache_key = video_depth_key
+        file_item.is_depth_video_cached = True
 
     del encoder
     gc.collect()

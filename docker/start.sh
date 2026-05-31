@@ -87,9 +87,39 @@ link_to_workspace() {
         echo "Linked ${app_path} -> ${ws_path}"
     fi
 }
+
+# Persist the UI database on /workspace so jobs, settings, and the saved HF
+# token survive a pod stop (the container filesystem is wiped on stop; only the
+# /workspace volume persists). Prisma points at /app/ai-toolkit/aitk_db.db
+# (file:../../aitk_db.db from ui/prisma/schema.prisma); move that file onto the
+# volume on first boot and symlink it back. SQLite resolves the symlink, so the
+# -wal/-shm side files are created on /workspace too.
+link_db_to_workspace() {
+    local db_name="aitk_db.db"
+    local app_db="/app/ai-toolkit/${db_name}"
+    local ws_db="/workspace/${db_name}"
+    if [ -d /workspace ]; then
+        # First boot only: seed the volume with the schema-pushed db baked into
+        # the image. Never overwrite a db that already exists on the volume.
+        if [ ! -e "${ws_db}" ] && [ -f "${app_db}" ] && [ ! -L "${app_db}" ]; then
+            mv "${app_db}" "${ws_db}"
+        fi
+        rm -f "${app_db}"
+        ln -sfn "${ws_db}" "${app_db}"
+        echo "Linked ${app_db} -> ${ws_db}"
+    fi
+}
 link_to_workspace output
 link_to_workspace datasets
 link_to_workspace models
+link_db_to_workspace
+
+# Bring the persisted db up to date with any additive schema changes shipped in
+# a newer image. Guarded so a push failure warns instead of aborting startup.
+if [ -d /workspace ]; then
+    ( cd /app/ai-toolkit/ui && npx prisma db push --skip-generate ) \
+        || echo "WARNING: 'prisma db push' failed; continuing with the existing database schema."
+fi
 
 echo "Starting AI Toolkit UI..."
 cd /app/ai-toolkit/ui && npm run start

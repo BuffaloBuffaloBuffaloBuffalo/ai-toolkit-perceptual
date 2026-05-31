@@ -1,7 +1,11 @@
 """Subject-mask preflight: run extraction on a dataset folder for visual QC.
 
-Writes 5-panel tile PNGs ([image | person | body | clothing | parse colormap])
-plus ``progress.json`` and ``done.marker`` to ``<output_dir>``. Pure inspection —
+For images, writes a 5-panel tile PNG ([image | person | body | clothing |
+parse colormap]). For videos, uniformly samples ``--video-frames`` frames across
+the clip, runs extraction on each, and vertically stacks the per-frame tiles
+into one labelled montage PNG so a clip's temporal behaviour reads as a single
+image. Either way the output is one ``<stem>.png`` per source file, plus
+``progress.json`` and ``done.marker`` in ``<output_dir>``. Pure inspection —
 does NOT touch the dataset's ``_face_id_cache/`` and does not write any
 safetensors. Re-runs with different CLI args overwrite tiles in place.
 
@@ -25,15 +29,21 @@ if _REPO_ROOT not in sys.path:
 
 
 IMAGE_EXTS = ('.jpg', '.jpeg', '.png', '.webp', '.bmp')
+# Mirror toolkit.data_loader.video_extensions so the preflight sees exactly the
+# files the dataloader would treat as videos.
+VIDEO_EXTS = ('.mp4', '.avi', '.mov', '.webm', '.mkv', '.wmv', '.m4v', '.flv')
 
 
-def _list_images(dataset_dir: str):
+def _is_video(path: str) -> bool:
+    return os.path.splitext(path)[1].lower() in VIDEO_EXTS
+
+
+def _list_media(dataset_dir: str):
     out = []
-    for ext in IMAGE_EXTS:
+    for ext in IMAGE_EXTS + VIDEO_EXTS:
         out.extend(glob(os.path.join(dataset_dir, f'*{ext}')))
         out.extend(glob(os.path.join(dataset_dir, f'*{ext.upper()}')))
-    out = sorted(set(out))
-    return out
+    return sorted(set(out))
 
 
 def _write_progress(progress_path: str, payload: dict) -> None:
@@ -55,7 +65,9 @@ def main():
     p.add_argument('--primary-only', type=int, default=1, help='1 = use only the largest YOLO box')
     p.add_argument('--sam-size', default='small', choices=['tiny', 'small', 'base_plus', 'large'])
     p.add_argument('--dtype', default='fp16', choices=['fp16', 'bf16', 'fp32'])
-    p.add_argument('--limit', type=int, default=0, help='If >0, only process the first N images')
+    p.add_argument('--limit', type=int, default=0, help='If >0, only process the first N files')
+    p.add_argument('--video-frames', type=int, default=4,
+                   help='Frames uniformly sampled per video for the QC montage')
     args = p.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -68,7 +80,7 @@ def main():
     with open(config_path, 'w') as f:
         json.dump(vars(args), f, indent=2)
 
-    files = _list_images(args.dataset_dir)
+    files = _list_media(args.dataset_dir)
     if args.limit > 0:
         files = files[:args.limit]
     total = len(files)
@@ -76,7 +88,7 @@ def main():
     if total == 0:
         _write_progress(progress_path, {
             'status': 'error',
-            'message': f'No images found under {args.dataset_dir}',
+            'message': f'No images or videos found under {args.dataset_dir}',
             'done': 0, 'total': 0,
         })
         with open(done_path, 'w') as f:
@@ -98,6 +110,9 @@ def main():
         from toolkit.subject_mask import (
             SubjectMaskExtractor, _render_preview_tile,
         )
+        from toolkit.video_frames import (
+            sample_video_frames_pil, vstack_labeled_tiles,
+        )
 
         cfg = SubjectMaskConfig(
             enabled=True,
@@ -114,18 +129,34 @@ def main():
 
         for i, path in enumerate(files):
             stem = os.path.splitext(os.path.basename(path))[0]
+            is_video = _is_video(path)
             _write_progress(progress_path, {
                 'status': 'running',
-                'message': f'Processing {os.path.basename(path)}',
+                'message': f'Processing {os.path.basename(path)}'
+                           + (' (video)' if is_video else ''),
                 'done': i, 'total': total, 'current': os.path.basename(path),
             })
             try:
-                pil = exif_transpose(Image.open(path)).convert('RGB')
-                masks = extractor.extract(pil)
-                tile = _render_preview_tile(
-                    pil, masks, n_classes=extractor.seg_cfg.num_labels,
-                )
-                tile.save(os.path.join(args.output_dir, f'{stem}.png'))
+                if is_video:
+                    frames = sample_video_frames_pil(path, args.video_frames)
+                    if not frames:
+                        raise Exception('No readable frames in video')
+                else:
+                    frames = [(None, exif_transpose(Image.open(path)).convert('RGB'))]
+
+                tiles, labels = [], []
+                for fidx, frame_pil in frames:
+                    masks = extractor.extract(frame_pil)
+                    tiles.append(_render_preview_tile(
+                        frame_pil, masks, n_classes=extractor.seg_cfg.num_labels,
+                    ))
+                    labels.append(f'frame {fidx}')
+
+                if is_video:
+                    montage = vstack_labeled_tiles(tiles, labels)
+                    montage.save(os.path.join(args.output_dir, f'{stem}.png'))
+                else:
+                    tiles[0].save(os.path.join(args.output_dir, f'{stem}.png'))
             except Exception as e:  # noqa: BLE001
                 # Per-image failures are non-fatal; record and continue so
                 # one bad file doesn't kill the whole run.

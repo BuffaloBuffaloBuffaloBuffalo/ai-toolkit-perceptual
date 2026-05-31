@@ -77,6 +77,7 @@ export async function POST(request: NextRequest) {
       '--sam-size', String(cfg.sam_size ?? 'small'),
       '--dtype', String(cfg.dtype ?? 'fp16'),
       '--limit', String(cfg.limit ?? 0),
+      '--video-frames', String(cfg.video_frames ?? 4),
     ];
 
     const subprocess = spawn(pythonPath, args, {

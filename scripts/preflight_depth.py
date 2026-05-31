@@ -5,6 +5,11 @@ With ``--use-mask``: also loads the subject-mask extractor and writes a 4-panel
 tile: ``[ original | depth | subject mask | depth × mask ]`` so the user can
 verify the spatial region the depth-consistency loss is restricted to.
 
+For videos, ``--video-frames`` frames are uniformly sampled across the clip,
+each gets the same 2- or 4-panel treatment, and the per-frame tiles are stacked
+into one labelled montage PNG. Output is one ``<stem>.png`` per source file
+either way.
+
 Pure inspection — does NOT touch the dataset's ``_face_id_cache/``. Tiles are
 overwritten in place on re-runs with the same runId.
 
@@ -28,11 +33,18 @@ if _REPO_ROOT not in sys.path:
 
 
 IMAGE_EXTS = ('.jpg', '.jpeg', '.png', '.webp', '.bmp')
+# Mirror toolkit.data_loader.video_extensions so the preflight sees exactly the
+# files the dataloader would treat as videos.
+VIDEO_EXTS = ('.mp4', '.avi', '.mov', '.webm', '.mkv', '.wmv', '.m4v', '.flv')
 
 
-def _list_images(dataset_dir: str):
+def _is_video(path: str) -> bool:
+    return os.path.splitext(path)[1].lower() in VIDEO_EXTS
+
+
+def _list_media(dataset_dir: str):
     out = []
-    for ext in IMAGE_EXTS:
+    for ext in IMAGE_EXTS + VIDEO_EXTS:
         out.extend(glob(os.path.join(dataset_dir, f'*{ext}')))
         out.extend(glob(os.path.join(dataset_dir, f'*{ext.upper()}')))
     return sorted(set(out))
@@ -150,7 +162,9 @@ def main():
     p.add_argument('--primary-only', type=int, default=1)
     p.add_argument('--sam-size', default='small', choices=['tiny', 'small', 'base_plus', 'large'])
     p.add_argument('--dtype', default='fp16', choices=['fp16', 'bf16', 'fp32'])
-    p.add_argument('--limit', type=int, default=0, help='If >0, only process the first N images')
+    p.add_argument('--limit', type=int, default=0, help='If >0, only process the first N files')
+    p.add_argument('--video-frames', type=int, default=4,
+                   help='Frames uniformly sampled per video for the QC montage')
     args = p.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -161,7 +175,7 @@ def main():
     with open(config_path, 'w') as f:
         json.dump(vars(args), f, indent=2)
 
-    files = _list_images(args.dataset_dir)
+    files = _list_media(args.dataset_dir)
     if args.limit > 0:
         files = files[:args.limit]
     total = len(files)
@@ -171,7 +185,7 @@ def main():
     if total == 0:
         _write_progress(progress_path, {
             'status': 'error',
-            'message': f'No images found under {args.dataset_dir}',
+            'message': f'No images or videos found under {args.dataset_dir}',
             'done': 0, 'total': 0, 'dataset': dataset_name, 'use_mask': use_mask,
         })
         with open(done_path, 'w') as f:
@@ -191,6 +205,9 @@ def main():
         from PIL import Image
         from PIL.ImageOps import exif_transpose
         from toolkit.depth_consistency import DifferentiableDepthEncoder
+        from toolkit.video_frames import (
+            sample_video_frames_pil, vstack_labeled_tiles,
+        )
 
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         depth_dtype = {
@@ -221,14 +238,54 @@ def main():
             )
             mask_extractor = SubjectMaskExtractor(mask_cfg)
 
+        def _depth_tile(pil):
+            """Depth (+optional mask) panels for one RGB PIL frame.
+
+            Returns ``(tile, empty_mask)``; ``empty_mask`` is True only when
+            ``use_mask`` and the extracted subject mask is empty.
+            """
+            W, H = pil.size
+            arr = (
+                torch.from_numpy(np.asarray(pil, dtype=np.float32) / 255.0)
+                .permute(2, 0, 1)
+                .unsqueeze(0)
+                .to(device)
+            )
+            with torch.no_grad():
+                depth = encoder(arr)[0].float().cpu().numpy()  # (Hd, Wd)
+
+            depth_pil = _depth_to_gray_pil(depth, (W, H))
+
+            empty = False
+            if use_mask and mask_extractor is not None:
+                masks = mask_extractor.extract(pil)
+                person = masks['person']  # (H, W) bool, original res
+                empty = not bool(person.any())
+                mask_pil = _mask_to_pil(person, (W, H))
+                masked_depth_pil = _depth_times_mask_pil(depth_pil, person, (W, H))
+                panels = [
+                    ('Original', pil),
+                    ('Depth', depth_pil),
+                    ('Subject mask', mask_pil),
+                    ('Depth × mask', masked_depth_pil),
+                ]
+            else:
+                panels = [
+                    ('Original', pil),
+                    ('Depth', depth_pil),
+                ]
+            return _render_tile(panels), empty
+
         n_processed = 0
         n_empty_mask = 0
 
         for i, path in enumerate(files):
             stem = os.path.splitext(os.path.basename(path))[0]
+            is_video = _is_video(path)
             _write_progress(progress_path, {
                 'status': 'running',
-                'message': f'Processing {os.path.basename(path)}',
+                'message': f'Processing {os.path.basename(path)}'
+                           + (' (video)' if is_video else ''),
                 'done': i, 'total': total,
                 'current': os.path.basename(path),
                 'processed': n_processed,
@@ -237,41 +294,27 @@ def main():
                 'use_mask': use_mask,
             })
             try:
-                pil = exif_transpose(Image.open(path)).convert('RGB')
-                W, H = pil.size
-
-                arr = (
-                    torch.from_numpy(np.asarray(pil, dtype=np.float32) / 255.0)
-                    .permute(2, 0, 1)
-                    .unsqueeze(0)
-                    .to(device)
-                )
-                with torch.no_grad():
-                    depth = encoder(arr)[0].float().cpu().numpy()  # (Hd, Wd)
-
-                depth_pil = _depth_to_gray_pil(depth, (W, H))
-
-                if use_mask and mask_extractor is not None:
-                    masks = mask_extractor.extract(pil)
-                    person = masks['person']  # (H, W) bool, original res
-                    if not bool(person.any()):
+                if is_video:
+                    frames = sample_video_frames_pil(path, args.video_frames)
+                    if not frames:
+                        raise Exception('No readable frames in video')
+                    tiles, labels = [], []
+                    any_empty = False
+                    for fidx, frame_pil in frames:
+                        tile, empty = _depth_tile(frame_pil)
+                        tiles.append(tile)
+                        labels.append(f'frame {fidx}' + (': empty mask' if (use_mask and empty) else ''))
+                        any_empty = any_empty or empty
+                    vstack_labeled_tiles(tiles, labels).save(
+                        os.path.join(args.output_dir, f'{stem}.png'))
+                    if use_mask and any_empty:
                         n_empty_mask += 1
-                    mask_pil = _mask_to_pil(person, (W, H))
-                    masked_depth_pil = _depth_times_mask_pil(depth_pil, person, (W, H))
-                    panels = [
-                        ('Original', pil),
-                        ('Depth', depth_pil),
-                        ('Subject mask', mask_pil),
-                        ('Depth × mask', masked_depth_pil),
-                    ]
                 else:
-                    panels = [
-                        ('Original', pil),
-                        ('Depth', depth_pil),
-                    ]
-
-                tile = _render_tile(panels)
-                tile.save(os.path.join(args.output_dir, f'{stem}.png'))
+                    pil = exif_transpose(Image.open(path)).convert('RGB')
+                    tile, empty = _depth_tile(pil)
+                    if use_mask and empty:
+                        n_empty_mask += 1
+                    tile.save(os.path.join(args.output_dir, f'{stem}.png'))
                 n_processed += 1
             except Exception as e:  # noqa: BLE001
                 err_path = os.path.join(args.output_dir, f'{stem}.error.txt')

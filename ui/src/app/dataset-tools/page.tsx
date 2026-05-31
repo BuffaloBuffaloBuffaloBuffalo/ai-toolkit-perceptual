@@ -16,12 +16,14 @@ type PreflightConfig = {
   primary_only: boolean;
   sam_size: 'tiny' | 'small' | 'base_plus' | 'large';
   limit: number;
+  video_frames: number;
 };
 
 type FaceDetectConfig = {
   face_model: string;
   det_size: number;
   limit: number;
+  video_frames: number;
 };
 
 type DepthConfig = {
@@ -37,6 +39,7 @@ type DepthConfig = {
   sam_size: 'tiny' | 'small' | 'base_plus' | 'large';
   dtype: 'fp16' | 'bf16' | 'fp32';
   limit: number;
+  video_frames: number;
 };
 
 type ProgressPayload = {
@@ -90,12 +93,14 @@ const DEFAULT_CFG: PreflightConfig = {
   primary_only: true,
   sam_size: 'small',
   limit: 0,
+  video_frames: 4,
 };
 
 const DEFAULT_FD_CFG: FaceDetectConfig = {
   face_model: 'buffalo_l',
   det_size: 640,
   limit: 0,
+  video_frames: 4,
 };
 
 const DEFAULT_DEPTH_CFG: DepthConfig = {
@@ -111,6 +116,7 @@ const DEFAULT_DEPTH_CFG: DepthConfig = {
   sam_size: 'small',
   dtype: 'fp16',
   limit: 0,
+  video_frames: 4,
 };
 
 export default function DatasetToolsPage() {
@@ -383,7 +389,9 @@ export default function DatasetToolsPage() {
           <section className="bg-gray-900 rounded-lg p-4">
             <h2 className="text-lg font-semibold text-gray-100 mb-2">Subject Mask Preflight</h2>
             <p className="text-sm text-gray-400 mb-4">
-              Run mask extraction on a dataset for visual QC. Tiles are written to{' '}
+              Run mask extraction on a dataset for visual QC. Videos are uniformly
+              sampled to <code className="text-gray-200">Video Frames</code> per clip and
+              stacked into one montage tile. Tiles are written to{' '}
               <code className="text-gray-200">output/dataset_preflight/&lt;runId&gt;/</code>. Does
               not affect the per-image <code className="text-gray-200">_face_id_cache</code>.
             </p>
@@ -438,10 +446,17 @@ export default function DatasetToolsPage() {
                 options={samOptions}
               />
               <NumberInput
-                label="Image Limit (0 = all)"
+                label="File Limit (0 = all)"
                 value={cfg.limit}
                 onChange={v => setCfg(c => ({ ...c, limit: Number(v ?? 0) }))}
                 min={0}
+              />
+              <NumberInput
+                label="Video Frames (sampled per clip)"
+                value={cfg.video_frames}
+                onChange={v => setCfg(c => ({ ...c, video_frames: Number(v ?? DEFAULT_CFG.video_frames) }))}
+                min={1}
+                max={64}
               />
               <div className="col-span-2 md:col-span-3 pt-2">
                 <Checkbox
@@ -552,7 +567,9 @@ export default function DatasetToolsPage() {
             <p className="text-sm text-gray-400 mb-4">
               Run InsightFace detection (RetinaFace) on a dataset for visual QC. Each tile shows
               the original image with bbox + keypoints overlaid; orange means a tight close-up
-              triggered the padding fallback. Tiles are written to{' '}
+              triggered the padding fallback. Videos are sampled to{' '}
+              <code className="text-gray-200">Video Frames</code> per clip and stacked into one
+              montage (each row labelled with its own detection status). Tiles are written to{' '}
               <code className="text-gray-200">output/dataset_face_detect/&lt;runId&gt;/</code>.
               Does not write to <code className="text-gray-200">_face_id_cache</code>.
             </p>
@@ -579,10 +596,17 @@ export default function DatasetToolsPage() {
                 max={1920}
               />
               <NumberInput
-                label="Image Limit (0 = all)"
+                label="File Limit (0 = all)"
                 value={fdCfg.limit}
                 onChange={v => setFdCfg(c => ({ ...c, limit: Number(v ?? 0) }))}
                 min={0}
+              />
+              <NumberInput
+                label="Video Frames (sampled per clip)"
+                value={fdCfg.video_frames}
+                onChange={v => setFdCfg(c => ({ ...c, video_frames: Number(v ?? DEFAULT_FD_CFG.video_frames) }))}
+                min={1}
+                max={64}
               />
             </div>
 
@@ -707,7 +731,8 @@ export default function DatasetToolsPage() {
               tile is <code className="text-gray-200">[ original | depth ]</code>; with mask on
               it becomes <code className="text-gray-200">[ original | depth | subject mask | depth × mask ]</code>{' '}
               so you can verify the spatial region the depth-consistency loss is restricted to.
-              Tiles are written to{' '}
+              Videos are sampled to <code className="text-gray-200">Video Frames</code> per clip and
+              stacked into one montage tile. Tiles are written to{' '}
               <code className="text-gray-200">output/dataset_depth/&lt;runId&gt;/</code>. Does
               not write to <code className="text-gray-200">_face_id_cache</code>.
             </p>
@@ -740,10 +765,17 @@ export default function DatasetToolsPage() {
                 options={dtypeOptions}
               />
               <NumberInput
-                label="Image Limit (0 = all)"
+                label="File Limit (0 = all)"
                 value={dpCfg.limit}
                 onChange={v => setDpCfg(c => ({ ...c, limit: Number(v ?? 0) }))}
                 min={0}
+              />
+              <NumberInput
+                label="Video Frames (sampled per clip)"
+                value={dpCfg.video_frames}
+                onChange={v => setDpCfg(c => ({ ...c, video_frames: Number(v ?? DEFAULT_DEPTH_CFG.video_frames) }))}
+                min={1}
+                max={64}
               />
               <div className="col-span-2 md:col-span-3 pt-2">
                 <Checkbox

@@ -693,6 +693,29 @@ class SDTrainer(BaseSDTrainProcess):
         by2 = max(0.0, min(by2, float(px_h)))
         return [bx1, by1, bx2, by2]
 
+    def _ensure_wan_depth_decoder(self):
+        """Lazily load the TAEHV tiny video decoder matching the model's latent
+        space (LTX-2/2.3 → 128-ch ``taeltx``; Wan 2.1 → 16-ch). Shared by every
+        5D video perceptor path — the live x0 decode and the still-image depth
+        GT roundtrip — so the decoder loads at most once. No-op if present."""
+        if self._wan_depth_decoder is not None:
+            return
+        _arch = (getattr(self.sd.model_config, 'arch', '') or '')
+        if _arch.startswith('ltx'):
+            _ltx_ver = str(getattr(self.sd, 'ltx_version', '2.3'))
+            print_acc(f"VideoPerceptor: loading TAEHV LTX-{_ltx_ver} tiny decoder...")
+            self._wan_depth_decoder = load_taehv_ltx2(
+                device=self.device_torch,
+                dtype=get_torch_dtype(self.train_config.dtype),
+                version=_ltx_ver,
+            )
+        else:
+            print_acc("VideoPerceptor: loading TAEHV tiny decoder...")
+            self._wan_depth_decoder = load_taehv_wan21(
+                device=self.device_torch,
+                dtype=get_torch_dtype(self.train_config.dtype),
+            )
+
     def _get_video_x0_frames(self, noise_pred, noisy_latents, timesteps, needs_grad):
         """Decode the x0 prediction to ``(B, 3, T, H, W)`` pixel frames in [0, 1].
 
@@ -711,24 +734,9 @@ class SDTrainer(BaseSDTrainProcess):
             # Non-flow video is unusual; mirrors the depth path's skip.
             return None
 
-        # Lazy-load the tiny decoder matching the model's latent space:
-        # LTX-2/2.3 (128-ch, taeltx) vs Wan 2.1 (16-ch).
-        if self._wan_depth_decoder is None:
-            _arch = (getattr(self.sd.model_config, 'arch', '') or '')
-            if _arch.startswith('ltx'):
-                _ltx_ver = str(getattr(self.sd, 'ltx_version', '2.3'))
-                print_acc(f"VideoPerceptor: loading TAEHV LTX-{_ltx_ver} tiny decoder...")
-                self._wan_depth_decoder = load_taehv_ltx2(
-                    device=self.device_torch,
-                    dtype=get_torch_dtype(self.train_config.dtype),
-                    version=_ltx_ver,
-                )
-            else:
-                print_acc("VideoPerceptor: loading TAEHV tiny decoder...")
-                self._wan_depth_decoder = load_taehv_wan21(
-                    device=self.device_torch,
-                    dtype=get_torch_dtype(self.train_config.dtype),
-                )
+        # Lazy-load the tiny decoder matching the model's latent space
+        # (LTX-2/2.3 vs Wan 2.1); shared with the still-image depth GT roundtrip.
+        self._ensure_wan_depth_decoder()
 
         cache = self._video_x0_frames_cache
         if (cache is not None and cache['step'] == self.step_num
@@ -1594,17 +1602,35 @@ class SDTrainer(BaseSDTrainProcess):
             _vae_scale = float(_vae_cfg.get('scaling_factor', 1.0)) if hasattr(_vae_cfg, 'get') else 1.0
             _vae_shift = float(_vae_cfg.get('shift_factor', 0.0) or 0.0) if hasattr(_vae_cfg, 'get') else 0.0
             _vae_dtype = self.sd.vae.dtype
-            # _vae_wants_5d (set above): LTX/Wan VAEs need a 5D tensor even for one
-            # image. Mirror ltx2.encode_images — add a singleton temporal axis
-            # going in, drop it coming out — so the depth GT roundtrip works here.
+            # _vae_wants_5d (set above): LTX/Wan emit 5D latents with per-channel
+            # (latent-mean)/std normalization and decode via TAEHV, not the
+            # scalar-scaled image VAE path below. _vae_roundtrip_for_depth
+            # branches on it and routes through the model's own encode_images.
 
             def _vae_roundtrip_for_depth(arr: torch.Tensor) -> torch.Tensor:
                 """[0,1] pixels → VAE encode → trainer decoder → [0,1] pixels."""
                 if next(self.sd.vae.parameters()).device != self.device_torch:
                     self.sd.vae.to(self.device_torch)
+                if _vae_wants_5d:
+                    # LTX/Wan latents normalize per-channel as (latent-mean)/std
+                    # (not the scalar scaling_factor/shift_factor the image VAEs
+                    # use), and the live video depth loss decodes them with the
+                    # TAEHV tiny video decoder (_get_video_x0_frames), not taesd
+                    # — a 2D image VAE that can't even accept a 5D 128-ch latent.
+                    # Route through the model's own encode_images (the single
+                    # source of truth for that normalization) then TAEHV, so the
+                    # cached still GT is the exact frame the trainer produces.
+                    img_m1 = (arr * 2.0 - 1.0).to(_vae_dtype)  # [0,1] -> [-1,1]
+                    latents = self.sd.encode_images(
+                        img_m1, device=self.device_torch, dtype=_vae_dtype
+                    )
+                    self._ensure_wan_depth_decoder()
+                    pixels = decode_wan_x0_to_frames(latents, self._wan_depth_decoder)
+                    if pixels.dim() == 5:
+                        # (B, C, T, H, W) -> (B, C, H, W) for the 2D depth encoder.
+                        pixels = pixels[:, :, 0]
+                    return pixels.clamp(0, 1)
                 arr_norm = (arr * 2.0 - 1.0).to(_vae_dtype)
-                if _vae_wants_5d and arr_norm.dim() == 4:
-                    arr_norm = arr_norm.unsqueeze(2)  # (B, C, H, W) -> (B, C, 1, H, W)
                 posterior = self.sd.vae.encode(arr_norm)
                 # Flux 2's VAE.encode returns a Tensor directly; standard
                 # diffusers VAEs return an object with `.latent_dist`. Cover both.

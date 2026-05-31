@@ -639,11 +639,28 @@ def cache_body_proportion_embeddings(
         print(f"  -  Warning: no body detected in {no_body_count}/{len(file_items)} images (using zero vector)")
 
 
+def _read_single_image_frame(file_item) -> Optional[torch.Tensor]:
+    """A still image as a 1-frame clip ``(1, 3, H, W)`` in [0, 1], with the same
+    flip/scale/crop the dataloader applies — so body-proportion GT for LTX/Wan
+    still images matches ``read_video_frames_with_transform``'s per-frame output."""
+    from PIL import Image
+    from PIL.ImageOps import exif_transpose
+    from toolkit.depth_consistency import _apply_dataloader_transform
+    try:
+        raw = exif_transpose(Image.open(file_item.path)).convert('RGB')
+    except Exception:  # noqa: BLE001 — unreadable image → skip (caller warns)
+        return None
+    pil = _apply_dataloader_transform(raw, file_item)
+    arr = torch.from_numpy(np.asarray(pil, dtype=np.float32) / 255.0)
+    return arr.permute(2, 0, 1).unsqueeze(0)  # (1, 3, H, W)
+
+
 def cache_video_body_proportion_embeddings(
     file_items: List['FileItemDTO'],
     face_id_config: 'FaceIDConfig',
     device: Optional[torch.device] = None,
     num_frames: Optional[int] = None,
+    include_images: bool = False,
 ):
     """Extract and cache per-frame GT body-proportion ratios for video items.
 
@@ -659,11 +676,16 @@ def cache_video_body_proportion_embeddings(
     encoder zeros out low-confidence frames on its own.
 
     Args:
-        file_items: items whose ``is_video`` is truthy are processed.
+        file_items: items whose ``is_video`` is truthy are processed (plus all
+            items when ``include_images`` is set).
         face_id_config: supplies ``body_proportion_include_head``.
         device: CUDA device for extraction.
         num_frames: uniformly subsample to this many frames; must match the
             training ``num_frames`` so cached T lines up with the decoded x0 T.
+        include_images: also process non-video items (LTX/Wan still images,
+            num_frames=1). Each still is read as a 1-frame clip from the source
+            image (``_read_single_image_frame``), so the body-proportion loss can
+            run through the 5D video block as T=1.
     """
     from PIL import Image
     from toolkit.video_frames import read_video_frames_with_transform
@@ -671,7 +693,14 @@ def cache_video_body_proportion_embeddings(
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    video_items = [f for f in file_items if getattr(f, "is_video", False)]
+    # include_images: LTX/Wan still-image datasets (num_frames=1) route here too,
+    # so the body-proportion loss runs through the 5D video block. Each still is a
+    # 1-frame clip read from the source image (no decode — same as the video path,
+    # which runs ViTPose on raw frames).
+    if include_images:
+        video_items = list(file_items)
+    else:
+        video_items = [f for f in file_items if getattr(f, "is_video", False)]
     if not video_items:
         return
 
@@ -700,9 +729,12 @@ def cache_video_body_proportion_embeddings(
                 file_item.body_proportion_gt_video = data[gt_key].clone()
                 continue
 
-        frames = read_video_frames_with_transform(file_item, num_frames)
+        if getattr(file_item, "is_video", False):
+            frames = read_video_frames_with_transform(file_item, num_frames)
+        else:
+            frames = _read_single_image_frame(file_item)  # (1, 3, H, W), T=1
         if frames is None:
-            print(f"  -  Warning: cannot read video frames: {file_item.path}")
+            print(f"  -  Warning: cannot read frames: {file_item.path}")
             continue
 
         rows = []

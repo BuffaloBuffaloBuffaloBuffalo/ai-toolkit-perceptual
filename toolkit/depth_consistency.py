@@ -424,6 +424,7 @@ def cache_depth_gt_embeddings(
     config: "DepthConsistencyConfig",  # noqa: F821
     device: Optional[torch.device] = None,
     vae_roundtrip_fn: Optional[callable] = None,  # noqa: A002 (lower-case callable is fine here)
+    store_as_single_frame_video: bool = False,
 ) -> None:
     """Extract and cache GT depth maps for all file items.
 
@@ -440,6 +441,14 @@ def cache_depth_gt_embeddings(
             the round-trip pixels rather than the raw original — that turns
             the floor of the live training loss to zero (the model can
             actually reach the target). Required for v3 caches.
+        store_as_single_frame_video: for video-latent models (LTX-2 / Wan)
+            trained on stills (num_frames=1). The live depth loss for these
+            runs through the 5D video block, which reads a ``(T, H, W)`` cube
+            under the video cache key. When set, the single roundtrip frame is
+            saved as a 1-frame cube under ``depth_gt_video*`` (versioned by
+            ``CACHE_VERSION_VIDEO_KEY``) and ``is_depth_video_cached`` is set,
+            instead of the 2D ``depth_gt*`` image map. Same v3 GT, different
+            consumer.
     """
     from PIL import Image
     from PIL.ImageOps import exif_transpose
@@ -459,6 +468,27 @@ def cache_depth_gt_embeddings(
     _blur_sfx = _blur_cache_suffix(_pix_blur_sigma)
     zero_depth_count = 0
 
+    # Single-frame-video mode stores the same v3 roundtrip GT under the video
+    # cache namespace (key + version + lazy-load flag) so the 5D video depth
+    # block reads it; otherwise everything below is the standard image path.
+    _key_base = "depth_gt_video" if store_as_single_frame_video else "depth_gt"
+    _ver_key = CACHE_VERSION_VIDEO_KEY if store_as_single_frame_video else CACHE_VERSION_KEY
+
+    def _record_lazy_meta(fi, cpath, ckey):
+        # Drop the resident tensor and point the DataLoader worker at the cache
+        # we just wrote (re-read via get_depth_gt / get_depth_gt_video). Same
+        # contract for both the hit and miss paths.
+        if store_as_single_frame_video:
+            fi.depth_gt_video = None
+            fi._depth_video_cache_path = cpath
+            fi._depth_video_cache_key = ckey
+            fi.is_depth_video_cached = True
+        else:
+            fi.depth_gt = None
+            fi._depth_cache_path = cpath
+            fi._depth_cache_key = ckey
+            fi.is_depth_cached = True
+
     for file_item in tqdm(file_items, desc="Caching GT depth maps"):
         img_dir = os.path.dirname(file_item.path)
         cache_dir = os.path.join(img_dir, "_face_id_cache")
@@ -476,9 +506,9 @@ def cache_depth_gt_embeddings(
         _ch = getattr(file_item, 'crop_height', None)
         _cw = getattr(file_item, 'crop_width', None)
         if isinstance(_ch, int) and isinstance(_cw, int) and _ch > 0 and _cw > 0:
-            depth_key = f"depth_gt_{int(_ch)}x{int(_cw)}{_blur_sfx}"
+            depth_key = f"{_key_base}_{int(_ch)}x{int(_cw)}{_blur_sfx}"
         else:
-            depth_key = f"depth_gt{_blur_sfx}"
+            depth_key = f"{_key_base}{_blur_sfx}"
 
         if os.path.exists(cache_path):
             # Header-only hit check — record where to read from and defer the
@@ -487,11 +517,8 @@ def cache_depth_gt_embeddings(
             # holds every bucket's map), but reading the bytes now would
             # serialize N large reads on the main process and hold them all
             # resident — the stall this lazy path removes.
-            if _cache_header_shape(cache_path, depth_key, CACHE_VERSION_KEY) is not None:
-                file_item.depth_gt = None
-                file_item._depth_cache_path = cache_path
-                file_item._depth_cache_key = depth_key
-                file_item.is_depth_cached = True
+            if _cache_header_shape(cache_path, depth_key, _ver_key) is not None:
+                _record_lazy_meta(file_item, cache_path, depth_key)
                 continue
 
         # v2: run DA2 on the *dataloader-transformed* pixels so cached depth
@@ -525,11 +552,9 @@ def cache_depth_gt_embeddings(
         if depth.abs().sum() < 1e-6:
             zero_depth_count += 1
 
-        # Don't retain the tensor on the shared file_list item: it would be
-        # deep-copied on every __getitem__ and held resident for every image
-        # at once. The worker re-reads from the cache we're about to write
-        # (get_depth_gt), same as the hit path.
-        file_item.depth_gt = None
+        # Single-frame-video mode saves the frame as a (1, H, W) cube so the
+        # 5D video depth block (which expects (T, H, W)) reads it as T=1.
+        depth_to_save = depth.unsqueeze(0) if store_as_single_frame_video else depth
 
         save_data = {}
         if os.path.exists(cache_path):
@@ -537,16 +562,15 @@ def cache_depth_gt_embeddings(
                 save_data = _load_then_close(cache_path)
             except Exception:  # noqa: BLE001 — corrupt cache → rewrite from scratch
                 save_data = {}
-        save_data[depth_key] = depth
-        save_data[CACHE_VERSION_KEY] = torch.ones(1)
+        save_data[depth_key] = depth_to_save
+        save_data[_ver_key] = torch.ones(1)
         _atomic_save_file(save_data, cache_path)
 
-        # Record lazy-load metadata so cleanup_depth can release the resident
-        # tensor and the worker re-reads from the just-written cache on later
-        # epochs — same contract as the hit path.
-        file_item._depth_cache_path = cache_path
-        file_item._depth_cache_key = depth_key
-        file_item.is_depth_cached = True
+        # Don't retain the tensor on the shared file_list item: it would be
+        # deep-copied on every __getitem__ and held resident for every image
+        # at once. Record lazy-load metadata so the worker re-reads from the
+        # just-written cache on later epochs — same contract as the hit path.
+        _record_lazy_meta(file_item, cache_path, depth_key)
 
     del encoder
     gc.collect()

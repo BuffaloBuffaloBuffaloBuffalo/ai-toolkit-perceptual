@@ -23,7 +23,6 @@ These can be used independently or together. Weight noising is the bigger practi
 - [LTX-2.3 Video (experimental)](#ltx-23-video-experimental): early video training support, example configs
 - [Tips and Tricks](#tips-and-tricks): empirical patterns from training runs
 - [Examples](#examples)
-  - [Sketchwave Style (single-image style LoRA)](#example-sketchwave-style-single-image-style-lora)
   - [Yoshitaka Amano Style (small-dataset style LoRA)](#example-yoshitaka-amano-style-small-dataset-style-lora)
 - [Configuration Reference](#configuration-reference): every extension-specific config option
 - [Upstream: AI Toolkit by Ostris](#upstream-ai-toolkit-by-ostris)
@@ -401,51 +400,6 @@ I recommend saving checkpoints every 25 steps. The optimal checkpoint is often i
 ## Examples
 
 > **Note on inference target.** All example configs in this README and under `config/examples/` are tuned for inference against the **distilled** model (Flux 2 Klein). If you plan to apply the trained LoRAs against the **base (non-distilled)** model instead, checkpoints in the **500–800 step range** are usually closer to optimal than the **1000–1200 step range** the configs save out.
-
-### Example: Sketchwave Style (single-image style LoRA)
-
-Training a style LoRA from a single image. One training image, one caption, and the LoRA picks up an entire visual vocabulary.
-
-Sketchwave is a specific look: sketchy graphite-style linework over warm cream paper, with restricted earthy palettes (olive-green, ochre, wine-red, sepia) and slightly painterly shading. There's one training image, a portrait. The goal is for the LoRA to apply the look to anything the base model can paint, including subjects with nothing in common with the portrait.
-
-Dataset layout:
-
-```
-examples/sketchwave/dataset/
-├── 1.webp     # single training image
-└── 1.txt      # caption
-```
-
-The caption opens with the trigger phrase `sketchwave style.` and then describes the image in detail: figure, clothing, lighting, and an explicit enumeration of the palette ("warm cream-yellow background, tan-and-ochre skin, dark sepia-brown linework, dark brown-black hair..."). Calling out the palette is deliberate. In LoRA training, anything you describe in the caption stays controllable at inference, while anything you leave out becomes part of what the trigger word bakes in. Naming the colors here teaches the LoRA that those are content choices in this particular image, not the essence of sketchwave style itself, so the trigger applies later with whatever palette you prompt for.
-
-The training image itself:
-
-| ![Reference](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/releases/download/examples-sketchwave-v1/dataset_reference.webp) |
-|:---:|
-| The single training illustration. |
-
-Full config is at [`examples/sketchwave/config.yaml`](examples/sketchwave/config.yaml). Key bits:
-
-- LoKr, linear/alpha 32, conv/alpha 16, full-rank, factor 8.
-- 1200 steps, batch size 1, gradient accumulation 2.
-- Resolution 768.
-- 1 image, `num_repeats: 50`.
-- Depth anchor: weight `0.005`, DA2-Large at `input_size: 1400`, `mask_source: none`.
-- Loss splitting on the dataset (`loss_split: diffusion_depth`).
-
-The interesting part is how the trained LoRA generalizes. None of these outputs share a subject with the training image. The LoRA carries the linework, palette, and paper-like shading onto identities and scenes with nothing in common with the training portrait, including an animal and an outdoor landscape:
-
-| New portrait | Different woman | Sleeping fox | Lakeside scene |
-|:---:|:---:|:---:|:---:|
-| ![Portrait](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/releases/download/examples-sketchwave-v1/output_portrait.png) | ![Lady](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/releases/download/examples-sketchwave-v1/output_lady.png) | ![Fox](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/releases/download/examples-sketchwave-v1/output_fox.png) | ![Landscape](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/releases/download/examples-sketchwave-v1/output_landscape.png) |
-
-To reproduce:
-
-```bash
-python run.py examples/sketchwave/config.yaml
-```
-
-Edit `model.name_or_path` in the config to point at your local Flux 2 Klein checkpoint first.
 
 ### Example: Yoshitaka Amano Style (small-dataset style LoRA)
 

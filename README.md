@@ -647,10 +647,19 @@ No local GPU? [**Deploy the prebuilt RunPod template →**](https://console.runp
 ### Local install
 
 Requirements:
-- Python >3.10
+- Python 3.12 (3.10 and 3.11 are fine too). Don't use 3.13 or newer yet, see the note below.
 - Nvidia GPU with enough VRAM for what you're training
 - Python venv
 - git
+
+**Heads up on Python 3.13:** a few of the native dependencies (insightface, onnxruntime, torchcodec) don't ship wheels for 3.13 yet, especially on Windows. If you build your venv with 3.13 the install ends up broken and the trainer dies during startup before it can even write a log file, so from the UI it just looks like the job is stuck on "starting" forever with no error in the log. Use 3.12 and you'll be fine.
+
+If your system Python is already 3.13 or newer, the easy fix is to make a 3.12 environment with conda and run everything inside it:
+```bash
+conda create -n ai-toolkit python=3.12
+conda activate ai-toolkit
+# then run the torch + requirements install steps below
+```
 
 Linux:
 ```bash

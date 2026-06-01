@@ -682,6 +682,11 @@ pip install --no-cache-dir torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 --
 pip install -r requirements.txt
 ```
 
+**RTX 50-series (Blackwell) GPUs:** the `cu126` build pinned above has no kernels for your card, so training dies with `CUDA error: no kernel image is available for execution on the device`. Install torch from the `cu128` channel instead (run this in place of the torch line above):
+```bash
+pip install torch==2.11.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+```
+
 For devices running **DGX OS** (including DGX Spark), follow [these](dgx_instructions.md) instructions.
 
 ## Running the Web UI

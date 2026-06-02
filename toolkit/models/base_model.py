@@ -1515,6 +1515,13 @@ class BaseModel:
             active_modules = ['vae']
         if device_state_preset in ['cache_clip']:
             active_modules = ['clip']
+        if device_state_preset in ['cache_text_encoder']:
+            # Without this case the preset fell through to an empty active set,
+            # sending the text encoder to CPU during text-embedding caching —
+            # T5-XXL then encodes on CPU (~9s/it). Keep it on the TE device.
+            active_modules = ['text_encoder']
+        if device_state_preset in ['unload']:
+            active_modules = []
         if device_state_preset in ['generate']:
             active_modules = ['vae', 'unet',
                               'text_encoder', 'adapter', 'refiner_unet']

@@ -122,11 +122,41 @@ export const modelArchs: ModelArch[] = [
   },
   {
     name: 'chroma',
-    label: 'Chroma',
-    group: 'image',
+    label: 'Chroma 1 Base',
+    group: 'experimental',
     defaults: {
       // default updates when [selected, unselected] in the UI
       'config.process[0].model.name_or_path': ['lodestones/Chroma1-Base', defaultNameOrPath],
+      'config.process[0].model.quantize': [true, false],
+      'config.process[0].model.quantize_te': [true, false],
+      'config.process[0].sample.sampler': ['flowmatch', 'flowmatch'],
+      'config.process[0].train.noise_scheduler': ['flowmatch', 'flowmatch'],
+    },
+    disableSections: ['network.conv'],
+  },
+  {
+    // Same backend arch as 'chroma' (the ':hd' suffix is stripped by
+    // config_modules), just defaults to the Chroma1-HD checkpoint.
+    name: 'chroma:hd',
+    label: 'Chroma 1 HD',
+    group: 'experimental',
+    defaults: {
+      // default updates when [selected, unselected] in the UI
+      'config.process[0].model.name_or_path': ['lodestones/Chroma1-HD', defaultNameOrPath],
+      'config.process[0].model.quantize': [true, false],
+      'config.process[0].model.quantize_te': [true, false],
+      'config.process[0].sample.sampler': ['flowmatch', 'flowmatch'],
+      'config.process[0].train.noise_scheduler': ['flowmatch', 'flowmatch'],
+    },
+    disableSections: ['network.conv'],
+  },
+  {
+    name: 'chroma_radiance',
+    label: 'Chroma Radiance',
+    group: 'experimental',
+    defaults: {
+      // default updates when [selected, unselected] in the UI
+      'config.process[0].model.name_or_path': ['lodestones/Chroma1-Radiance/latest_x0.safetensors', defaultNameOrPath],
       'config.process[0].model.quantize': [true, false],
       'config.process[0].model.quantize_te': [true, false],
       'config.process[0].sample.sampler': ['flowmatch', 'flowmatch'],
@@ -603,7 +633,7 @@ export const modelArchs: ModelArch[] = [
   {
     name: 'zimage',
     label: 'Z-Image',
-    group: 'image',
+    group: 'experimental',
     defaults: {
       // default updates when [selected, unselected] in the UI
       'config.process[0].model.name_or_path': ['Tongyi-MAI/Z-Image', defaultNameOrPath],
@@ -671,7 +701,7 @@ export const modelArchs: ModelArch[] = [
   {
     name: 'ltx2.3',
     label: 'LTX-2.3 (22B)',
-    group: 'video',
+    group: 'experimental',
     isVideoModel: true,
     defaults: {
       // default updates when [selected, unselected] in the UI
@@ -761,13 +791,16 @@ export const modelArchs: ModelArch[] = [
   return a.label.localeCompare(b.label, undefined, { sensitivity: 'base' });
 }) as any;
 
-// Only expose supported models in the UI selector
+// Models exposed in the UI selector (split across the supported + experimental groups)
 const enabledModelNames = new Set([
   'sdxl',
   'flux2_klein_9b',
   'zimage',
   'zimage:turbo',
   'ltx2.3',
+  'chroma',
+  'chroma:hd',
+  'chroma_radiance',
 ]);
 
 export const groupedModelOptions: GroupedSelectOption[] = modelArchs
@@ -783,7 +816,13 @@ export const groupedModelOptions: GroupedSelectOption[] = modelArchs
       });
     }
     return acc;
-  }, [] as GroupedSelectOption[]);
+  }, [] as GroupedSelectOption[])
+  // Render groups in a stable order (supported image models first, experimental
+  // last) instead of by whichever group label happens to sort first.
+  .sort((a, b) => {
+    const order = ['image', 'instruction', 'video', 'experimental'];
+    return order.indexOf(a.label) - order.indexOf(b.label);
+  });
 
 export const quantizationOptions: SelectOption[] = [
   { value: '', label: '- NONE -' },

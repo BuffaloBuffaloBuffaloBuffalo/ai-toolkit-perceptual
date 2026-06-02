@@ -217,7 +217,11 @@ class ChromaPipeline(FluxPipeline):
 
         # 5. Prepare timesteps
         sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps)
-        image_seq_len = latents.shape[1]
+        # Radiance latents are unpacked pixels (B, 3, H, W), so latents.shape[1]
+        # is the channel count (3), not the token count — using it collapses the
+        # dynamic sigma shift (mu) to ~base_shift and softens/over-smooths output.
+        # Use the real patch-token count from the image ids instead.
+        image_seq_len = latent_image_ids.shape[1] if self.is_radiance else latents.shape[1]
         mu = calculate_shift(
             image_seq_len,
             self.scheduler.config.base_image_seq_len,

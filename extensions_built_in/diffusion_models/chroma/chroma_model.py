@@ -420,8 +420,14 @@ class ChromaModel(BaseModel):
         return self.model.final_layer.linear.weight.requires_grad
 
     def get_te_has_grad(self):
-        # return from a weight if it has grad
-        return self.text_encoder[1].encoder.block[0].layer[0].SelfAttention.q.weight.requires_grad
+        # When text embeddings are cached (cache_text_embeddings / low_vram), the
+        # real T5 is swapped for a FakeTextEncoder that has no `.encoder` module —
+        # walking the real weight path would AttributeError. A faked/unloaded
+        # encoder is never being trained, so report no grad in that case.
+        try:
+            return self.text_encoder[1].encoder.block[0].layer[0].SelfAttention.q.weight.requires_grad
+        except AttributeError:
+            return False
     
     def save_model(self, output_path, meta, save_dtype):
         if not output_path.endswith(".safetensors"):

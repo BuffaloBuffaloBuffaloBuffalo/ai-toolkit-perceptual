@@ -716,6 +716,21 @@ class SDTrainer(BaseSDTrainProcess):
                 dtype=get_torch_dtype(self.train_config.dtype),
             )
 
+    def _is_pixel_space_vae(self) -> bool:
+        """True for pixel-space models (chroma_radiance / zeta_chroma) that use
+        FakeVAE — an identity encode/decode with no real latent space. Their
+        "latent" already IS the image in [-1, 1] (latent_channels == 3), so the
+        perceptor losses skip the tiny decoder and treat x0 as pixels directly.
+        Detection is by channel count, not arch string, so any FakeVAE model is
+        covered. Safe if the VAE / config is missing."""
+        cfg = getattr(self.sd.vae, 'config', None)
+        if cfg is None:
+            return False
+        lat = getattr(cfg, 'latent_channels', None)
+        if lat is None and hasattr(cfg, 'get'):
+            lat = cfg.get('latent_channels', None)
+        return lat == 3
+
     def _get_video_x0_frames(self, noise_pred, noisy_latents, timesteps, needs_grad):
         """Decode the x0 prediction to ``(B, 3, T, H, W)`` pixel frames in [0, 1].
 
@@ -1471,9 +1486,12 @@ class SDTrainer(BaseSDTrainProcess):
                     encoder = 'sdxl' if arch == 'sdxl' else 'sd15'
                 elif arch in ('sd3',):
                     encoder = 'sd3'
-                elif arch in ('flux', 'flex1', 'flex2', 'zimage'):
-                    # Z-Image reuses the Flux VAE (16-ch latents, same scaling
-                    # and shift factors as black-forest-labs/FLUX.1-dev).
+                elif arch in ('flux', 'flex1', 'flex2', 'zimage', 'chroma'):
+                    # Z-Image and Chroma both reuse the Flux VAE (16-ch latents,
+                    # same scaling and shift factors as black-forest-labs/FLUX.1-dev;
+                    # Chroma loads it from ostris/Flex.1-alpha). chroma_radiance /
+                    # zeta_chroma are pixel-space (FakeVAE) and are intentionally
+                    # excluded here.
                     encoder = 'flux'
                 else:
                     encoder = 'sdxl'  # safe default (4ch)
@@ -1528,7 +1546,14 @@ class SDTrainer(BaseSDTrainProcess):
                 print_acc("  VAE decoder: fine-grained gradient checkpointing enabled")
 
         # Load lightweight decoder for face losses (identity)
-        if _need_face_decoder and self.taesd is None:
+        if _need_face_decoder and self.taesd is None and self._is_pixel_space_vae():
+            # Pixel-space models (chroma_radiance / zeta_chroma) use FakeVAE, an
+            # identity encode/decode — x0 already IS the image in [-1,1]. Load no
+            # tiny decoder; the live x0 decode and depth-GT roundtrip detect
+            # pixel-space and skip decoding. (A 4-ch taesd would channel-mismatch
+            # on a 3-ch tensor.)
+            print_acc("  Pixel-space VAE (FakeVAE) — no tiny decoder loaded for perceptor losses")
+        elif _need_face_decoder and self.taesd is None:
             if hasattr(self.sd.vae, 'config') and self.sd.vae.config is not None:
                 vae_channels = self.sd.vae.config.get('latent_channels', 4)
             elif hasattr(self.sd.vae, 'params'):
@@ -1562,9 +1587,13 @@ class SDTrainer(BaseSDTrainProcess):
                 self.sd.is_flux
                 or 'flex' in getattr(self.sd, 'arch', '')
                 or getattr(self.sd, 'arch', '') == 'zimage'
+                or getattr(self.sd, 'arch', '') == 'chroma'
             ):
-                # Z-Image's VAE is the Flux VAE (16-ch latents, identical
-                # scaling/shift factors), so TAEF1 is the correct tiny decoder.
+                # Z-Image and Chroma both use the Flux VAE (16-ch latents,
+                # identical scaling/shift factors; Chroma loads it from
+                # ostris/Flex.1-alpha), so TAEF1 is the correct tiny decoder.
+                # NOTE: only arch == 'chroma' (VAE-latent) routes here;
+                # chroma_radiance / zeta_chroma are pixel-space (FakeVAE).
                 taesd_name = "madebyollin/taef1"
                 print_acc(f"  Loading TAESD ({taesd_name}) for face losses...")
                 self.taesd = AutoencoderTiny.from_pretrained(
@@ -1609,6 +1638,13 @@ class SDTrainer(BaseSDTrainProcess):
 
             def _vae_roundtrip_for_depth(arr: torch.Tensor) -> torch.Tensor:
                 """[0,1] pixels → VAE encode → trainer decoder → [0,1] pixels."""
+                if self._is_pixel_space_vae():
+                    # Pixel-space (FakeVAE): encode and decode are identity, so the
+                    # round-trip is a no-op and GT depth is computed on the original
+                    # image — the cleanest zero-floor target. Return before touching
+                    # .parameters() (FakeVAE has none → StopIteration) or FakeDist
+                    # (no .mode()).
+                    return arr.clamp(0, 1)
                 if next(self.sd.vae.parameters()).device != self.device_torch:
                     self.sd.vae.to(self.device_torch)
                 if _vae_wants_5d:
@@ -2765,7 +2801,11 @@ class SDTrainer(BaseSDTrainProcess):
                         x0_pred = (noisy_latents - sqrt_one_minus_alpha_bar * noise_pred) / sqrt_alpha_bar.clamp(min=1e-8)
 
                 # Decode x0 prediction to pixel space for face recognition
-                if hasattr(self, '_taef2_decoder') and self._taef2_decoder is not None:
+                if self._is_pixel_space_vae():
+                    # Pixel-space (FakeVAE: chroma_radiance / zeta_chroma): the x0
+                    # "latent" already IS the image in [-1,1]; no decode needed.
+                    x0_pixels = (x0_pred.float() + 1.0) * 0.5
+                elif hasattr(self, '_taef2_decoder') and self._taef2_decoder is not None:
                     x0_for_decode = x0_pred
                     if x0_for_decode.shape[1] != 32:
                         x0_for_decode = rearrange(
@@ -2989,7 +3029,11 @@ class SDTrainer(BaseSDTrainProcess):
                             id_preview_dir = os.path.join(self.save_root, 'id_previews')
                             os.makedirs(id_preview_dir, exist_ok=True)
                             noisy_for_decode = noisy_latents
-                            if hasattr(self, '_taef2_decoder') and self._taef2_decoder is not None:
+                            if self._is_pixel_space_vae():
+                                # Pixel-space (FakeVAE): the noisy latent already IS
+                                # a (noised) image in [-1,1].
+                                noisy_pixels = ((noisy_for_decode.float() + 1.0) * 0.5).clamp(0, 1)
+                            elif hasattr(self, '_taef2_decoder') and self._taef2_decoder is not None:
                                 nfd = noisy_for_decode
                                 if nfd.shape[1] != 32:
                                     nfd = rearrange(nfd, "b (c p1 p2) h w -> b c (h p1) (w p2)", c=32, p1=2, p2=2)
@@ -3730,7 +3774,10 @@ class SDTrainer(BaseSDTrainProcess):
                         _dc_x0_pred = (noisy_latents - _dc_s1ma * noise_pred) / _dc_sa.clamp(min=1e-8)
 
                 # Decode x0 to pixel space (same path the face-losses block uses).
-                if hasattr(self, '_taef2_decoder') and self._taef2_decoder is not None:
+                if self._is_pixel_space_vae():
+                    # Pixel-space (FakeVAE): x0 already IS the image in [-1,1].
+                    _dc_pixels = (_dc_x0_pred.float() + 1.0) * 0.5
+                elif hasattr(self, '_taef2_decoder') and self._taef2_decoder is not None:
                     _dc_for_dec = _dc_x0_pred
                     if _dc_for_dec.shape[1] != 32:
                         _dc_for_dec = rearrange(

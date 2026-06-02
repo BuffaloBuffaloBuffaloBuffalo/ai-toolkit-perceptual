@@ -41,6 +41,7 @@ class ChromaParams:
     nerf_depth: int
     nerf_max_freqs: int
     _use_compiled: bool
+    use_x0: bool = False
 
 
 chroma_params = ChromaParams(
@@ -218,6 +219,12 @@ class Chroma(nn.Module):
         )
         self.approximator_in_dim = params.approximator_in_dim
 
+        # x0-parameterized checkpoints (Chroma1-Radiance latest_x0*) ship a
+        # zero-size "__x0__" marker. Register a matching buffer so the key loads
+        # and to flag forward() to convert predicted x0 into flow velocity.
+        if params.use_x0:
+            self.register_buffer("__x0__", torch.tensor([]))
+
     @property
     def device(self):
         # Get the device of the module (assumes all parameters are on the same device)
@@ -242,6 +249,7 @@ class Chroma(nn.Module):
         if txt.ndim != 3:
             raise ValueError("Input txt tensors must have 3 dimensions.")
         B, C, H, W = img.shape
+        img_orig = img  # forward reassigns `img` during patchify; keep the noisy input
 
         # gemini gogogo idk how to unfold and pack the patch properly :P
         # Store the raw pixel values of each patch for the NeRF head later.
@@ -377,4 +385,8 @@ class Chroma(nn.Module):
         ) # [B, Hidden, H, W]
         img_dct = self.nerf_final_layer_conv.conv(img_dct)
 
+        if hasattr(self, "__x0__"):
+            # x0 checkpoint: the network predicts x0; convert to the flow-matching
+            # velocity the scheduler/loss expect: v = (x_t - x0) / t.
+            return (img_orig - img_dct) / timesteps.view(-1, 1, 1, 1)
         return img_dct

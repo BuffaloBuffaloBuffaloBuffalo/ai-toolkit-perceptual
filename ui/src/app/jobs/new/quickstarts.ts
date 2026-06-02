@@ -288,7 +288,7 @@ function buildSubjectLikenessZImageTurboConfig(current: JobConfig): JobConfig {
     num_frames: 1,
     flip_x: false,
     flip_y: false,
-    num_repeats: 50,
+    num_repeats: 1,
     diffusion_loss_weight: 1,
     depth_loss_weight: 0.005,
     loss_split: 'sum',

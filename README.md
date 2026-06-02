@@ -7,10 +7,9 @@ An extension of [AI Toolkit by Ostris](https://github.com/ostris/ai-toolkit) tha
 
 These can be used independently or together. Weight noising is the bigger practical win for subject-likeness LoRAs; perceptual anchoring is the bigger win when you need geometric/structural control.
 
-**Supported models:** SDXL, FLUX.2 Klein 9B, Z-Image Turbo (experimental, see [Z-Image Turbo](#z-image-turbo-experimental)), LTX-2.3 video (experimental, see [LTX-2.3 Video](#ltx-23-video-experimental))
-
 ## Contents
 
+- [Supported and Experimental Models](#supported-and-experimental-models): which models are validated, which need more testing
 - [Perceptual Anchoring](#perceptual-anchoring): depth, identity, body, face suppression
 - [Weight Noising](#weight-noising): per-step Gaussian perturbation of LoRA weights
 - [Auto-Masking](#auto-masking): body / clothing / subject masks for region-weighted loss
@@ -19,7 +18,7 @@ These can be used independently or together. Weight noising is the bigger practi
 - [Training Previews](#training-previews): what each anchor saves to disk
 - [Dataset-Tools UI](#dataset-tools-ui): preflight passes for masks, depth, faces
 - [Quickstart Templates](#quickstart-templates): UI presets for validated configs
-- [Z-Image Turbo (experimental)](#z-image-turbo-experimental): early support, current best-guess settings, ComfyUI inference tip
+- [Z-Image Turbo](#z-image-turbo): model-specific notes, current best-guess settings, ComfyUI inference tip
 - [LTX-2.3 Video (experimental)](#ltx-23-video-experimental): early video training support, example configs
 - [Tips and Tricks](#tips-and-tricks): empirical patterns from training runs
 - [Examples](#examples)
@@ -28,6 +27,19 @@ These can be used independently or together. Weight noising is the bigger practi
 - [Upstream: AI Toolkit by Ostris](#upstream-ai-toolkit-by-ostris)
 - [Installation](#installation): local setup, or one-click RunPod template
 - [Running the Web UI](#running-the-web-ui): start the job builder, dataset tools, and training monitors
+
+## Supported and Experimental Models
+
+The model dropdown in the web UI is split into two groups, and the same split applies when you train from a config file.
+
+**Supported:** SDXL, FLUX.2 Klein 9B, and Z-Image Turbo. These are known to work well with both weight noising and perceptual anchors, so they're the safest place to start. FLUX.2 Klein 9B and Z-Image Turbo each have a ready-made [Quickstart Template](#quickstart-templates) you can apply in one click.
+
+**Experimental:** everything else in the selector, including Chroma 1 Base, Chroma 1 HD, Chroma Radiance, Z-Image (base), and LTX-2.3, plus the other architectures you can load from a config. These may work, but they haven't had enough testing to call them validated. When you train one:
+
+- Start from values close to the [Quickstart Templates](#quickstart-templates) and tweak from there.
+- Turn on weight noising first, before you add a perceptual anchor. Weight noising is generally safe and improves results in most cases. Perceptual anchors are stronger but can destabilize training if the strength is wrong, so add one only after the plain weight-noise run looks healthy.
+
+If you get an experimental model working well, please [open an issue](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/issues) with your config and samples so we can move it into the supported set.
 
 ## Perceptual Anchoring
 
@@ -318,14 +330,14 @@ Current templates:
 - **Subject Likeness, Masked (Flux 2 Klein 9B + Weight Noise)**: same recipe plus subject masking with per-region weights (`background:0`, `clothing:1`, `body:1`) and depth-consistency restricted to the subject mask. Use this when you can be disciplined about captioning only the changeable parts of the character and skipping the background/setting. See the [Tips and Tricks](#tips-and-tricks) section for the rationale.
   - YAML: [`config/examples/subject_likeness_masked_flux2_klein9b.yaml`](config/examples/subject_likeness_masked_flux2_klein9b.yaml)
 
-- **Subject Likeness (Z-Image Turbo + Weight Noise)**: experimental, see [Z-Image Turbo](#z-image-turbo-experimental) below. LoKr + weight noise (relative, σ=0.0125) via the de-distill training adapter. Single 1024 bucket with `num_repeats: 50`, subject-masked depth-consistency (`background:0`, `clothing:1`), AdamW8bit @ lr=2.5e-4, batch=4, 3000 steps. Custom timestep distribution and curve to front-load high-t and low-mid-t training. Transformer in bf16 (Tongyi-MAI warns against FP8 on Turbo), text encoder quantized to qfloat8.
+- **Subject Likeness (Z-Image Turbo + Weight Noise)**: see [Z-Image Turbo](#z-image-turbo) below. LoKr + weight noise (relative, σ=0.0125) via the de-distill training adapter. Single 1024 bucket, subject-masked depth-consistency (`background:0`, `clothing:1`), AdamW8bit @ lr=2.5e-4, batch=4, 3000 steps. Custom timestep distribution and curve to front-load high-t and low-mid-t training. Transformer in bf16 (Tongyi-MAI warns against FP8 on Turbo), text encoder quantized to qfloat8.
   - YAML: [`config/examples/subject_likeness_zimage_turbo.yaml`](config/examples/subject_likeness_zimage_turbo.yaml)
 
 Templates live in `ui/src/app/jobs/new/quickstarts.ts`; the YAML files under `config/examples/` mirror them and stay in sync. Adding a new template is a one-export change on the TS side plus a YAML mirror. The chosen template name shows in the dropdown label and stays there until you pick another. It's not saved to the config; the form *is* the template after apply.
 
-## Z-Image Turbo (experimental)
+## Z-Image Turbo
 
-Z-Image Turbo support is experimental. The quickstart above is a best guess from a few production runs, not a tuned recipe. If you find settings that work better, please [open an issue](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/issues) with your config and samples. Step/LR/sigma sweeps, multi-bucket evidence, and reports on Z-Image base are all useful.
+Z-Image Turbo works well with weight noising and the depth anchor, so it's in the supported set, but the quickstart is still a best guess from a few production runs rather than a fully tuned recipe. If you find settings that work better, please [open an issue](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/issues) with your config and samples. Step/LR/sigma sweeps, multi-bucket evidence, and reports on Z-Image base are all useful.
 
 A few notes:
 

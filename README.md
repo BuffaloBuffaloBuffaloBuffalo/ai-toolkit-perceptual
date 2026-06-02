@@ -215,16 +215,6 @@ train:
 - **`relative`** (default): `σ_per_param = sigma × ‖w‖_RMS`. Adapts automatically to per-layer scale, which matters because LoRA layers can have very different gradient/weight magnitudes (LoRA-up vs LoRA-down, attention vs MLP). LoRA-up params (init=0) get no noise until they learn something, so early training is safe by construction.
 - **`absolute`**: fixed σ everywhere. Use when you've calibrated a specific magnitude target across all layers.
 
-### Scaling rules
-
-The effective regularization depends on the Langevin temperature `σ² / lr`. Increasing batch size or LR proportionally weakens the noise's effect; smaller datasets need higher σ to preserve constant per-image regularization. Heuristics:
-
-- **Dataset size**: σ ∝ 1 / √N_effective. Smaller dataset → higher σ.
-- **Batch size**: σ ∝ √B. Larger batch → higher σ.
-- **LR**: σ should decay at least as fast as √lr if you want explore-early-exploit-late dynamics.
-
-Reference points: single-image dataset σ ≈ 0.03–0.05; 50-image dataset σ ≈ 0.02; 500-image diverse dataset σ ≈ 0.01 or skip.
-
 ### Metrics
 
 - **`weight_noise_norm`**: Frobenius norm of the injected noise per logged step. In relative mode this grows with the LoRA's weight magnitude during training; that's normal and expected.

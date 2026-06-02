@@ -254,6 +254,213 @@ const subjectLikenessMaskedFlux2Klein9b: QuickstartTemplate = {
 };
 
 // ---------------------------------------------------------------------------
+// Style LoRA (Flux 2 Klein 9B + Depth Anchor)
+// ---------------------------------------------------------------------------
+// Small-dataset STYLE recipe, abstracted from the validated Yoshitaka Amano
+// run (see the "Yoshitaka Amano Style" example in the README). On a tiny style
+// set the diffusion loss alone overfits to the specific training compositions;
+// the full-image depth anchor plus diffusion/depth loss splitting pushes the
+// LoRA toward what is invariant across the artist's work (linework, color
+// treatment, paper) and away from memorizing individual images. No weight
+// noise (the Amano run didn't use it); the block is left disabled so it is one
+// toggle away. No subject mask, since this trains a style and not a subject.
+
+function buildStyleDepthAnchorConfig(current: JobConfig): JobConfig {
+  const existingName = current.config.name || '';
+  const existingDatasetPath =
+    current.config.process[0]?.datasets?.[0]?.folder_path || '';
+  const existingGpuIds = (current.config.process[0] as any)?.gpu_ids;
+
+  // Single 768 bucket. loss_split: diffusion_depth runs the diffusion step on
+  // appearance and the depth step on structure; they only really agree on the
+  // high-level "this looks like the style" signal.
+  const dataset: any = {
+    folder_path: existingDatasetPath,
+    mask_path: null,
+    mask_min_value: 0.1,
+    default_caption: '',
+    caption_ext: 'txt',
+    caption_dropout_rate: 0.05,
+    cache_latents_to_disk: true,
+    is_reg: false,
+    network_weight: 1,
+    resolution: [768],
+    controls: [],
+    shrink_video_to_frames: true,
+    num_frames: 1,
+    flip_x: false,
+    flip_y: false,
+    num_repeats: 1,
+    diffusion_loss_weight: 1,
+    depth_loss_weight: 0.005,
+    identity_loss_weight: 0,
+    loss_split: 'diffusion_depth',
+  };
+
+  return {
+    job: 'extension',
+    config: {
+      name: existingName,
+      process: [
+        {
+          type: 'diffusion_trainer',
+          training_folder: 'output',
+          sqlite_db_path: './aitk_db.db',
+          device: 'cuda',
+          trigger_word: null,
+          performance_log_every: 10,
+          network: {
+            type: 'lokr',
+            linear: 32,
+            linear_alpha: 32,
+            conv: 16,
+            conv_alpha: 16,
+            lokr_full_rank: true,
+            lokr_factor: 8,
+            network_kwargs: { ignore_if_contains: [] },
+          },
+          save: {
+            dtype: 'bf16',
+            save_every: 50,
+            max_step_saves_to_keep: 120,
+            save_format: 'diffusers',
+            push_to_hub: false,
+          },
+          datasets: [dataset],
+          train: {
+            // Disabled to match the Amano run. Flip enabled: true (sigma stays
+            // a sane 0.0125) to stack weight noise on top of the depth anchor.
+            weight_noise: {
+              enabled: false,
+              mode: 'relative',
+              sigma: 0.0125,
+              log_every: 1,
+            },
+            max_grad_norm: 1,
+            batch_size: 2,
+            bypass_guidance_embedding: false,
+            steps: 4000,
+            gradient_accumulation: 1,
+            train_unet: true,
+            train_text_encoder: false,
+            gradient_checkpointing: true,
+            noise_scheduler: 'flowmatch',
+            optimizer: 'adamw8bit',
+            timestep_type: 'weighted',
+            content_or_style: 'balanced',
+            optimizer_params: { weight_decay: 0.0001 },
+            unload_text_encoder: false,
+            cache_text_embeddings: true,
+            lr: 5e-5,
+            ema_config: { use_ema: false, ema_decay: 0.99 },
+            skip_first_sample: false,
+            force_first_sample: true,
+            disable_sampling: false,
+            dtype: 'bf16',
+            diff_output_preservation: false,
+            diff_output_preservation_multiplier: 1,
+            diff_output_preservation_class: 'person',
+            switch_boundary_every: 1,
+            loss_type: 'mse',
+            diffusion_loss_weight: 1,
+            diffusion_loss_max_t: 1,
+            diffusion_loss_min_t: 0,
+            custom_timestep_distribution: null,
+            custom_timestep_curve: null,
+            max_denoising_steps: 999,
+            min_denoising_steps: 0,
+            loss_split: null,
+          },
+          logging: { log_every: 1, use_ui_logger: true },
+          model: {
+            name_or_path: 'black-forest-labs/FLUX.2-klein-base-9B',
+            quantize: true,
+            qtype: 'qfloat8',
+            quantize_te: true,
+            qtype_te: 'qfloat8',
+            arch: 'flux2_klein_9b',
+            low_vram: false,
+            model_kwargs: { match_target_res: false },
+            layer_offloading: false,
+            layer_offloading_text_encoder_percent: 1,
+            layer_offloading_transformer_percent: 1,
+          },
+          sample: {
+            sampler: 'flowmatch',
+            sample_every: 100,
+            width: 640,
+            height: 960,
+            samples: [
+              { prompt: 'a portrait of a person' },
+            ],
+            neg: '',
+            seed: 42,
+            walk_seed: false,
+            guidance_scale: 4,
+            sample_steps: 25,
+            num_frames: 1,
+            fps: 1,
+          },
+          face_id: {
+            enabled: false,
+            init_scale: 0.3,
+            identity_loss_weight: 0,
+            landmark_loss_weight: 0,
+            body_proportion_loss_weight: 0,
+            body_proportion_loss_min_t: 0.8,
+            body_proportion_loss_max_t: 1,
+            body_shape_loss_weight: 0,
+            body_shape_loss_max_t: 1,
+            body_shape_loss_min_t: 0.8,
+            identity_loss_min_t: 0,
+            identity_loss_max_t: 0.9,
+            identity_metrics: false,
+            identity_loss_use_average: true,
+            identity_loss_min_cos: 0.4,
+          },
+          depth_consistency: {
+            loss_weight: 0.005,
+            input_size: 1400,
+            preview_every: 1,
+            mask_source: 'none',
+            loss_max_t: 0.9,
+            model_id: 'depth-anything/Depth-Anything-V2-Large-hf',
+            loss_min_t: 0,
+            grad_checkpoint: false,
+            ssi_weight: 0,
+            grad_weight: 1,
+            grad_scales: 6,
+          },
+          subject_mask: {
+            enabled: false,
+            background_loss_weight: 0,
+            clothing_loss_weight: 0,
+            save_debug_previews: true,
+            cache_resolution: 768,
+            segformer_res: 768,
+          },
+          ...(existingGpuIds !== undefined ? { gpu_ids: existingGpuIds } : {}),
+        } as any,
+      ],
+    },
+    meta: { name: '[name]', version: '1.0' },
+  } as unknown as JobConfig;
+}
+
+const styleDepthAnchorFlux2Klein9b: QuickstartTemplate = {
+  id: 'style_lora_flux2_klein9b',
+  label: 'Style LoRA (Flux 2 Klein 9B + Depth Anchor)',
+  description:
+    'Small-dataset style recipe (from the validated Amano run). LoKr + ' +
+    'full-image depth-consistency (0.005, DA2-Large @ input_size 1400) with ' +
+    'diffusion/depth loss splitting. Single 768 bucket, AdamW8bit @ lr=5e-5, ' +
+    'batch=2, grad-accum=1, 4000 steps. No weight noise (block left disabled) ' +
+    'and no subject mask: the depth anchor keeps a tiny style set from ' +
+    'overfitting to specific training compositions.',
+  apply: (current) => buildStyleDepthAnchorConfig(current),
+};
+
+// ---------------------------------------------------------------------------
 // Subject Likeness — Z-Image Turbo + Weight Noise
 // ---------------------------------------------------------------------------
 // Z-Image Turbo recipe abstracted from a validated production run. Trains
@@ -490,5 +697,6 @@ const subjectLikenessZImageTurbo: QuickstartTemplate = {
 export const QUICKSTARTS: QuickstartTemplate[] = [
   subjectLikenessFlux2Klein9b,
   subjectLikenessMaskedFlux2Klein9b,
+  styleDepthAnchorFlux2Klein9b,
   subjectLikenessZImageTurbo,
 ];

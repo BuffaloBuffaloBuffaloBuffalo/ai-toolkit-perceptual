@@ -123,7 +123,7 @@ export const modelArchs: ModelArch[] = [
   {
     name: 'chroma',
     label: 'Chroma 1 Base',
-    group: 'image',
+    group: 'experimental',
     defaults: {
       // default updates when [selected, unselected] in the UI
       'config.process[0].model.name_or_path': ['lodestones/Chroma1-Base', defaultNameOrPath],
@@ -139,7 +139,7 @@ export const modelArchs: ModelArch[] = [
     // config_modules), just defaults to the Chroma1-HD checkpoint.
     name: 'chroma:hd',
     label: 'Chroma 1 HD',
-    group: 'image',
+    group: 'experimental',
     defaults: {
       // default updates when [selected, unselected] in the UI
       'config.process[0].model.name_or_path': ['lodestones/Chroma1-HD', defaultNameOrPath],
@@ -633,7 +633,7 @@ export const modelArchs: ModelArch[] = [
   {
     name: 'zimage',
     label: 'Z-Image',
-    group: 'image',
+    group: 'experimental',
     defaults: {
       // default updates when [selected, unselected] in the UI
       'config.process[0].model.name_or_path': ['Tongyi-MAI/Z-Image', defaultNameOrPath],
@@ -701,7 +701,7 @@ export const modelArchs: ModelArch[] = [
   {
     name: 'ltx2.3',
     label: 'LTX-2.3 (22B)',
-    group: 'video',
+    group: 'experimental',
     isVideoModel: true,
     defaults: {
       // default updates when [selected, unselected] in the UI
@@ -791,7 +791,7 @@ export const modelArchs: ModelArch[] = [
   return a.label.localeCompare(b.label, undefined, { sensitivity: 'base' });
 }) as any;
 
-// Only expose supported models in the UI selector
+// Models exposed in the UI selector (split across the supported + experimental groups)
 const enabledModelNames = new Set([
   'sdxl',
   'flux2_klein_9b',
@@ -816,7 +816,13 @@ export const groupedModelOptions: GroupedSelectOption[] = modelArchs
       });
     }
     return acc;
-  }, [] as GroupedSelectOption[]);
+  }, [] as GroupedSelectOption[])
+  // Render groups in a stable order (supported image models first, experimental
+  // last) instead of by whichever group label happens to sort first.
+  .sort((a, b) => {
+    const order = ['image', 'instruction', 'video', 'experimental'];
+    return order.indexOf(a.label) - order.indexOf(b.label);
+  });
 
 export const quantizationOptions: SelectOption[] = [
   { value: '', label: '- NONE -' },

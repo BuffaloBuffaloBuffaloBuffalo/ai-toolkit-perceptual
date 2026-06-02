@@ -130,6 +130,19 @@ class ChromaRadianceModel(BaseModel):
                 repo_id='lodestones/Chroma',
                 filename=f"chroma-unlocked-v{version}.safetensors",
             )
+        elif model_path.endswith(".safetensors") and not os.path.exists(model_path):
+            # HF "<repo>/<file>.safetensors" form, e.g.
+            # lodestones/Chroma1-Radiance/latest_x0.safetensors. The Radiance repo
+            # does NOT follow the Chroma1-<name>.safetensors convention (its files
+            # are latest_x0*.safetensors), so the file must be named explicitly:
+            # last path segment = filename, the rest = repo id. Mirrors ZetaChroma.
+            splits = model_path.split("/")
+            filename = splits[-1]
+            repo_id = "/".join(splits[:-1])
+            model_path = huggingface_hub.hf_hub_download(
+                repo_id=repo_id,
+                filename=filename,
+            )
         elif model_path.startswith("lodestones/Chroma1-"):
             # will have a file in the repo that is Chroma1-whatever.safetensors
             model_path = huggingface_hub.hf_hub_download(
@@ -154,6 +167,12 @@ class ChromaRadianceModel(BaseModel):
             chroma_state_dict = torch.load(model_path, map_location='cpu', weights_only=True)
         else:
             chroma_state_dict = load_file(model_path, 'cpu')
+
+        # Chroma1-Radiance "latest_x0*" checkpoints carry a zero-size "__x0__"
+        # marker flagging an x0-prediction checkpoint. Configure the transformer
+        # to register a matching __x0__ buffer (so the key loads) and to convert
+        # its x0 output to flow velocity in forward(). Mirrors Zeta-Chroma.
+        chroma_params.use_x0 = "__x0__" in chroma_state_dict
         
         # determine number of double and single blocks
         double_blocks = 0

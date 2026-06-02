@@ -122,11 +122,41 @@ export const modelArchs: ModelArch[] = [
   },
   {
     name: 'chroma',
-    label: 'Chroma',
+    label: 'Chroma 1 Base',
     group: 'image',
     defaults: {
       // default updates when [selected, unselected] in the UI
       'config.process[0].model.name_or_path': ['lodestones/Chroma1-Base', defaultNameOrPath],
+      'config.process[0].model.quantize': [true, false],
+      'config.process[0].model.quantize_te': [true, false],
+      'config.process[0].sample.sampler': ['flowmatch', 'flowmatch'],
+      'config.process[0].train.noise_scheduler': ['flowmatch', 'flowmatch'],
+    },
+    disableSections: ['network.conv'],
+  },
+  {
+    // Same backend arch as 'chroma' (the ':hd' suffix is stripped by
+    // config_modules), just defaults to the Chroma1-HD checkpoint.
+    name: 'chroma:hd',
+    label: 'Chroma 1 HD',
+    group: 'image',
+    defaults: {
+      // default updates when [selected, unselected] in the UI
+      'config.process[0].model.name_or_path': ['lodestones/Chroma1-HD', defaultNameOrPath],
+      'config.process[0].model.quantize': [true, false],
+      'config.process[0].model.quantize_te': [true, false],
+      'config.process[0].sample.sampler': ['flowmatch', 'flowmatch'],
+      'config.process[0].train.noise_scheduler': ['flowmatch', 'flowmatch'],
+    },
+    disableSections: ['network.conv'],
+  },
+  {
+    name: 'chroma_radiance',
+    label: 'Chroma Radiance',
+    group: 'experimental',
+    defaults: {
+      // default updates when [selected, unselected] in the UI
+      'config.process[0].model.name_or_path': ['lodestones/Chroma1-Radiance/latest_x0.safetensors', defaultNameOrPath],
       'config.process[0].model.quantize': [true, false],
       'config.process[0].model.quantize_te': [true, false],
       'config.process[0].sample.sampler': ['flowmatch', 'flowmatch'],
@@ -768,6 +798,9 @@ const enabledModelNames = new Set([
   'zimage',
   'zimage:turbo',
   'ltx2.3',
+  'chroma',
+  'chroma:hd',
+  'chroma_radiance',
 ]);
 
 export const groupedModelOptions: GroupedSelectOption[] = modelArchs

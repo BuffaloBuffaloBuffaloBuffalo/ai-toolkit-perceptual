@@ -13,11 +13,12 @@ import JobConfigViewer from '@/components/JobConfigViewer';
 import JobMetricsGraph from '@/components/JobMetricsGraph';
 import JobMetricsCompareGraph from '@/components/JobMetricsCompareGraph';
 import DepthPreviews from '@/components/DepthPreviews';
+import IdentityPreviews from '@/components/IdentityPreviews';
 import { Job } from '@prisma/client';
 import { JobConfig } from '@/types';
 
-type PageKey = 'overview' | 'samples' | 'depth_previews' | 'config' | 'metrics' | 'metrics_compare';
-const PAGE_KEYS = new Set<PageKey>(['overview', 'samples', 'depth_previews', 'config', 'metrics', 'metrics_compare']);
+type PageKey = 'overview' | 'samples' | 'depth_previews' | 'identity_previews' | 'config' | 'metrics' | 'metrics_compare';
+const PAGE_KEYS = new Set<PageKey>(['overview', 'samples', 'depth_previews', 'identity_previews', 'config', 'metrics', 'metrics_compare']);
 
 interface Page {
   name: string;
@@ -34,6 +35,20 @@ function hasDepthPreviews(job: Job): boolean {
   try {
     const cfg = JSON.parse(job.job_config) as JobConfig;
     return (cfg.config?.process?.[0]?.depth_consistency?.preview_every ?? 0) > 0;
+  } catch {
+    return false;
+  }
+}
+
+// Identity previews land in <save_root>/id_previews/ whenever the identity
+// pipeline runs — i.e. an identity loss weight is set, or identity_metrics is
+// on as a diagnostic-only opt-in. See SDTrainer.py around the id_previews dir.
+function hasIdentityPreviews(job: Job): boolean {
+  if (!job.job_config) return false;
+  try {
+    const cfg = JSON.parse(job.job_config) as JobConfig;
+    const faceId = cfg.config?.process?.[0]?.face_id;
+    return (faceId?.identity_loss_weight ?? 0) > 0 || faceId?.identity_metrics === true;
   } catch {
     return false;
   }
@@ -59,6 +74,13 @@ const pages: Page[] = [
     component: DepthPreviews,
     mainCss: 'pt-24',
     condition: hasDepthPreviews,
+  },
+  {
+    name: 'Identity Previews',
+    value: 'identity_previews',
+    component: IdentityPreviews,
+    mainCss: 'pt-24',
+    condition: hasIdentityPreviews,
   },
   {
     name: 'Metrics',

@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useMemo, useRef, useState } from 'react';
-import useIdentityPreviews, { IdentityPreview } from '@/hooks/useIdentityPreviews';
+import { IdentityPreview } from '@/hooks/useIdentityPreviews';
 import useLocalStorageState from '@/hooks/useLocalStorageState';
 import SampleImageCard from './SampleImageCard';
 import { Job } from '@prisma/client';
@@ -27,10 +27,13 @@ function basename(p: string): string {
 
 interface Props {
   job: Job;
+  // Fetched and polled by the parent page so the tab is content-gated; optional
+  // (with safe defaults) so the component still satisfies the shared tab type.
+  previews?: IdentityPreview[];
+  status?: 'idle' | 'loading' | 'success' | 'error';
 }
 
-export default function IdentityPreviews({ job }: Props) {
-  const { previews, status } = useIdentityPreviews(job.id, 5000);
+export default function IdentityPreviews({ job, previews = [], status = 'idle' }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
 
   const stepBounds = useMemo<{ lo: number; hi: number }>(() => {

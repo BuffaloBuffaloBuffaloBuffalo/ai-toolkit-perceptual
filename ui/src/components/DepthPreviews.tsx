@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useMemo, useRef, useState } from 'react';
-import useDepthPreviews, { DepthPreview } from '@/hooks/useDepthPreviews';
+import { DepthPreview } from '@/hooks/useDepthPreviews';
 import useLocalStorageState from '@/hooks/useLocalStorageState';
 import SampleImageCard from './SampleImageCard';
 import { Job } from '@prisma/client';
@@ -36,10 +36,13 @@ function sizeKey(s?: { w: number; h: number }): string | null {
 
 interface Props {
   job: Job;
+  // Fetched and polled by the parent page so the tab is content-gated; optional
+  // (with safe defaults) so the component still satisfies the shared tab type.
+  previews?: DepthPreview[];
+  status?: 'idle' | 'loading' | 'success' | 'error';
 }
 
-export default function DepthPreviews({ job }: Props) {
-  const { previews, status } = useDepthPreviews(job.id, 5000);
+export default function DepthPreviews({ job, previews = [], status = 'idle' }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
 
   const stepBounds = useMemo<{ lo: number; hi: number }>(() => {

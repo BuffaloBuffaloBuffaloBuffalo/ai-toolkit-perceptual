@@ -13,11 +13,13 @@ import JobConfigViewer from '@/components/JobConfigViewer';
 import JobMetricsGraph from '@/components/JobMetricsGraph';
 import JobMetricsCompareGraph from '@/components/JobMetricsCompareGraph';
 import DepthPreviews from '@/components/DepthPreviews';
+import IdentityPreviews from '@/components/IdentityPreviews';
+import useDepthPreviews from '@/hooks/useDepthPreviews';
+import useIdentityPreviews from '@/hooks/useIdentityPreviews';
 import { Job } from '@prisma/client';
-import { JobConfig } from '@/types';
 
-type PageKey = 'overview' | 'samples' | 'depth_previews' | 'config' | 'metrics' | 'metrics_compare';
-const PAGE_KEYS = new Set<PageKey>(['overview', 'samples', 'depth_previews', 'config', 'metrics', 'metrics_compare']);
+type PageKey = 'overview' | 'samples' | 'depth_previews' | 'identity_previews' | 'config' | 'metrics' | 'metrics_compare';
+const PAGE_KEYS = new Set<PageKey>(['overview', 'samples', 'depth_previews', 'identity_previews', 'config', 'metrics', 'metrics_compare']);
 
 interface Page {
   name: string;
@@ -25,18 +27,6 @@ interface Page {
   component: React.ComponentType<{ job: Job }>;
   menuItem?: React.ComponentType<{ job?: Job | null }> | null;
   mainCss?: string;
-  /** Hide the tab unless the predicate (run against the loaded job) returns true. */
-  condition?: (job: Job) => boolean;
-}
-
-function hasDepthPreviews(job: Job): boolean {
-  if (!job.job_config) return false;
-  try {
-    const cfg = JSON.parse(job.job_config) as JobConfig;
-    return (cfg.config?.process?.[0]?.depth_consistency?.preview_every ?? 0) > 0;
-  } catch {
-    return false;
-  }
 }
 
 const pages: Page[] = [
@@ -58,7 +48,12 @@ const pages: Page[] = [
     value: 'depth_previews',
     component: DepthPreviews,
     mainCss: 'pt-24',
-    condition: hasDepthPreviews,
+  },
+  {
+    name: 'Identity Previews',
+    value: 'identity_previews',
+    component: IdentityPreviews,
+    mainCss: 'pt-24',
   },
   {
     name: 'Metrics',
@@ -87,6 +82,14 @@ export default function JobPage({ params }: { params: { jobID: string } }) {
   const usableParams = use(params as any) as { jobID: string };
   const jobID = usableParams.jobID;
   const { job, status, refreshJob } = useJob(jobID, 5000);
+  // Depth/Identity preview tabs are content-gated: poll the preview folders for
+  // the viewed job and only surface a tab once its folder actually has files.
+  // Lifting the fetch here (rather than inside the tab component) lets the tab
+  // bar react to "first preview written" without the component mounting first,
+  // and hands the already-loaded data down so the tab renders immediately
+  // instead of flashing its own loading state.
+  const depth = useDepthPreviews(jobID, 5000);
+  const identity = useIdentityPreviews(jobID, 5000);
 
   // Tab selection lives in the URL (`?tab=…`) so refresh + tab-switch-and-return
   // both preserve it, and the URL is shareable. Per-tab interior state (filters,
@@ -102,9 +105,20 @@ export default function JobPage({ params }: { params: { jobID: string } }) {
     router.replace(`?${params.toString()}`, { scroll: false });
   };
 
-  const visiblePages = useMemo(() => (job ? pages.filter(p => !p.condition || p.condition(job)) : pages.filter(p => !p.condition)), [job]);
-  // If the previously selected tab no longer applies (e.g. preview_every was
-  // turned off after the user landed on it), bounce back to overview.
+  // Content-gated tabs: hide Depth/Identity Previews until their folder has at
+  // least one file. Every other tab is always shown.
+  const visiblePages = useMemo(
+    () =>
+      pages.filter(p => {
+        if (p.value === 'depth_previews') return depth.previews.length > 0;
+        if (p.value === 'identity_previews') return identity.previews.length > 0;
+        return true;
+      }),
+    [depth.previews.length, identity.previews.length],
+  );
+  // If the previously selected tab no longer applies (e.g. a preview tab whose
+  // folder is still empty, or whose files were removed), bounce to the first
+  // visible tab (overview).
   const page = visiblePages.find(p => p.value === pageKey) ?? visiblePages[0];
   const effectivePageKey = page?.value ?? 'overview';
 
@@ -144,11 +158,21 @@ export default function JobPage({ params }: { params: { jobID: string } }) {
         {job && (
           <>
             {visiblePages.map(p => {
-              const Component = p.component;
               const isActive = p.value === effectivePageKey;
+              // Depth/Identity get the page-level fetched data injected; every
+              // other tab just receives the job.
+              let body: React.ReactNode;
+              if (p.value === 'depth_previews') {
+                body = <DepthPreviews job={job} previews={depth.previews} status={depth.status} />;
+              } else if (p.value === 'identity_previews') {
+                body = <IdentityPreviews job={job} previews={identity.previews} status={identity.status} />;
+              } else {
+                const Component = p.component;
+                body = <Component job={job} />;
+              }
               return (
                 <div key={p.value} className={isActive ? 'contents' : 'hidden'} aria-hidden={!isActive}>
-                  <Component job={job} />
+                  {body}
                 </div>
               );
             })}

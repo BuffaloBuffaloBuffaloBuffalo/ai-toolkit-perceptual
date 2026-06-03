@@ -1,21 +1,19 @@
 'use client';
 
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { DepthPreview } from '@/hooks/useDepthPreviews';
+import { IdentityPreview } from '@/hooks/useIdentityPreviews';
 import useLocalStorageState from '@/hooks/useLocalStorageState';
 import SampleImageCard from './SampleImageCard';
 import { Job } from '@prisma/client';
 import { LuImageOff, LuLoader, LuBan, LuX } from 'react-icons/lu';
 
-type SortKey = 'step' | 't' | 'dc';
+type SortKey = 'step' | 't' | 'cos';
 type SortDir = 'asc' | 'desc';
 
-// Bands match the trainer's convention: bin_start = floor(t * 10) / 10, label
-// `t{int(bin_start*100):02d}`. See SDTrainer.py around line 2147 etc.
+// Bands match the trainer's id_sim_tNN convention: bin_start = floor(t * 10) / 10,
+// label `t{int(bin_start*100):02d}`. See SDTrainer.py around the id_sim binning.
 const BAND_VALUES = ['all', 't00', 't10', 't20', 't30', 't40', 't50', 't60', 't70', 't80', 't90'] as const;
 type Band = (typeof BAND_VALUES)[number];
-const BAND_SET = new Set<Band>(BAND_VALUES);
-const SORT_KEYS = new Set<SortKey>(['step', 't', 'dc']);
 
 function bandFor(t: number): Band {
   const lo = Math.floor(Math.max(0, Math.min(0.999999, t)) * 10) * 10;
@@ -26,23 +24,16 @@ function basename(p: string): string {
   const i = p.lastIndexOf('/');
   return i >= 0 ? p.slice(i + 1) : p;
 }
-function clamp01(v: number): number {
-  if (!Number.isFinite(v)) return 0;
-  return Math.max(0, Math.min(1, v));
-}
-function sizeKey(s?: { w: number; h: number }): string | null {
-  return s ? `${s.w}x${s.h}` : null;
-}
 
 interface Props {
   job: Job;
   // Fetched and polled by the parent page so the tab is content-gated; optional
   // (with safe defaults) so the component still satisfies the shared tab type.
-  previews?: DepthPreview[];
+  previews?: IdentityPreview[];
   status?: 'idle' | 'loading' | 'success' | 'error';
 }
 
-export default function DepthPreviews({ job, previews = [], status = 'idle' }: Props) {
+export default function IdentityPreviews({ job, previews = [], status = 'idle' }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
 
   const stepBounds = useMemo<{ lo: number; hi: number }>(() => {
@@ -59,14 +50,13 @@ export default function DepthPreviews({ job, previews = [], status = 'idle' }: P
   // tab-switch-and-return, or browser-restart all land on the last view the
   // user had for this job. Empty strings on the step inputs mean "no
   // constraint" — keeps the controls usable before previews finish loading.
-  const lsKey = (suffix: string) => `aitk:depthPreviews:${job.id}:${suffix}`;
+  const lsKey = (suffix: string) => `aitk:identityPreviews:${job.id}:${suffix}`;
   const [minStep, setMinStep] = useLocalStorageState<string>(lsKey('minStep'), '');
   const [maxStep, setMaxStep] = useLocalStorageState<string>(lsKey('maxStep'), '');
   const [minT, setMinT] = useLocalStorageState<number>(lsKey('minT'), 0);
   const [maxT, setMaxT] = useLocalStorageState<number>(lsKey('maxT'), 1);
   const [band, setBand] = useLocalStorageState<Band>(lsKey('band'), 'all');
   const [sample, setSample] = useLocalStorageState<string>(lsKey('sample'), 'all');
-  const [size, setSize] = useLocalStorageState<string>(lsKey('size'), 'all');
   const [sortKey, setSortKey] = useLocalStorageState<SortKey>(lsKey('sortKey'), 'step');
   const [sortDir, setSortDir] = useLocalStorageState<SortDir>(lsKey('sortDir'), 'desc');
   // Zoom-overlay state. The full path is transient (it depends on where the
@@ -92,56 +82,13 @@ export default function DepthPreviews({ job, previews = [], status = 'idle' }: P
     if (match) _setSelectedPathTransient(match.path);
   }, [previews, selectedPath, persistedSelectedFile]);
 
-  // Sample × size options are linked: each dropdown shows only values that
-  // *exist in combination with* the other dropdown's current selection. This
-  // prevents the user from picking a (sample, size) pair that has no previews.
-  // If a setter is called with a value that would leave the partner dropdown
-  // on an unreachable value, the partner is reset to "all" — see setters
-  // below.
-  const sizeSortCmp = (a: string, b: string) => {
-    const [aw, ah] = a.split('x').map(n => parseInt(n, 10));
-    const [bw, bh] = b.split('x').map(n => parseInt(n, 10));
-    return aw - bw || ah - bh;
-  };
   const sampleOptions = useMemo(() => {
     const set = new Set<string>();
     for (const p of previews) {
-      if (!p.srcName) continue;
-      if (size !== 'all' && sizeKey(p.size) !== size) continue;
-      set.add(p.srcName);
+      if (p.srcName) set.add(p.srcName);
     }
     return Array.from(set).sort();
-  }, [previews, size]);
-  const sizeOptions = useMemo(() => {
-    const set = new Set<string>();
-    for (const p of previews) {
-      const k = sizeKey(p.size);
-      if (!k) continue;
-      if (sample !== 'all' && p.srcName !== sample) continue;
-      set.add(k);
-    }
-    return Array.from(set).sort(sizeSortCmp);
-  }, [previews, sample]);
-
-  // When the user picks a value, validate that the other dropdown's current
-  // value is still reachable; if not, reset the other to "all" so the UI
-  // never displays a stuck-but-unreachable pair.
-  const sampleHasSize = (s: string, z: string): boolean => {
-    if (z === 'all') return true;
-    return previews.some(p => p.srcName === s && sizeKey(p.size) === z);
-  };
-  const sizeHasSample = (z: string, s: string): boolean => {
-    if (s === 'all') return true;
-    return previews.some(p => sizeKey(p.size) === z && p.srcName === s);
-  };
-  const pickSample = (v: string) => {
-    setSample(v);
-    if (v !== 'all' && size !== 'all' && !sampleHasSize(v, size)) setSize('all');
-  };
-  const pickSize = (v: string) => {
-    setSize(v);
-    if (v !== 'all' && sample !== 'all' && !sizeHasSample(v, sample)) setSample('all');
-  };
+  }, [previews]);
 
   const filtered = useMemo(() => {
     const stepLo = minStep === '' ? -Infinity : parseInt(minStep, 10);
@@ -157,24 +104,18 @@ export default function DepthPreviews({ job, previews = [], status = 'idle' }: P
       if (Number.isFinite(stepLo) && p.step < stepLo) return false;
       if (Number.isFinite(stepHi) && p.step > stepHi) return false;
       if (p.t < tLo || p.t > tHi) return false;
-      // A specific sample selection only keeps previews with a matching
-      // srcName, which means videos (no srcName) drop out unless "all".
       if (sample !== 'all' && p.srcName !== sample) return false;
-      // Same shape for size: pre-suffix previews lack size and drop out
-      // unless "all" — selecting a size means "show only this resolution".
-      if (size !== 'all' && sizeKey(p.size) !== size) return false;
       return true;
     });
     const dir = sortDir === 'asc' ? 1 : -1;
-    const keyFn = (p: DepthPreview): number => {
+    const keyFn = (p: IdentityPreview): number => {
       if (sortKey === 'step') return p.step;
       if (sortKey === 't') return p.t;
-      // `dc` is image-only; videos sort to the end ascending
-      return p.dc ?? Number.POSITIVE_INFINITY;
+      return p.cos;
     };
     out.sort((a, b) => (keyFn(a) - keyFn(b)) * dir);
     return out;
-  }, [previews, minStep, maxStep, minT, maxT, band, sample, size, sortKey, sortDir]);
+  }, [previews, minStep, maxStep, minT, maxT, band, sample, sortKey, sortDir]);
 
   const counts = useMemo(() => {
     const total = previews.length;
@@ -213,16 +154,16 @@ export default function DepthPreviews({ job, previews = [], status = 'idle' }: P
 
   const emptyMessage = useMemo(() => {
     if (status === 'loading' && previews.length === 0) {
-      return { icon: <LuLoader className="animate-spin w-8 h-8" />, title: 'Loading Depth Previews', sub: 'Please wait…' };
+      return { icon: <LuLoader className="animate-spin w-8 h-8" />, title: 'Loading Identity Previews', sub: 'Please wait…' };
     }
     if (status === 'error') {
-      return { icon: <LuBan className="w-8 h-8" />, title: 'Error Loading Depth Previews', sub: 'There was a problem fetching the previews.' };
+      return { icon: <LuBan className="w-8 h-8" />, title: 'Error Loading Identity Previews', sub: 'There was a problem fetching the previews.' };
     }
     if (status === 'success' && previews.length === 0) {
       return {
         icon: <LuImageOff className="w-8 h-8" />,
-        title: 'No Depth Previews Yet',
-        sub: 'Depth previews are written to <save_root>/depth_previews/ during training; check back after the first preview_every step.',
+        title: 'No Identity Previews Yet',
+        sub: 'Identity previews are written to <save_root>/id_previews/ during training when identity loss or identity metrics are enabled; check back after the first preview is saved.',
       };
     }
     if (previews.length > 0 && filtered.length === 0) {
@@ -294,30 +235,13 @@ export default function DepthPreviews({ job, previews = [], status = 'idle' }: P
           <span className={labelCls}>Sample</span>
           <select
             value={sample}
-            onChange={e => pickSample(e.target.value)}
+            onChange={e => setSample(e.target.value)}
             className={`${inputCls} max-w-[14rem]`}
             disabled={sampleOptions.length === 0}
-            title={sampleOptions.length === 0 ? 'No samples match the current Size filter' : 'Filter by source image'}
+            title="Filter by source image"
           >
             <option value="all">all ({sampleOptions.length})</option>
             {sampleOptions.map(s => (
-              <option key={s} value={s}>
-                {s}
-              </option>
-            ))}
-          </select>
-        </div>
-        <div className="flex items-center gap-2">
-          <span className={labelCls}>Size</span>
-          <select
-            value={size}
-            onChange={e => pickSize(e.target.value)}
-            className={inputCls}
-            disabled={sizeOptions.length === 0}
-            title={sizeOptions.length === 0 ? 'No sized previews match the current Sample filter (older trainer builds also omit the size suffix).' : 'Filter by sample resolution (W×H)'}
-          >
-            <option value="all">all ({sizeOptions.length})</option>
-            {sizeOptions.map(s => (
               <option key={s} value={s}>
                 {s}
               </option>
@@ -329,7 +253,7 @@ export default function DepthPreviews({ job, previews = [], status = 'idle' }: P
           <select value={sortKey} onChange={e => setSortKey(e.target.value as SortKey)} className={inputCls}>
             <option value="step">step</option>
             <option value="t">t</option>
-            <option value="dc">dc loss</option>
+            <option value="cos">cos sim</option>
           </select>
           <button
             type="button"
@@ -364,18 +288,15 @@ export default function DepthPreviews({ job, previews = [], status = 'idle' }: P
                 imageUrl={p.path}
                 numSamples={1}
                 sampleImages={[p.path]}
-                alt={`depth preview step ${p.step} t ${p.t}`}
+                alt={`identity preview step ${p.step} t ${p.t}`}
                 observerRoot={containerRef.current}
                 onClick={() => setSelectedPath(p.path)}
               />
               <div className="bg-gray-900 text-xs text-gray-300 px-2 py-1 rounded-b-lg flex flex-wrap gap-x-3">
                 <span><span className="text-gray-500">step</span> {p.step}</span>
                 <span><span className="text-gray-500">t</span> {p.t.toFixed(2)}</span>
-                {typeof p.dc === 'number' && (
-                  <span><span className="text-gray-500">dc</span> {p.dc.toFixed(4)}</span>
-                )}
+                <span><span className="text-gray-500">cos</span> {p.cos.toFixed(3)}</span>
                 <span className="text-gray-500">{bandFor(p.t)}</span>
-                {p.size && <span className="text-gray-500">{p.size.w}×{p.size.h}</span>}
                 {p.srcName && <span className="text-gray-500 truncate">· {p.srcName}</span>}
               </div>
             </div>
@@ -403,7 +324,7 @@ export default function DepthPreviews({ job, previews = [], status = 'idle' }: P
           </button>
           <img
             src={`/api/img/${encodeURIComponent(selected.path)}`}
-            alt={`depth preview step ${selected.step} t ${selected.t}`}
+            alt={`identity preview step ${selected.step} t ${selected.t}`}
             className="max-w-[95vw] max-h-[85vh] object-contain rounded-md shadow-2xl"
             onClick={e => e.stopPropagation()}
           />
@@ -413,13 +334,8 @@ export default function DepthPreviews({ job, previews = [], status = 'idle' }: P
           >
             <span><span className="text-gray-500">step</span> {selected.step}</span>
             <span><span className="text-gray-500">t</span> {selected.t.toFixed(2)}</span>
-            {typeof selected.dc === 'number' && (
-              <span><span className="text-gray-500">dc</span> {selected.dc.toFixed(4)}</span>
-            )}
+            <span><span className="text-gray-500">cos</span> {selected.cos.toFixed(3)}</span>
             <span><span className="text-gray-500">band</span> {bandFor(selected.t)}</span>
-            {selected.size && (
-              <span><span className="text-gray-500">size</span> {selected.size.w}×{selected.size.h}</span>
-            )}
             {selected.srcName && (
               <span className="truncate max-w-[40ch]"><span className="text-gray-500">sample</span> {selected.srcName}</span>
             )}

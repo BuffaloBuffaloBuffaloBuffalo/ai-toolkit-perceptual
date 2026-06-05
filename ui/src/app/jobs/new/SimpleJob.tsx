@@ -2014,20 +2014,20 @@ export default function SimpleJob({
                         <div>
                           <div className="text-xs font-medium text-gray-400 mb-1">Diffusion</div>
                           <div className="grid grid-cols-3 gap-2">
-                            <NumberInput label="Weight" value={dataset.diffusion_loss_weight ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].diffusion_loss_weight`)} placeholder="inherit" min={0} />
-                            <NumberInput label="Min t" value={dataset.diffusion_loss_min_t ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].diffusion_loss_min_t`)} placeholder="inherit" min={0} max={1} />
-                            <NumberInput label="Max t" value={dataset.diffusion_loss_max_t ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].diffusion_loss_max_t`)} placeholder="inherit" min={0} max={1} />
-                            <NumberInput label="Face Suppression" value={dataset.face_suppression_weight ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].face_suppression_weight`)} placeholder="inherit" min={0} max={1} />
-                            <NumberInput label="Supp. Expand" value={dataset.face_suppression_expand ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].face_suppression_expand`)} placeholder="inherit" min={1.0} max={3.0} />
+                            <NumberInput label="Weight" value={dataset.diffusion_loss_weight ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].diffusion_loss_weight`)} unsetOnEmpty placeholder="inherit" min={0} />
+                            <NumberInput label="Min t" value={dataset.diffusion_loss_min_t ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].diffusion_loss_min_t`)} unsetOnEmpty placeholder="inherit" min={0} max={1} />
+                            <NumberInput label="Max t" value={dataset.diffusion_loss_max_t ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].diffusion_loss_max_t`)} unsetOnEmpty placeholder="inherit" min={0} max={1} />
+                            <NumberInput label="Face Suppression" value={dataset.face_suppression_weight ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].face_suppression_weight`)} unsetOnEmpty placeholder="inherit" min={0} max={1} />
+                            <NumberInput label="Supp. Expand" value={dataset.face_suppression_expand ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].face_suppression_expand`)} unsetOnEmpty placeholder="inherit" min={1.0} max={3.0} />
                           </div>
                         </div>
                         {/* Latent Perceptual — experimental, hidden for now
                         <div>
                           <div className="text-xs font-medium text-gray-400 mb-1">Latent Perceptual</div>
                           <div className="grid grid-cols-3 gap-2">
-                            <NumberInput label="Weight" value={dataset.latent_perceptual_loss_weight ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].latent_perceptual_loss_weight`)} placeholder="inherit" min={0} />
-                            <NumberInput label="Min t" value={dataset.latent_perceptual_loss_min_t ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].latent_perceptual_loss_min_t`)} placeholder="inherit" min={0} max={1} />
-                            <NumberInput label="Max t" value={dataset.latent_perceptual_loss_max_t ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].latent_perceptual_loss_max_t`)} placeholder="inherit" min={0} max={1} />
+                            <NumberInput label="Weight" value={dataset.latent_perceptual_loss_weight ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].latent_perceptual_loss_weight`)} unsetOnEmpty placeholder="inherit" min={0} />
+                            <NumberInput label="Min t" value={dataset.latent_perceptual_loss_min_t ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].latent_perceptual_loss_min_t`)} unsetOnEmpty placeholder="inherit" min={0} max={1} />
+                            <NumberInput label="Max t" value={dataset.latent_perceptual_loss_max_t ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].latent_perceptual_loss_max_t`)} unsetOnEmpty placeholder="inherit" min={0} max={1} />
                           </div>
                         </div>
                         */}
@@ -2035,17 +2035,17 @@ export default function SimpleJob({
                         <div>
                           <div className="text-xs font-medium text-gray-400 mb-1">Identity (ArcFace)</div>
                           <div className="grid grid-cols-4 gap-2">
-                            <NumberInput label="Weight" value={dataset.identity_loss_weight ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].identity_loss_weight`)} placeholder="inherit" min={0} />
-                            <NumberInput label="Min t" value={dataset.identity_loss_min_t ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].identity_loss_min_t`)} placeholder="inherit" min={0} max={1} />
-                            <NumberInput label="Max t" value={dataset.identity_loss_max_t ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].identity_loss_max_t`)} placeholder="inherit" min={0} max={1} />
-                            <NumberInput label="Min Cos" value={dataset.identity_loss_min_cos ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].identity_loss_min_cos`)} placeholder="inherit" min={0} max={1} />
+                            <NumberInput label="Weight" value={dataset.identity_loss_weight ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].identity_loss_weight`)} unsetOnEmpty placeholder="inherit" min={0} />
+                            <NumberInput label="Min t" value={dataset.identity_loss_min_t ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].identity_loss_min_t`)} unsetOnEmpty placeholder="inherit" min={0} max={1} />
+                            <NumberInput label="Max t" value={dataset.identity_loss_max_t ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].identity_loss_max_t`)} unsetOnEmpty placeholder="inherit" min={0} max={1} />
+                            <NumberInput label="Min Cos" value={dataset.identity_loss_min_cos ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].identity_loss_min_cos`)} unsetOnEmpty placeholder="inherit" min={0} max={1} />
                           </div>
                         </div>
                         {/* Landmark — experimental, hidden for now
                         <div>
                           <div className="text-xs font-medium text-gray-400 mb-1">Landmark</div>
                           <div className="grid grid-cols-3 gap-2">
-                            <NumberInput label="Weight" value={dataset.landmark_loss_weight ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].landmark_loss_weight`)} placeholder="inherit" min={0} />
+                            <NumberInput label="Weight" value={dataset.landmark_loss_weight ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].landmark_loss_weight`)} unsetOnEmpty placeholder="inherit" min={0} />
                           </div>
                         </div>
                         */}
@@ -2053,18 +2053,18 @@ export default function SimpleJob({
                         <div>
                           <div className="text-xs font-medium text-gray-400 mb-1">Body Proportion</div>
                           <div className="grid grid-cols-3 gap-2">
-                            <NumberInput label="Weight" value={dataset.body_proportion_loss_weight ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].body_proportion_loss_weight`)} placeholder="inherit" min={0} />
-                            <NumberInput label="Min t" value={dataset.body_proportion_loss_min_t ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].body_proportion_loss_min_t`)} placeholder="inherit" min={0} max={1} />
-                            <NumberInput label="Max t" value={dataset.body_proportion_loss_max_t ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].body_proportion_loss_max_t`)} placeholder="inherit" min={0} max={1} />
+                            <NumberInput label="Weight" value={dataset.body_proportion_loss_weight ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].body_proportion_loss_weight`)} unsetOnEmpty placeholder="inherit" min={0} />
+                            <NumberInput label="Min t" value={dataset.body_proportion_loss_min_t ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].body_proportion_loss_min_t`)} unsetOnEmpty placeholder="inherit" min={0} max={1} />
+                            <NumberInput label="Max t" value={dataset.body_proportion_loss_max_t ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].body_proportion_loss_max_t`)} unsetOnEmpty placeholder="inherit" min={0} max={1} />
                           </div>
                         </div>
                         {/* Depth Consistency */}
                         <div>
                           <div className="text-xs font-medium text-gray-400 mb-1">Depth Consistency</div>
                           <div className="grid grid-cols-3 gap-2">
-                            <NumberInput label="Weight" value={dataset.depth_loss_weight ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].depth_loss_weight`)} placeholder="inherit" min={0} />
-                            <NumberInput label="Min t" value={dataset.depth_loss_min_t ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].depth_loss_min_t`)} placeholder="inherit" min={0} max={1} />
-                            <NumberInput label="Max t" value={dataset.depth_loss_max_t ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].depth_loss_max_t`)} placeholder="inherit" min={0} max={1} />
+                            <NumberInput label="Weight" value={dataset.depth_loss_weight ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].depth_loss_weight`)} unsetOnEmpty placeholder="inherit" min={0} />
+                            <NumberInput label="Min t" value={dataset.depth_loss_min_t ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].depth_loss_min_t`)} unsetOnEmpty placeholder="inherit" min={0} max={1} />
+                            <NumberInput label="Max t" value={dataset.depth_loss_max_t ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].depth_loss_max_t`)} unsetOnEmpty placeholder="inherit" min={0} max={1} />
                           </div>
                         </div>
                         {/* Loss Alternation: alternate diffusion / depth per optimizer step.
@@ -2100,9 +2100,9 @@ export default function SimpleJob({
                           <div>
                             <div className="text-xs font-medium text-gray-400 mb-1">Subject Mask Regions</div>
                             <div className="grid grid-cols-4 gap-2">
-                              <NumberInput label="Background" value={dataset.background_loss_weight ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].background_loss_weight`)} placeholder="inherit" min={0} />
-                              <NumberInput label="Clothing" value={dataset.clothing_loss_weight ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].clothing_loss_weight`)} placeholder="inherit" min={0} />
-                              <NumberInput label="Body" value={dataset.body_loss_weight ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].body_loss_weight`)} placeholder="inherit" min={0} />
+                              <NumberInput label="Background" value={dataset.background_loss_weight ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].background_loss_weight`)} unsetOnEmpty placeholder="inherit" min={0} />
+                              <NumberInput label="Clothing" value={dataset.clothing_loss_weight ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].clothing_loss_weight`)} unsetOnEmpty placeholder="inherit" min={0} />
+                              <NumberInput label="Body" value={dataset.body_loss_weight ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].body_loss_weight`)} unsetOnEmpty placeholder="inherit" min={0} />
                               <Checkbox label="Restrict Perc." checked={dataset.perceptual_restrict_to_body ?? false} onChange={value => setJobConfig(value, `config.process[0].datasets[${i}].perceptual_restrict_to_body`)} />
                             </div>
                           </div>
@@ -2111,26 +2111,26 @@ export default function SimpleJob({
                         <div>
                           <div className="text-xs font-medium text-gray-400 mb-1">Body Shape</div>
                           <div className="grid grid-cols-4 gap-2">
-                            <NumberInput label="Weight" value={dataset.body_shape_loss_weight ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].body_shape_loss_weight`)} placeholder="inherit" min={0} />
-                            <NumberInput label="Min t" value={dataset.body_shape_loss_min_t ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].body_shape_loss_min_t`)} placeholder="inherit" min={0} max={1} />
-                            <NumberInput label="Max t" value={dataset.body_shape_loss_max_t ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].body_shape_loss_max_t`)} placeholder="inherit" min={0} max={1} />
-                            <NumberInput label="Min Cos" value={dataset.body_shape_loss_min_cos ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].body_shape_loss_min_cos`)} placeholder="inherit" min={0} max={1} />
+                            <NumberInput label="Weight" value={dataset.body_shape_loss_weight ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].body_shape_loss_weight`)} unsetOnEmpty placeholder="inherit" min={0} />
+                            <NumberInput label="Min t" value={dataset.body_shape_loss_min_t ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].body_shape_loss_min_t`)} unsetOnEmpty placeholder="inherit" min={0} max={1} />
+                            <NumberInput label="Max t" value={dataset.body_shape_loss_max_t ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].body_shape_loss_max_t`)} unsetOnEmpty placeholder="inherit" min={0} max={1} />
+                            <NumberInput label="Min Cos" value={dataset.body_shape_loss_min_cos ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].body_shape_loss_min_cos`)} unsetOnEmpty placeholder="inherit" min={0} max={1} />
                           </div>
                         </div>
                         <div>
                           <div className="text-xs font-medium text-gray-400 mb-1">Normal Map</div>
                           <div className="grid grid-cols-3 gap-2">
-                            <NumberInput label="Weight" value={dataset.normal_loss_weight ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].normal_loss_weight`)} placeholder="inherit" min={0} />
-                            <NumberInput label="Min t" value={dataset.normal_loss_min_t ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].normal_loss_min_t`)} placeholder="inherit" min={0} max={1} />
-                            <NumberInput label="Max t" value={dataset.normal_loss_max_t ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].normal_loss_max_t`)} placeholder="inherit" min={0} max={1} />
+                            <NumberInput label="Weight" value={dataset.normal_loss_weight ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].normal_loss_weight`)} unsetOnEmpty placeholder="inherit" min={0} />
+                            <NumberInput label="Min t" value={dataset.normal_loss_min_t ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].normal_loss_min_t`)} unsetOnEmpty placeholder="inherit" min={0} max={1} />
+                            <NumberInput label="Max t" value={dataset.normal_loss_max_t ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].normal_loss_max_t`)} unsetOnEmpty placeholder="inherit" min={0} max={1} />
                           </div>
                         </div>
                         <div>
                           <div className="text-xs font-medium text-gray-400 mb-1">VAE Anchor</div>
                           <div className="grid grid-cols-3 gap-2">
-                            <NumberInput label="Weight" value={dataset.vae_anchor_loss_weight ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].vae_anchor_loss_weight`)} placeholder="inherit" min={0} />
-                            <NumberInput label="Min t" value={dataset.vae_anchor_loss_min_t ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].vae_anchor_loss_min_t`)} placeholder="inherit" min={0} max={1} />
-                            <NumberInput label="Max t" value={dataset.vae_anchor_loss_max_t ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].vae_anchor_loss_max_t`)} placeholder="inherit" min={0} max={1} />
+                            <NumberInput label="Weight" value={dataset.vae_anchor_loss_weight ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].vae_anchor_loss_weight`)} unsetOnEmpty placeholder="inherit" min={0} />
+                            <NumberInput label="Min t" value={dataset.vae_anchor_loss_min_t ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].vae_anchor_loss_min_t`)} unsetOnEmpty placeholder="inherit" min={0} max={1} />
+                            <NumberInput label="Max t" value={dataset.vae_anchor_loss_max_t ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].vae_anchor_loss_max_t`)} unsetOnEmpty placeholder="inherit" min={0} max={1} />
                           </div>
                         </div>
                         */}

@@ -22,6 +22,7 @@ from transformers import AutoProcessor, Mistral3ForConditionalGeneration
 from .src.model import Flux2, Flux2Params
 from .src.pipeline import Flux2Pipeline
 from .src.autoencoder import AutoEncoder, AutoEncoderParams
+from .comfy_compat import normalize_transformer_state_dict
 from safetensors.torch import load_file, save_file
 from PIL import Image
 import torch.nn.functional as F
@@ -135,12 +136,32 @@ class Flux2Model(BaseModel):
         with torch.device("meta"):
             transformer = Flux2(self.get_flux2_params())
 
-        # use local path if provided
-        if os.path.exists(os.path.join(transformer_path, self.flux2_te_filename)):
+        # Resolve the transformer checkpoint. These all load with no manual
+        # conversion (see normalize_transformer_state_dict for the key handling):
+        #  - a local single .safetensors file (e.g. a ComfyUI diffusion_models export)
+        #  - an "org/repo/file.safetensors" single-file path on the HF hub
+        #  - a local folder (or hub repo id) holding flux2_te_filename
+        if transformer_path.endswith(".safetensors") and os.path.exists(transformer_path):
+            # local single-file checkpoint, use as-is
+            pass
+        elif transformer_path.endswith(".safetensors"):
+            # single file on the hub: org/repo/filename.safetensors
+            splits = transformer_path.split("/")
+            if len(splits) < 3:
+                raise ValueError(
+                    f"Invalid model path '{transformer_path}'. A single-file hub path "
+                    f"must look like 'org/repo/filename.safetensors'."
+                )
+            transformer_path = huggingface_hub.hf_hub_download(
+                repo_id="/".join(splits[:2]),
+                filename="/".join(splits[2:]),
+                token=HF_TOKEN,
+            )
+        elif os.path.exists(os.path.join(transformer_path, self.flux2_te_filename)):
+            # local folder holding the expected transformer file
             transformer_path = os.path.join(transformer_path, self.flux2_te_filename)
-
-        if not os.path.exists(transformer_path):
-            # assume it is from the hub
+        elif not os.path.exists(transformer_path):
+            # assume it is a hub repo id that holds flux2_te_filename
             transformer_path = huggingface_hub.hf_hub_download(
                 repo_id=model_path,
                 filename=self.flux2_te_filename,
@@ -148,6 +169,10 @@ class Flux2Model(BaseModel):
             )
 
         transformer_state_dict = load_file(transformer_path, device="cpu")
+        # ComfyUI / original-format checkpoints may namespace the DiT under
+        # "model.diffusion_model." and bundle the vae/text encoders alongside it.
+        # Normalize onto the native module keys so they load without conversion.
+        transformer_state_dict = normalize_transformer_state_dict(transformer_state_dict)
 
         # cast to dtype
         for key in transformer_state_dict:

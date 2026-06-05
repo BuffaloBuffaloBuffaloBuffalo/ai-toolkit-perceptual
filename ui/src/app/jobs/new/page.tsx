@@ -6,7 +6,7 @@ import { defaultJobConfig, defaultDatasetConfig, migrateJobConfig } from './jobC
 import { jobTypeOptions } from './options';
 import { JobConfig } from '@/types';
 import { objectCopy } from '@/utils/basic';
-import { useNestedState } from '@/utils/hooks';
+import { useNestedState, setNestedValue } from '@/utils/hooks';
 import { SelectInput } from '@/components/formInputs';
 import useSettings from '@/hooks/useSettings';
 import useGPUInfo from '@/hooks/useGPUInfo';
@@ -43,15 +43,24 @@ export default function TrainingForm() {
 
     const datasetOptions = datasets.map(name => ({ value: path.join(settings.DATASETS_FOLDER, name), label: name }));
     setDatasetOptions(datasetOptions);
-    const defaultDatasetPath = defaultDatasetConfig.folder_path;
 
-    for (let i = 0; i < jobConfig.config.process[0].datasets.length; i++) {
-      const dataset = jobConfig.config.process[0].datasets[i];
-      if (dataset.folder_path === defaultDatasetPath) {
-        if (datasetOptions.length > 0) {
-          setJobConfig(datasetOptions[0].value, `config.process[0].datasets[${i}].folder_path`);
+    if (datasetOptions.length > 0) {
+      const defaultDatasetPath = defaultDatasetConfig.folder_path;
+      // Use a functional updater so the guard checks the *current* config, not a
+      // stale closure. The dataset-list/settings fetches resolve independently of
+      // the async job-config load (open/clone). With a closure read, the guard can
+      // pass against the stale placeholder config while the keyed write lands on
+      // the freshly-loaded config — overwriting datasets[0].folder_path with the
+      // first dataset in the list and silently resetting the job's dataset.
+      setJobConfig((prev: JobConfig) => {
+        let updated = prev;
+        for (let i = 0; i < prev.config.process[0].datasets.length; i++) {
+          if (prev.config.process[0].datasets[i].folder_path === defaultDatasetPath) {
+            updated = setNestedValue(updated, datasetOptions[0].value, `config.process[0].datasets[${i}].folder_path`);
+          }
         }
-      }
+        return updated;
+      });
     }
   }, [datasets, settings, isSettingsLoaded, datasetFetchStatus]);
 

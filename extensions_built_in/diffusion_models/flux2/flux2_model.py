@@ -172,7 +172,9 @@ class Flux2Model(BaseModel):
         # ComfyUI / original-format checkpoints may namespace the DiT under
         # "model.diffusion_model." and bundle the vae/text encoders alongside it.
         # Normalize onto the native module keys so they load without conversion.
-        transformer_state_dict = normalize_transformer_state_dict(transformer_state_dict)
+        transformer_state_dict = normalize_transformer_state_dict(
+            transformer_state_dict, log=self.print_and_status_update
+        )
 
         # cast to dtype
         for key in transformer_state_dict:

@@ -530,6 +530,7 @@ export default function SimpleJob({
                   options={[
                     { value: 'adamw8bit', label: 'AdamW8Bit' },
                     { value: 'adafactor', label: 'Adafactor' },
+                    { value: 'automagic2', label: 'Automagic v2 (low VRAM)' },
                     { value: 'rose', label: 'Rose (stateless, experimental)' },
                   ]}
                 />

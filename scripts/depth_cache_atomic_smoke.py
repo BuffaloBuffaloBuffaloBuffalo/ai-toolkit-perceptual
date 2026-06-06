@@ -5,9 +5,11 @@ Covers the two private helpers added in ``toolkit/depth_consistency.py``:
   * ``_atomic_save_file`` — temp-file + ``os.replace`` write so that an
     in-place rewrite of a safetensors cache cannot trip Windows
     ``ERROR_USER_MAPPED_FILE (1224)`` when the destination is mmap'd.
-  * ``_load_then_close`` — load a safetensors cache and force-release the
-    mmap handle so a subsequent overwrite of the same path succeeds on
-    Windows.
+  * ``_load_then_close`` — load a safetensors cache into owned (cloned)
+    storage so the returned tensors are detached from the mmap and a
+    subsequent overwrite of the same path is safe. (The clones drop the mmap
+    by refcounting; no per-item ``gc.collect()`` is needed or used — that was
+    removed as it dominated the caching loop under a large resident heap.)
 
 The depth-cache crash on Windows hit the exact load → augment → save path
 exercised here (multi-bucket training writes the same per-image cache file

@@ -185,6 +185,8 @@ aitk_db.db
 
 # Session-local / scratchpad
 /.claude/
+/style_clustering/
+/timestep_distributions/
 /config/examples/generate_cartwheel_1024.yaml
 /test_data/
 /toolkit/taehv/*.pth

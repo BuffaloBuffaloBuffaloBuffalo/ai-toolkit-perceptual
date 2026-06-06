@@ -49,6 +49,7 @@ CANONICAL_RENAMES: Dict[str, str] = {
     # core
     "loss": "core/loss",
     "grad_norm": "core/grad_norm",
+    "weight_norm": "core/weight_norm",
     "timestep": "core/timestep",
 
     # diffusion / training

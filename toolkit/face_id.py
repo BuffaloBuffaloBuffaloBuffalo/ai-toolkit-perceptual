@@ -24,6 +24,37 @@ class FaceIDExtractor:
             providers=['CUDAExecutionProvider', 'CPUExecutionProvider'],
         )
         self.app.prepare(ctx_id=device_id, det_size=(640, 640))
+        self._warn_if_cpu_only()
+
+    def _warn_if_cpu_only(self):
+        # InsightFace silently falls back to CPU when onnxruntime can't bind the
+        # CUDA provider — commonly the CPU-only `onnxruntime` wheel shadowing
+        # `onnxruntime-gpu`, or cuDNN (libcudnn.so.9) missing from the loader path.
+        # On a large dataset that turns face caching from seconds into days, so
+        # surface it loudly in the job log instead of leaving a silent ETA.
+        active = set()
+        for m in self.app.models.values():
+            try:
+                active.update(m.session.get_providers())
+            except Exception:
+                pass
+        if 'CUDAExecutionProvider' not in active:
+            try:
+                import onnxruntime as ort
+                avail = ort.get_available_providers()
+            except Exception:
+                avail = ['<unknown>']
+            bar = '!' * 80
+            print(
+                f"\n{bar}\n"
+                f"[face_id] WARNING: InsightFace is running on CPU (active providers: "
+                f"{sorted(active)}).\n"
+                f"          onnxruntime available providers: {avail}\n"
+                f"          Face-embedding caching will be EXTREMELY slow (seconds per\n"
+                f"          image). Usually the CPU-only `onnxruntime` package is\n"
+                f"          shadowing `onnxruntime-gpu`, or cuDNN is not on the library\n"
+                f"          path. See docker/Dockerfile for the fix.\n{bar}\n"
+            )
 
     def _get_largest_face(self, faces):
         """Return the largest face by bounding box area."""

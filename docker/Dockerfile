@@ -58,6 +58,19 @@ COPY requirements.txt /app/ai-toolkit/requirements.txt
 RUN pip install --no-cache-dir --break-system-packages -r requirements.txt && \
     pip install setuptools==69.5.1 --no-cache-dir --break-system-packages
 
+# insightface hard-depends on the CPU-only `onnxruntime`, which installs into the
+# same package dir as `onnxruntime-gpu` and shadows its native library — leaving
+# onnxruntime with no CUDAExecutionProvider, so InsightFace face-embedding caching
+# silently runs on CPU (~4s/image vs ~12ms on an H100; days vs minutes on a large
+# dataset). Force the GPU build's libraries to win, then register torch's bundled
+# CUDA/cuDNN libs (the nvidia-*-cu12 wheels under nvidia/*/lib, which aren't in
+# ldconfig) so the CUDA EP can load libcudnn.so.9 at runtime. The final assert
+# fails the build if the GPU provider isn't active.
+RUN pip install --no-cache-dir --break-system-packages --force-reinstall --no-deps onnxruntime-gpu==1.26.0 && \
+    python -c "import nvidia, glob, os; print('\n'.join(sorted({d for b in nvidia.__path__ for d in glob.glob(os.path.join(b, '*', 'lib'))})))" > /etc/ld.so.conf.d/nvidia-pip-libs.conf && \
+    ldconfig && \
+    python -c "import onnxruntime as o; p=o.get_available_providers(); assert 'CUDAExecutionProvider' in p, p; print('onnxruntime providers OK:', p)"
+
 # Install Node deps (still cache-friendly if package files don't change)
 COPY ui/package.json /app/ai-toolkit/ui/
 COPY ui/package-lock.json /app/ai-toolkit/ui/

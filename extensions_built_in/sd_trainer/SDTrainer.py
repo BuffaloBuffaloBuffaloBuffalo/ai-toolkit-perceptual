@@ -353,6 +353,32 @@ class SDTrainer(BaseSDTrainProcess):
                 out[k] = slot['sum'] / cnt
         return out
 
+    @staticmethod
+    def _prune_preview_dir(dir_path: str, max_keep: int) -> None:
+        """Keep only the newest ``max_keep`` files in ``dir_path``.
+
+        Preview images/clips accumulate one-per-step (or per sample) over a
+        long run and can balloon a job folder. This trims the directory to the
+        most-recent ``max_keep`` files by creation time, mirroring the
+        checkpoint-retention convention (``max_step_saves_to_keep``).
+        ``max_keep <= 0`` keeps everything (no pruning). Failures are swallowed
+        so preview housekeeping can never interrupt training.
+        """
+        if not max_keep or max_keep <= 0:
+            return
+        try:
+            files = [e.path for e in os.scandir(dir_path) if e.is_file()]
+            if len(files) <= max_keep:
+                return
+            files.sort(key=os.path.getctime)
+            for stale in files[:-max_keep]:
+                try:
+                    os.remove(stale)
+                except OSError:
+                    pass
+        except OSError:
+            pass
+
     def _reset_step_bins(self) -> None:
         """Reset all per-t-band bin accumulators at the start of a fresh
         optimizer step. Called from `hook_train_loop` so that bins span a
@@ -3083,6 +3109,12 @@ class SDTrainer(BaseSDTrainProcess):
                                     draw.text((4, h + 2), label, fill='white')
                                     combined.save(os.path.join(id_preview_dir, f'{src_name}_step{self.step_num:06d}_t{t_val:.2f}_cos{cos_val:.3f}.jpg'))
 
+                            # Trim id_previews/ to the most recent N files.
+                            self._prune_preview_dir(
+                                id_preview_dir,
+                                self.face_id_config.identity_loss_preview_max_keep,
+                            )
+
                             # Console log per-sample breakdown every 50 steps
                             if self.step_num % 50 == 0:
                                 for idx in range(x0_pixels.shape[0]):
@@ -3931,6 +3963,7 @@ class SDTrainer(BaseSDTrainProcess):
                                 dc_preview_dir,
                                 f'{src_name}_step{self.step_num:06d}_t{_t_val:.2f}_dc{_dc_val:.4f}_s{_w_px}x{_h_px}.jpg'
                             ))
+                            self._prune_preview_dir(dc_preview_dir, _dc_cfg.preview_max_keep)
                         except Exception as e:  # noqa: BLE001
                             print_acc(f"  depth preview failed: {e}")
 
@@ -4185,6 +4218,7 @@ class SDTrainer(BaseSDTrainProcess):
                                 gt_depth=_gt_cube_p,
                                 fps=16,
                             )
+                            self._prune_preview_dir(dc_preview_dir, _dc_cfg.preview_max_keep)
                         except Exception as e:  # noqa: BLE001
                             print_acc(f"  video depth preview failed: {e}")
 

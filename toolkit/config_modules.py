@@ -1021,6 +1021,10 @@ class FaceIDConfig:
         self.identity_loss_frames_per_chunk: int = kwargs.get('identity_loss_frames_per_chunk', 4)
         # Save an animated-webp identity preview every N steps (0 = never).
         self.identity_loss_preview_every: int = kwargs.get('identity_loss_preview_every', 0)
+        # Cap how many face preview images are retained in id_previews/. Once the
+        # count exceeds this, the oldest files (by creation time) are pruned so a
+        # long run can't fill the job folder. <= 0 keeps everything. Default 500.
+        self.identity_loss_preview_max_keep: int = kwargs.get('identity_loss_preview_max_keep', 500)
         # Video GT is built from the DECODED clip; a frame is only used as a target
         # if the detector finds a face in the decoded frame with det_score >= this.
         # Raise to drop frames the tiny decoder blurs past recognition.
@@ -1134,6 +1138,11 @@ class DepthConsistencyConfig:
         self.preview_only: bool = kwargs.get('preview_only', False)
         # Preview only for steps whose t-ratio is >= this value (video path).
         self.preview_min_t: float = kwargs.get('preview_min_t', 0.0)
+        # Cap how many depth preview files (image .jpg + video .webp) are kept in
+        # depth_previews/. Once the count exceeds this, the oldest files (by
+        # creation time) are pruned so a long run can't fill the job folder.
+        # <= 0 keeps everything. Default 500.
+        self.preview_max_keep: int = kwargs.get('preview_max_keep', 500)
         # Video path only: frames per DA2 chunk during x0→depth backward. Keeps
         # peak activation memory bounded regardless of the video's total T.
         self.frames_per_chunk: int = kwargs.get('frames_per_chunk', 8)

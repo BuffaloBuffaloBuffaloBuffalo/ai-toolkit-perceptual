@@ -60,16 +60,30 @@ def _atomic_save_file(save_data: dict, cache_path: str) -> None:
 
 
 def _load_then_close(cache_path: str) -> dict:
-    """Load a safetensors file and aggressively release the mmap handle.
+    """Read every tensor from a cache file into owned (non-mmap) storage.
 
-    Detaches every tensor from the underlying mmap by cloning into a fresh
-    dict, drops the original reference, and forces a GC pass so the Rust
-    side can unmap the file before the caller tries to overwrite it.
+    The GT-depth cache shares one ``_face_id_cache/{stem}.safetensors`` per
+    image with the face/body/shape embeddings and every other bucket's depth
+    map, so writing a new bucket's map means reading the existing keys, merging,
+    and rewriting the whole file (safetensors has no in-place append).
+
+    ``load_file`` mmaps the file; cloning each tensor copies it into owned
+    storage, and once ``existing`` drops, refcounting unmaps the file right away
+    (the returned dict has no reference cycle, so a GC pass is not needed to
+    release it). The previous per-item ``gc.collect()`` here was the dominant
+    cost of the caching loop whenever the cache file already existed — and it
+    always does once the face pass has run (it writes these same files first) or
+    when a cache was copied in. A full collect per image is an O(N^2) heap walk
+    that scales with the resident heap (the multi-billion-param trainer model,
+    the VAE, DA2), starving the loop with the GPU idle (~1-3 it/s, ~0% util on
+    an H100). Releasing the mmap never required it, and the rewrite goes through
+    ``_atomic_save_file`` (temp file + ``os.replace``), which is already safe
+    against a live mmap. Mirrors commit a51428c, which removed the same per-item
+    collect from the cache-HIT read path.
     """
     existing = load_file(cache_path)
     copied = {k: v.clone() for k, v in existing.items()}
     del existing
-    gc.collect()
     return copied
 
 

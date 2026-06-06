@@ -214,17 +214,17 @@ function UploadCard({ onUploaded }: { onUploaded: () => void }) {
   const [error, setError] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
-  // The RunPod edge (Cloudflare) rejects a request body over some size with a 400
-  // before it reaches the app — a whole multi-GB file, and even a 50 MiB chunk,
-  // both fail. We don't hardcode the cap (RunPod can change it): start optimistic
-  // and, whenever the edge bounces a chunk, halve the chunk size and retry the
-  // same bytes until it goes through, then keep that size. Each chunk POSTs to its
-  // byte offset; the server appends, reports the authoritative offset (so we can
-  // resume after a hiccup or reload), and renames into place once the .part
-  // reaches the full file size.
-  const START_CHUNK = 8 * 1024 * 1024; // 8 MiB — observed to clear the edge
-  const MIN_CHUNK = 512 * 1024; // floor; below this we stop shrinking and back off
-  const MAX_RETRIES = 8; // consecutive transient failures before giving up
+  // The RunPod/Cloudflare edge and the Next server both handle large bodies fine
+  // (a 128 MiB POST clears server-side in ~1.5s); the real bottleneck is that ONE
+  // TCP stream to the datacenter is bandwidth-delay-product limited — measured
+  // ~13 Mbps while the uplink can do several× that. So we upload many fixed-size
+  // chunks CONCURRENTLY to saturate the link: an `init` pre-allocates the file,
+  // PARALLELISM chunks POST to their byte offsets at once, then we `finalize`. The
+  // server records which offsets landed, so a reload/drop only re-sends the
+  // missing chunks instead of restarting a multi-GB transfer.
+  const CHUNK = 16 * 1024 * 1024; // 16 MiB per chunk — clears the edge, amortizes per-request overhead
+  const PARALLELISM = 8; // concurrent chunk uploads — saturates a high-latency uplink one stream can't
+  const MAX_CHUNK_RETRIES = 6; // per-chunk transient-failure retries before giving up
 
   const upload = async () => {
     if (!file || uploading) return;
@@ -235,103 +235,122 @@ function UploadCard({ onUploaded }: { onUploaded: () => void }) {
     setUploading(true);
 
     // Mirror what apiClient adds — the project's auth interceptor lives in axios,
-    // not in raw XHR, so we plumb the bearer token through ourselves on the POSTs.
+    // not in fetch, so we plumb the bearer token through ourselves on every call.
     const token = typeof window !== 'undefined' ? localStorage.getItem('AI_TOOLKIT_AUTH') : null;
+    const authH: Record<string, string> = token ? { Authorization: `Bearer ${token}` } : {};
     const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+    const post = (headers: Record<string, string>, body?: BodyInit | null) =>
+      fetch('/api/models/upload', { method: 'POST', headers: { ...authH, ...headers }, body: body ?? undefined });
+    // A "hard" error aborts the whole upload; everything else is retried.
+    const hard = (msg: string) => Object.assign(new Error(msg), { hard: true });
 
-    type ChunkResult = { uploaded: number; complete: boolean };
-    type ChunkError = Error & { kind: 'edge' | 'transient' | 'app'; status: number };
-    const fail = (kind: ChunkError['kind'], message: string, httpStatus = 0): ChunkError =>
-      Object.assign(new Error(message), { kind, status: httpStatus });
+    // Plan the chunks up front. A 0-byte file still gets one empty chunk so init +
+    // finalize still produce the (empty) file.
+    const chunks: { offset: number; size: number }[] = [];
+    for (let o = 0; o < f.size; o += CHUNK) chunks.push({ offset: o, size: Math.min(CHUNK, f.size - o) });
+    if (chunks.length === 0) chunks.push({ offset: 0, size: 0 });
+    const totalBytes = f.size || 1;
 
-    const sendChunk = (offset: number, size: number) =>
-      new Promise<ChunkResult>((resolve, reject) => {
-        const end = Math.min(f.size, offset + size);
-        const xhr = new XMLHttpRequest();
-        xhr.upload.addEventListener('progress', e => {
-          if (e.lengthComputable) setProgress(Math.min(1, f.size ? (offset + e.loaded) / f.size : 1));
-        });
-        xhr.addEventListener('load', () => {
-          const s = xhr.status;
-          let body: any = null;
-          try { body = JSON.parse(xhr.responseText); } catch { /* not JSON */ }
-          if (s >= 200 && s < 300) {
-            resolve({ uploaded: typeof body?.uploaded === 'number' ? body.uploaded : end, complete: !!body?.complete });
-            return;
+    // Send one chunk, retrying transient failures (network, 5xx, 429, bodiless edge
+    // bounce) with backoff. A vanished .part (NEED_INIT) re-inits then retries; a
+    // hard 4xx (already exists, unsupported) aborts immediately.
+    const sendOne = async (c: { offset: number; size: number }) => {
+      for (let attempt = 0; ; attempt++) {
+        try {
+          const r = await post(
+            {
+              'X-Filename': f.name,
+              'X-Chunk-Offset': String(c.offset),
+              'X-File-Size': String(f.size),
+              'Content-Type': 'application/octet-stream',
+            },
+            f.slice(c.offset, c.offset + c.size),
+          );
+          if (r.ok) return;
+          const b = await r.json().catch(() => null);
+          if (r.status === 409 && b?.code === 'NEED_INIT') {
+            await post({ 'X-Filename': f.name, 'X-Upload-Init': '1', 'X-File-Size': String(f.size) });
+          } else if (r.status === 409 && /exists/i.test(b?.error || '')) {
+            throw hard('A model with that filename already exists');
+          } else if (r.status >= 500 || r.status === 429 || !b) {
+            if (attempt >= MAX_CHUNK_RETRIES) throw new Error(b?.error || `Chunk failed (HTTP ${r.status || 0})`);
+          } else {
+            throw hard(b?.error || `Chunk failed (HTTP ${r.status})`);
           }
-          if (body && typeof body.error === 'string') {
-            // The app answered — trust its verdict. Resync/transient codes retry;
-            // hard 4xx (already exists, unsupported, unauthorized) abort.
-            if (body.code === 'OFFSET_GAP' || s === 429 || s >= 500) { reject(fail('transient', body.error, s)); return; }
-            reject(fail('app', body.error, s));
-            return;
-          }
-          // No JSON (Cloudflare's HTML 400, or an opaque status) — the edge bounced
-          // the body before the app saw it. Shrinking the chunk is the fix.
-          reject(fail('edge', `Edge rejected a ${formatBytes(end - offset)} chunk (HTTP ${s || 0})`, s));
-        });
-        xhr.addEventListener('error', () => reject(fail('edge', 'Network/edge error', 0)));
-        xhr.addEventListener('timeout', () => reject(fail('transient', 'Chunk timed out', 0)));
-        xhr.open('POST', '/api/models/upload');
-        if (token) xhr.setRequestHeader('Authorization', `Bearer ${token}`);
-        xhr.setRequestHeader('X-Filename', f.name);
-        xhr.setRequestHeader('X-Chunk-Offset', String(offset));
-        xhr.setRequestHeader('X-File-Size', String(f.size));
-        xhr.setRequestHeader('Content-Type', 'application/octet-stream');
-        xhr.send(f.slice(offset, end));
-      });
-
-    // Ask the server how much already landed, so a reload or retry resumes instead
-    // of restarting. Throws 'app' if the model is already fully present.
-    const serverOffset = async (): Promise<number> => {
-      const res = await apiClient.get('/api/models/upload', { params: { filename: f.name } });
-      if (res.data?.exists) throw fail('app', 'A model with that filename already exists', 409);
-      const up = Number(res.data?.uploaded);
-      return Number.isFinite(up) && up > 0 && up <= f.size ? up : 0;
+        } catch (e: any) {
+          if (e?.hard) throw e;
+          if (attempt >= MAX_CHUNK_RETRIES) throw e;
+        }
+        await sleep(Math.min(8000, 500 * 2 ** Math.min(attempt, 4)));
+      }
     };
 
     try {
-      let offset = await serverOffset();
-      if (offset > 0) setStatus(`Resuming at ${formatBytes(offset)} of ${formatBytes(f.size)}`);
-      setProgress(f.size ? Math.min(1, offset / f.size) : 0);
-      let chunk = START_CHUNK;
-      let fails = 0;
+      // Resume probe: bail if already present, else learn which offsets landed.
+      const probeRes = await fetch(`/api/models/upload?filename=${encodeURIComponent(f.name)}`, { headers: authH });
+      const probe = await probeRes.json().catch(() => ({} as any));
+      if (probe?.exists) throw new Error('A model with that filename already exists');
+      const received = new Set<number>(Array.isArray(probe?.received) ? probe.received.map(Number) : []);
 
-      // Loop until the server confirms completion (renamed into place). Sending a
-      // zero-length chunk once offset has reached the end finalizes a full-but-
-      // unrenamed .part or a 0-byte file.
-      for (;;) {
-        const before = offset;
-        try {
-          const res = await sendChunk(offset, offset < f.size ? chunk : 0);
-          offset = res.uploaded;
-          setProgress(Math.min(1, f.size ? offset / f.size : 1));
-          if (res.complete) break;
-          if (offset <= before) {
-            // No forward progress on a success — avoid a hot loop.
-            if (++fails > MAX_RETRIES) throw new Error('Upload stalled (no progress)');
-            await sleep(Math.min(8000, 500 * 2 ** (fails - 1)));
-          } else {
-            fails = 0;
-            setStatus(null);
-          }
-        } catch (err) {
-          const e = err as ChunkError;
-          if (e.kind === 'app') throw e; // unrecoverable — surface the message
-          if (e.kind === 'edge' && chunk > MIN_CHUNK) {
-            // Too big for the edge: halve and retry the same bytes. This is the
-            // adaptive self-tune, not a real failure, so it spends no retry budget.
-            chunk = Math.max(MIN_CHUNK, Math.floor(chunk / 2));
-            setStatus(`Edge rejected a larger chunk; retrying at ${formatBytes(chunk)}…`);
-            continue;
-          }
-          if (++fails > MAX_RETRIES) throw new Error(`${e.message} — gave up after ${MAX_RETRIES} retries`);
-          // Transient (or edge already at the floor): back off, resync to the
-          // server's offset, and retry so we never re-send bytes that landed.
-          setStatus(`Hiccup (${e.message}); retry ${fails}/${MAX_RETRIES}…`);
-          await sleep(Math.min(8000, 500 * 2 ** (fails - 1)));
-          try { offset = await serverOffset(); setProgress(f.size ? Math.min(1, offset / f.size) : 0); } catch { /* keep offset */ }
+      // Init a fresh upload (pre-allocate the .part). Skip if resuming into one.
+      if (!probe?.partExists) {
+        const r = await post({ 'X-Filename': f.name, 'X-Upload-Init': '1', 'X-File-Size': String(f.size) });
+        if (!r.ok) {
+          const b = await r.json().catch(() => null);
+          throw new Error(b?.error || `Could not start upload (HTTP ${r.status})`);
         }
+        received.clear();
+      }
+
+      let doneBytes = chunks.filter(c => received.has(c.offset)).reduce((s, c) => s + c.size, 0);
+      setProgress(Math.min(1, doneBytes / totalBytes));
+      const pending = chunks.filter(c => !received.has(c.offset));
+      if (received.size > 0 && pending.length > 0) {
+        setStatus(`Resuming — ${received.size}/${chunks.length} chunks already uploaded`);
+      } else {
+        setStatus(`Uploading ${chunks.length} chunk${chunks.length === 1 ? '' : 's'}, ${PARALLELISM} at a time…`);
+      }
+
+      // Worker pool: each worker pulls the next pending chunk until the queue drains.
+      // `pending[idx++]` is atomic between awaits (JS is single-threaded), so no two
+      // workers grab the same chunk. The first failure aborts the rest.
+      let idx = 0;
+      let aborted = false;
+      const worker = async () => {
+        for (;;) {
+          if (aborted) return;
+          const c = pending[idx++];
+          if (!c) return;
+          try {
+            await sendOne(c);
+          } catch (e) {
+            aborted = true;
+            throw e;
+          }
+          doneBytes += c.size;
+          setProgress(Math.min(1, doneBytes / totalBytes));
+        }
+      };
+      await Promise.all(Array.from({ length: Math.min(PARALLELISM, Math.max(1, pending.length)) }, worker));
+
+      // Finalize: the server checks every expected offset landed and the .part is
+      // the right size before renaming. If it reports gaps, re-send just those.
+      for (let attempt = 0; ; attempt++) {
+        const r = await post({
+          'X-Filename': f.name,
+          'X-Upload-Finalize': '1',
+          'X-File-Size': String(f.size),
+          'X-Chunk-Size': String(CHUNK),
+        });
+        if (r.ok) break;
+        const b = await r.json().catch(() => null);
+        if (r.status === 409 && b?.code === 'INCOMPLETE' && Array.isArray(b?.missing) && attempt < 3) {
+          const miss = (b.missing as number[]).map(off => ({ offset: off, size: Math.min(CHUNK, f.size - off) }));
+          setStatus(`Re-sending ${miss.length} missing chunk${miss.length === 1 ? '' : 's'}…`);
+          for (const c of miss) await sendOne(c);
+          continue;
+        }
+        throw new Error(b?.error || `Could not finalize upload (HTTP ${r.status})`);
       }
 
       setFile(null);

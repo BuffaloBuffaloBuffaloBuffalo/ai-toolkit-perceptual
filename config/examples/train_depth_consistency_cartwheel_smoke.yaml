@@ -69,6 +69,7 @@ config:
         frames_per_chunk: 8
         preview_every: 1           # preview on every step so we catch webp failures fast
         preview_min_t: 0.0
+        preview_max_keep: 500      # keep only the newest N preview files (<=0 = keep all)
       sample:
         sample_every: 10000        # effectively off — we only care about the loss path here
         sampler: "flowmatch"

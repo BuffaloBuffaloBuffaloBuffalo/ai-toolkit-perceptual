@@ -38,6 +38,7 @@ export const defaultFaceIDConfig: FaceIDConfig = {
   identity_loss_average_blend: 0.0,
   identity_loss_use_random: false,
   identity_loss_num_refs: 0,
+  identity_loss_preview_max_keep: 500,
   identity_metrics: false,
   landmark_loss_weight: 0.0,
   body_proportion_loss_weight: 0.0,
@@ -90,6 +91,7 @@ export const defaultDepthConsistencyConfig: DepthConsistencyConfig = {
   mask_source: 'subject',
   grad_checkpoint: true,
   preview_every: 100,
+  preview_max_keep: 500,
 };
 
 export const defaultSliderConfig: SliderConfig = {

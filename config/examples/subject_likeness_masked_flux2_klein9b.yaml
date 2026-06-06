@@ -171,7 +171,7 @@ config:
         loss_max_t: 1
         model_id: "depth-anything/Depth-Anything-V2-Large-hf"
         loss_min_t: 0
-        grad_checkpoint: false
+        grad_checkpoint: true
         ssi_weight: 0
         grad_weight: 1
         grad_scales: 6

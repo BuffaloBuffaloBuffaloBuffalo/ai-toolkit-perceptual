@@ -195,3 +195,6 @@ aitk_db.db
 
 # YOLO weights auto-downloaded by ultralytics at cwd
 /yolo*.pt
+
+# playwright-cli scratch (snapshots, console/request logs)
+/.playwright-cli/

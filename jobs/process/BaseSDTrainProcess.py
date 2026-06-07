@@ -2129,7 +2129,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # esure params require grad
         self.ensure_params_requires_grad(force=True)
         optimizer = get_optimizer(self.params, optimizer_type, learning_rate=self.train_config.lr,
-                                  optimizer_params=self.train_config.optimizer_params)
+                                  optimizer_params=self.train_config.optimizer_params,
+                                  gradient_accumulation=self.train_config.gradient_accumulation,
+                                  max_grad_norm=self.train_config.max_grad_norm)
         self.optimizer = optimizer
         
         # set it to do paramiter swapping

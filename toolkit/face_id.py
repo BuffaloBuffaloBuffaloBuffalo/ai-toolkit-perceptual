@@ -666,7 +666,21 @@ def cache_face_embeddings(
             file_item.landmark_embedding = landmark_tensor
             save_data['landmark_embedding'] = landmark_tensor
 
+        # Merge into any existing cache rather than overwriting it: this file
+        # ({stem}.safetensors) is shared with the depth/body-proportion/body-
+        # shape passes (depth_gt_*, body_proportion_*, body_shape_* keys). A
+        # blind save_file() here truncates the file to face-only keys and
+        # silently destroys those siblings' maps — e.g. depth maps copied in
+        # from another machine, or written by an earlier pass this run (depth
+        # caches last). clone() because safetensors mmaps the source file.
         os.makedirs(cache_dir, exist_ok=True)
+        if os.path.exists(cache_path):
+            try:
+                existing = {k: v.clone() for k, v in load_file(cache_path).items()}
+                existing.update(save_data)
+                save_data = existing
+            except Exception:  # noqa: BLE001 — corrupt/unreadable → rewrite face-only
+                pass
         save_file(save_data, cache_path)
 
     # Free encoder VRAM

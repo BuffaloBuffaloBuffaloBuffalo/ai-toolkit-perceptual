@@ -481,6 +481,8 @@ def cache_depth_gt_embeddings(
     _pix_blur_sigma = float(getattr(config, 'pixel_blur_sigma', 0.0) or 0.0)
     _blur_sfx = _blur_cache_suffix(_pix_blur_sigma)
     zero_depth_count = 0
+    _cache_hits = 0    # items that reused an existing cached map (header-only hit)
+    _cache_misses = 0  # items whose GT map was (re)computed this run
 
     # Single-frame-video mode stores the same v3 roundtrip GT under the video
     # cache namespace (key + version + lazy-load flag) so the 5D video depth
@@ -532,9 +534,11 @@ def cache_depth_gt_embeddings(
             # serialize N large reads on the main process and hold them all
             # resident — the stall this lazy path removes.
             if _cache_header_shape(cache_path, depth_key, _ver_key) is not None:
+                _cache_hits += 1
                 _record_lazy_meta(file_item, cache_path, depth_key)
                 continue
 
+        _cache_misses += 1
         # v2: run DA2 on the *dataloader-transformed* pixels so cached depth
         # lines up with the training tensor the trainer actually sees. Mirrors
         # toolkit/dataloader_mixins.load_and_process_image lines 774-793.
@@ -590,6 +594,14 @@ def cache_depth_gt_embeddings(
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+    if _cache_hits or _cache_misses:
+        print(
+            f"  -  GT depth cache: {_cache_hits} reused, {_cache_misses} computed "
+            f"(this run's key like {depth_key!r} + {_ver_key!r}). If you copied caches "
+            f"in and expected reuse, all-computed means a bucket/version/path mismatch "
+            f"or a sibling pass overwrote the shared file."
+        )
 
     if zero_depth_count > 0:
         print(

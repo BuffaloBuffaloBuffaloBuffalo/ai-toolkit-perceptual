@@ -59,20 +59,8 @@ function buildSubjectLikenessConfig(
     flip_x: false,
     flip_y: false,
     num_repeats: [16, 4, 1],
-    diffusion_loss_weight: 1,
-    depth_loss_weight: 0.005,
     loss_split: 'sum',
   };
-
-  if (opts.subjectMask) {
-    // Per-region diffusion weights — only applied when subject_mask is on.
-    // Captions should describe ONLY the changeable parts (clothing, expression,
-    // pose) and skip background/setting. The mask makes "ignore background"
-    // spatial; the captions make "everything captioned is promptable" semantic.
-    dataset.background_loss_weight = 0;
-    dataset.clothing_loss_weight = 1;
-    dataset.body_loss_weight = 1;
-  }
 
   return {
     job: 'extension',
@@ -218,6 +206,7 @@ function buildSubjectLikenessConfig(
             enabled: opts.subjectMask,
             background_loss_weight: 0,
             clothing_loss_weight: 1,
+            body_loss_weight: 1,
             save_debug_previews: true,
             cache_resolution: 768,
             segformer_res: 768,
@@ -291,9 +280,6 @@ function buildStyleDepthAnchorConfig(current: JobConfig): JobConfig {
     flip_x: false,
     flip_y: false,
     num_repeats: 1,
-    diffusion_loss_weight: 1,
-    depth_loss_weight: 0.005,
-    identity_loss_weight: 0,
     loss_split: 'diffusion_depth',
   };
 
@@ -496,8 +482,6 @@ function buildSubjectLikenessZImageTurboConfig(current: JobConfig): JobConfig {
     flip_x: false,
     flip_y: false,
     num_repeats: 1,
-    diffusion_loss_weight: 1,
-    depth_loss_weight: 0.005,
     loss_split: 'sum',
   };
 

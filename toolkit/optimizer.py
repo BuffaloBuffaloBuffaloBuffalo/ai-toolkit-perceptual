@@ -1,15 +1,49 @@
 import torch
 
+# Tracks whether the automagic2 max_grad_norm warning has already been emitted,
+# so the heads-up prints once per process rather than once per optimizer rebuild.
+_AUTOMAGIC2_CLIP_WARNED = False
+
 
 def get_optimizer(
         params,
         optimizer_type='adam',
         learning_rate=1e-6,
-        optimizer_params=None
+        optimizer_params=None,
+        gradient_accumulation=1,
+        max_grad_norm=None,
 ):
     if optimizer_params is None:
         optimizer_params = {}
     lower_type = optimizer_type.lower()
+
+    # Automagic2 fuses its update into register_post_accumulate_grad_hook: each
+    # param is stepped and its .grad freed the instant autograd finishes the
+    # backward, and .step() is a no-op. That breaks the trainer's
+    # zero_grad -> backward(xN) -> clip_grad_norm_ -> step() contract whenever
+    # gradient_accumulation > 1 (the weights would update on every microbatch
+    # instead of once per step, and the clip would see freed grads). It also
+    # makes max_grad_norm ineffective for the same reason. Guard the misuse
+    # additively here; the gradient_accumulation == 1 default path is unchanged.
+    if lower_type == 'automagic2':
+        if gradient_accumulation is not None and gradient_accumulation > 1:
+            raise ValueError(
+                "optimizer 'automagic2' does not support gradient_accumulation > 1 "
+                f"(got gradient_accumulation={gradient_accumulation}). automagic2 fuses "
+                "the optimizer step into the backward pass (register_post_accumulate_grad_hook), "
+                "so weights update on every microbatch instead of once per accumulated step and "
+                "gradients are freed before they can be accumulated. Set gradient_accumulation=1, "
+                "or choose a different optimizer."
+            )
+        global _AUTOMAGIC2_CLIP_WARNED
+        if (max_grad_norm is not None and max_grad_norm > 0) and not _AUTOMAGIC2_CLIP_WARNED:
+            print(
+                "WARNING: max_grad_norm is ineffective with optimizer 'automagic2'. "
+                "automagic2 frees gradients inside the backward pass (its step is fused "
+                "into register_post_accumulate_grad_hook), so clip_grad_norm_ runs after the "
+                "grads are already None and is a silent no-op."
+            )
+            _AUTOMAGIC2_CLIP_WARNED = True
     if lower_type.startswith("dadaptation"):
         # dadaptation optimizer does not use standard learning rate. 1 is the default value
         import dadaptation
@@ -97,6 +131,9 @@ def get_optimizer(
     elif lower_type == 'automagic':
         from toolkit.optimizers.automagic import Automagic
         optimizer = Automagic(params, lr=float(learning_rate), **optimizer_params)
+    elif lower_type == 'automagic2':
+        from toolkit.optimizers.automagic2 import Automagic2
+        optimizer = Automagic2(params, lr=float(learning_rate), **optimizer_params)
     elif lower_type == 'rose':
         # Range-Of-Slice Equilibration optimizer (Kieren 2026, Apache 2.0).
         # Stateless: no per-param momentum/variance buffers; uses per-slice

@@ -72,10 +72,15 @@ export interface NumberInputProps extends InputProps {
   onChange: (value: number | null) => void;
   min?: number;
   max?: number;
+  // Fork addition (opt-in): when set, fully clearing the field emits null so the
+  // consumer can drop the config key (used by the per-dataset overrides, which
+  // inherit the global value when their key is absent). When unset we keep the
+  // upstream behaviour: hold the previous value until a valid number is entered.
+  unsetOnEmpty?: boolean;
 }
 
 export const NumberInput = (props: NumberInputProps) => {
-  const { label, value, onChange, placeholder, required, min, max, docKey = null } = props;
+  const { label, value, onChange, placeholder, required, min, max, docKey = null, unsetOnEmpty = false } = props;
   let { doc } = props;
   if (!doc && docKey) {
     doc = getDoc(docKey);
@@ -112,7 +117,17 @@ export const NumberInput = (props: NumberInputProps) => {
 
           // Handle empty or partial inputs
           if (rawValue === '' || rawValue === '-') {
-            // For empty or partial negative input, don't call onChange yet
+            // Fork (opt-in): a fully-cleared field unsets the value so the
+            // consumer can drop the config key. The per-dataset overrides emit
+            // null here, then normalize it to a key delete so the field inherits
+            // the global value. The trainer reads every field via
+            // kwargs.get(key, default), so an absent key falls back to the
+            // default; a persisted `key: null` would instead reach it as None
+            // and bypass the default. Upstream behaviour (flag off) holds the
+            // previous value until a valid number is entered.
+            if (unsetOnEmpty && rawValue === '') {
+              onChange(null);
+            }
             return;
           }
 

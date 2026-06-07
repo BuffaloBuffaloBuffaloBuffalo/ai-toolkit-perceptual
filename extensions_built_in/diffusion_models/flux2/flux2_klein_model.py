@@ -34,6 +34,9 @@ class Flux2KleinModel(Flux2Model):
         # use the new format on this new model by default
         self.use_old_lokr_format = False
 
+        if self.model_config.te_name_or_path is not None:
+            self.flux2_klein_te_path = self.model_config.te_name_or_path
+
     def load_te(self):
         if self.flux2_klein_te_path is None:
             raise ValueError("flux2_klein_te_path must be set for Flux2KleinModel")

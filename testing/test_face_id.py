@@ -19,6 +19,7 @@ from toolkit.face_id import (
     crop_face_for_vision,
     cache_face_embeddings,
 )
+import toolkit.face_id as _fid  # for monkeypatching the extractor in cache merge tests
 from toolkit.body_id import BodyIDProjector
 from toolkit.config_modules import FaceIDConfig, BodyIDConfig
 from toolkit.identity_inference import load_identity_from_lora, has_identity
@@ -428,6 +429,162 @@ def test_cache_completeness_check():
 
 
 # ---------------------------------------------------------------------------
+# cache_face_embeddings merge tests
+#
+# _face_id_cache/{stem}.safetensors is SHARED: the depth (depth_gt_*),
+# body-proportion, and body-shape passes write the same file. The face pass
+# must MERGE its keys in, never blind-overwrite, or it silently destroys the
+# others' maps (e.g. depth maps copied onto a fresh pod, since face caches
+# before depth). The extractor is faked so these stay CPU / no-model.
+# ---------------------------------------------------------------------------
+
+_MERGE_FACE_VAL = np.arange(512, dtype=np.float32) / 512.0
+_MERGE_DEPTH = torch.full((96, 96), 3.5, dtype=torch.float16)
+
+
+class _FakeFaceExtractor:
+    def __init__(self, *a, **k):
+        pass
+
+    def extract_from_pil(self, pil):
+        return _MERGE_FACE_VAL.copy()
+
+    def extract_from_pil_with_bbox(self, pil):
+        return _MERGE_FACE_VAL.copy(), np.array([1, 2, 30, 40], dtype=np.float32)
+
+
+class _FakeIdentityEncoder:
+    def __init__(self, *a, **k):
+        pass
+
+    def encode(self, pil):
+        return torch.full((512,), 0.25)
+
+
+class _patch_face_models:
+    """Swap InsightFace / ArcFace for CPU fakes around a cache_face_embeddings call."""
+    def __init__(self, identity=False):
+        self.identity = identity
+
+    def __enter__(self):
+        self._ext, self._idy = _fid.FaceIDExtractor, _fid.DifferentiableFaceEncoder
+        _fid.FaceIDExtractor = _FakeFaceExtractor
+        if self.identity:
+            _fid.DifferentiableFaceEncoder = _FakeIdentityEncoder
+        return self
+
+    def __exit__(self, *a):
+        _fid.FaceIDExtractor, _fid.DifferentiableFaceEncoder = self._ext, self._idy
+        return False
+
+
+def _seed_cache(cache_path, tensors):
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+    save_file(tensors, cache_path)
+
+
+def _make_image(path):
+    Image.fromarray(np.zeros((64, 64, 3), dtype=np.uint8)).save(path)
+
+
+def test_face_cache_merge_preserves_depth():
+    """Face pass must keep a sibling depth_gt_* key written by the depth pass."""
+    with tempfile.TemporaryDirectory() as d:
+        img = os.path.join(d, 'im.jpg'); _make_image(img)
+        cp = os.path.join(d, '_face_id_cache', 'im.safetensors')
+        _seed_cache(cp, {'depth_gt_512x512': _MERGE_DEPTH.clone(), 'depth_gt_v3': torch.ones(1)})
+        with _patch_face_models():
+            cache_face_embeddings([_FakeFileItem(img)], FaceIDConfig())
+        data = load_file(cp)
+        assert 'depth_gt_512x512' in data and 'depth_gt_v3' in data, "depth keys destroyed"
+        assert torch.equal(data['depth_gt_512x512'], _MERGE_DEPTH), "depth bytes changed"
+        assert 'face_embedding' in data, "face_embedding not written"
+        assert np.allclose(data['face_embedding'].numpy(), _MERGE_FACE_VAL), "wrong face value"
+
+
+def test_face_cache_merge_preserves_all_siblings():
+    """depth + body_proportion + body_shape keys all survive the face pass."""
+    with tempfile.TemporaryDirectory() as d:
+        img = os.path.join(d, 'im.jpg'); _make_image(img)
+        cp = os.path.join(d, '_face_id_cache', 'im.safetensors')
+        seeded = {
+            'depth_gt_512x512': _MERGE_DEPTH.clone(), 'depth_gt_v3': torch.ones(1),
+            'body_proportion_512x512': torch.full((17, 3), 0.7), 'body_proportion_v1': torch.ones(1),
+            'body_shape_512x512': torch.full((10,), 1.3), 'body_shape_v1': torch.ones(1),
+        }
+        _seed_cache(cp, {k: v.clone() for k, v in seeded.items()})
+        with _patch_face_models():
+            cache_face_embeddings([_FakeFileItem(img)], FaceIDConfig())
+        data = load_file(cp)
+        for k, v in seeded.items():
+            assert k in data and torch.equal(data[k], v), f"{k} not preserved"
+        assert 'face_embedding' in data, "face_embedding not written"
+
+
+def test_face_cache_fresh_file_is_face_only():
+    """No pre-existing cache: behaviour is unchanged (face-only file written)."""
+    with tempfile.TemporaryDirectory() as d:
+        img = os.path.join(d, 'im.jpg'); _make_image(img)
+        cp = os.path.join(d, '_face_id_cache', 'im.safetensors')
+        with _patch_face_models():
+            cache_face_embeddings([_FakeFileItem(img)], FaceIDConfig())
+        data = load_file(cp)
+        assert list(data.keys()) == ['face_embedding'], f"fresh file not face-only: {sorted(data)}"
+
+
+def test_face_cache_reextract_preserves_depth():
+    """A face miss (identity key absent) re-extracts: refresh face, keep depth."""
+    with tempfile.TemporaryDirectory() as d:
+        img = os.path.join(d, 'im.jpg'); _make_image(img)
+        cp = os.path.join(d, '_face_id_cache', 'im.safetensors')
+        _seed_cache(cp, {'depth_gt_512x512': _MERGE_DEPTH.clone(), 'depth_gt_v3': torch.ones(1),
+                         'face_embedding': torch.full((512,), -9.0)})
+        with _patch_face_models(identity=True):
+            cache_face_embeddings([_FakeFileItem(img)], FaceIDConfig(identity_metrics=True))
+        data = load_file(cp)
+        assert torch.equal(data['depth_gt_512x512'], _MERGE_DEPTH), "depth not preserved on re-extract"
+        assert np.allclose(data['face_embedding'].numpy(), _MERGE_FACE_VAL), "stale face not refreshed"
+        assert 'identity_embedding' in data, "identity_embedding not added"
+
+
+def test_face_cache_corrupt_file_fallback():
+    """A pre-existing corrupt/garbage cache file must not crash the face pass.
+
+    The merge step tries load_file() on the existing path; on a corrupt file it
+    falls back to a face-only rewrite. The result must be a *valid* safetensors
+    file that is face-keyed (the unreadable siblings are unavoidably lost, but
+    the write must not raise and must not leave a broken file behind).
+    """
+    with tempfile.TemporaryDirectory() as d:
+        img = os.path.join(d, 'im.jpg'); _make_image(img)
+        cp = os.path.join(d, '_face_id_cache', 'im.safetensors')
+        # Pre-write garbage bytes at the cache path (not a valid safetensors blob).
+        os.makedirs(os.path.dirname(cp), exist_ok=True)
+        with open(cp, 'wb') as f:
+            f.write(b'\x00\x01not a safetensors file\xff\xfe' * 8)
+        with _patch_face_models():
+            # Must not raise despite the corrupt destination.
+            cache_face_embeddings([_FakeFileItem(img)], FaceIDConfig())
+        # Resulting file is valid and face-keyed.
+        data = load_file(cp)
+        assert 'face_embedding' in data, "face_embedding not written after corrupt fallback"
+        assert np.allclose(data['face_embedding'].numpy(), _MERGE_FACE_VAL), "wrong face value"
+
+
+def test_face_cache_write_is_atomic_no_tmp_leftover():
+    """The atomic writer leaves no .tmp_* turds in the cache dir on success."""
+    with tempfile.TemporaryDirectory() as d:
+        img = os.path.join(d, 'im.jpg'); _make_image(img)
+        cache_dir = os.path.join(d, '_face_id_cache')
+        cp = os.path.join(cache_dir, 'im.safetensors')
+        with _patch_face_models():
+            cache_face_embeddings([_FakeFileItem(img)], FaceIDConfig())
+        leftovers = [f for f in os.listdir(cache_dir) if f.startswith('.tmp_')]
+        assert leftovers == [], f"atomic save left temp files behind: {leftovers}"
+        assert os.path.exists(cp) and load_file(cp), "final cache file missing/invalid"
+
+
+# ---------------------------------------------------------------------------
 # End-to-end projector pipeline test
 # ---------------------------------------------------------------------------
 
@@ -827,6 +984,13 @@ if __name__ == '__main__':
         ("Cache loads ArcFace only", test_cache_loads_arcface_only),
         ("Cache loads both embeddings", test_cache_loads_both_embeddings),
         ("Cache completeness check", test_cache_completeness_check),
+        # Cache merge (shared _face_id_cache file must not clobber siblings)
+        ("Cache merge preserves depth", test_face_cache_merge_preserves_depth),
+        ("Cache merge preserves depth+body siblings", test_face_cache_merge_preserves_all_siblings),
+        ("Cache fresh file is face-only", test_face_cache_fresh_file_is_face_only),
+        ("Cache re-extract preserves depth", test_face_cache_reextract_preserves_depth),
+        ("Cache corrupt-file fallback", test_face_cache_corrupt_file_fallback),
+        ("Cache write is atomic (no tmp leftover)", test_face_cache_write_is_atomic_no_tmp_leftover),
         # End-to-end (face + vision)
         ("E2E pipeline (ArcFace + vision)", test_end_to_end_pipeline),
         ("E2E pipeline (ArcFace only)", test_end_to_end_arcface_only),

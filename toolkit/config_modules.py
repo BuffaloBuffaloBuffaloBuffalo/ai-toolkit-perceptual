@@ -358,9 +358,16 @@ LossTarget = Literal['noise', 'source', 'unaugmented', 'differential_noise']
 
 class WeightNoiseConfig:
     """Inject Gaussian noise directly into LoRA parameter values after the
-    optimizer step (Pattern A — drift). Each step does ``p.data += noise``;
-    Adam's loss-minimization corrects the drift over training so the weights
-    wander around the optimizer trajectory inside a bounded ball.
+    optimizer step (Pattern A — drift). Each step does ``p.data += noise``.
+
+    By default the drift is unbounded: in ``relative`` mode the per-tensor
+    weight norm follows a multiplicative random walk (``E[||w||^2]`` grows by
+    ``1 + sigma^2`` per step) that Adam's ~LR-capped step cannot pull back, so
+    on long runs the LoRA norm blows up and training falls apart. Set
+    ``bound_norm: true`` to renormalize each tensor to its pre-noise norm
+    after injection — the norm is then pinned exactly while the (tangential)
+    perturbation is preserved, so the weights wander on a fixed-norm shell
+    instead of drifting outward.
 
     Lives in ``SDTrainer`` just after ``ema.update()`` so the EMA shadow
     tracks the (nearly) clean optimizer path while the live training weights
@@ -377,9 +384,10 @@ class WeightNoiseConfig:
 
     Metrics
     -------
-    Every ``log_every`` steps emits ``weight_noise_norm`` (the Frobenius
-    norm of the injected noise across all tagged params). Pair with the
-    grad_noise_snr if both knobs are on.
+    Every ``log_every`` steps emits ``weight_noise_norm`` (Frobenius norm of
+    the injected noise) and ``weight_norm`` (Frobenius norm of the LoRA
+    weights). A flat ``weight_norm`` is healthy; a climbing one is the drift
+    runaway — lower ``sigma`` or turn on ``bound_norm``.
     """
 
     def __init__(self, **kwargs):
@@ -390,6 +398,11 @@ class WeightNoiseConfig:
         self.sigma: float = float(kwargs.get('sigma', 1.25e-2))
         # 0 disables logging.
         self.log_every: int = int(kwargs.get('log_every', 50))
+        # Renormalize each LoRA tensor back to its pre-noise (post-optimizer)
+        # Frobenius norm after injection. Caps the weight-norm random walk
+        # exactly while preserving the tangential perturbation and the
+        # tensor's stable rank. Default False = legacy unbounded drift.
+        self.bound_norm: bool = bool(kwargs.get('bound_norm', False))
 
 
 class GradientNoiseConfig:

@@ -216,6 +216,11 @@ class SDTrainer(BaseSDTrainProcess):
         # `_inject_weight_noise` on log_every steps; emitted via
         # `_last_to_metric`.
         self._last_weight_noise_norm: Optional[float] = None
+        # Frobenius norm of the LoRA weights, measured in the same pass as
+        # weight_noise_norm. Pair them: weight_norm flat = healthy; climbing
+        # step-over-step is the relative-noise runaway (noise scales with
+        # ||w||, so growth feeds bigger noise). Capped by weight_noise.bound_norm.
+        self._last_weight_norm: Optional[float] = None
         # Fisher-trace diagnostic. Sum of Adam's exp_avg_sq across all
         # LoRA params — the diagonal of the empirical Fisher information,
         # which is the standard cheap proxy for diagonal-Hessian trace.
@@ -293,6 +298,7 @@ class SDTrainer(BaseSDTrainProcess):
             '_last_grad_noise_norm': 'grad_noise_norm',
             '_last_grad_noise_snr': 'grad_noise_snr',
             '_last_weight_noise_norm': 'weight_noise_norm',
+            '_last_weight_norm': 'weight_norm',
             '_last_fisher_trace': 'fisher_trace',
             '_last_timestep': 'timestep',
             '_last_id_sim': 'id_sim',
@@ -631,7 +637,9 @@ class SDTrainer(BaseSDTrainProcess):
         mode = cfg.mode
         step = max(0, int(getattr(self, 'step_num', 0)))
         do_log = cfg.log_every > 0 and step % cfg.log_every == 0
+        bound = bool(getattr(cfg, 'bound_norm', False))
         noise_sq = 0.0
+        weight_sq = 0.0
 
         # Iterate every tagged adapter param (gradient may be None here —
         # post optimizer.zero_grad — so the grad-aware iterator is wrong).
@@ -647,6 +655,11 @@ class SDTrainer(BaseSDTrainProcess):
             if not getattr(p, '_is_lora', False):
                 continue
             w = p.data
+            if do_log:
+                # ||w||^2 over every tagged LoRA param (including zero-init
+                # ups that get no noise yet) so weight_norm reflects the full
+                # adapter. Measured pre-noise = the optimizer's trajectory.
+                weight_sq += float(w.detach().pow(2).sum())
             if mode == 'absolute':
                 sigma = float(cfg.sigma)
             elif mode == 'relative':
@@ -659,13 +672,25 @@ class SDTrainer(BaseSDTrainProcess):
 
             if sigma <= 0:
                 continue
+            pre_norm = float(w.norm()) if bound else 0.0
             noise = torch.randn_like(w) * sigma
             if do_log:
                 noise_sq += float(noise.pow(2).sum())
             w.add_(noise)
+            if bound and pre_norm > 0.0:
+                # Project the tensor back onto the sphere of its pre-noise
+                # norm. Strips only the radial (norm-inflating) component of
+                # the noise — ~1/d of its energy, but the part that compounds
+                # into the unbounded weight-norm random walk — while keeping
+                # the full tangential perturbation. Pure rescale, so the
+                # tensor's stable rank is unchanged.
+                post_norm = float(w.norm())
+                if post_norm > 0.0:
+                    w.mul_(pre_norm / post_norm)
 
         if do_log:
             self._last_weight_noise_norm = noise_sq ** 0.5
+            self._last_weight_norm = weight_sq ** 0.5
 
     @staticmethod
     def _scale_bbox_to_pixels(raw_bbox, file_item, px_h, px_w):
@@ -6260,6 +6285,9 @@ class SDTrainer(BaseSDTrainProcess):
         if self._last_weight_noise_norm is not None:
             loss_dict['weight_noise_norm'] = self._last_weight_noise_norm
             self._last_weight_noise_norm = None
+        if self._last_weight_norm is not None:
+            loss_dict['weight_norm'] = self._last_weight_norm
+            self._last_weight_norm = None
         if self._last_fisher_trace is not None:
             loss_dict['fisher_trace'] = self._last_fisher_trace
             self._last_fisher_trace = None

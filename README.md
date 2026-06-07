@@ -12,6 +12,7 @@ These can be used independently or together. Weight noising is the bigger practi
 - [Supported and Experimental Models](#supported-and-experimental-models): which models are validated, which need more testing
 - [Perceptual Anchoring](#perceptual-anchoring): depth, identity, body, face suppression
 - [Weight Noising](#weight-noising): per-step Gaussian perturbation of LoRA weights
+- [Optimizers](#optimizers): fork-added optimizer choices, including a low-VRAM one
 - [Auto-Masking](#auto-masking): body / clothing / subject masks for region-weighted loss
 - [Reg Dataset Semantics](#reg-dataset-semantics): how reg samples are treated in this extension
 - [Training Metrics](#training-metrics): what gets logged each step
@@ -196,7 +197,7 @@ The technique sits between classical weight noise (Graves 2011) and the SAM/SGLD
 ### What it does
 
 - **Pushes training toward flat loss minima.** Standard expected-loss expansion adds a `½ σ² · Tr(H)` flat-minima penalty (Camuto et al. NeurIPS 2020). Verified empirically via the `grad/fisher` metric (diagonal-Fisher trace, which proxies `Tr(H)`); the curve trends down vs the unperturbed baseline.
-- **Spreads learning across the LoRA's rank budget.** Measured **+20% stable rank**, **+12% participation ratio** on a 112-module LoKr trained on Flux 2 Klein 9B at matched step count. Frobenius norm barely moves (+2%), ruling out weight inflation; the same energy is just distributed across more singular directions. This is the LoRA-specific manifestation of the flat-minima bias and is probably the biggest reason the technique works.
+- **Spreads learning across the LoRA's rank budget.** Measured **+20% stable rank**, **+12% participation ratio** on a 112-module LoKr trained on Flux 2 Klein 9B at matched step count. On that run the Frobenius norm barely moved (+2%), so the gain came from spreading the same energy across more singular directions, not from inflating the weights. This is the LoRA-specific manifestation of the flat-minima bias and is probably the biggest reason the technique works. (In `relative` mode on longer runs the norm can creep up on its own; `bound_norm` pins it if that happens, covered below.)
 - **Resists memorization on small datasets.** Single-image runs converge reliably where the same config without noise overcooks or diverges. The model exhibits a "self-healing" property in this regime: weights can briefly diverge into a worse basin and recover, because no single singular direction is load-bearing.
 
 ### Recommended starting config
@@ -218,7 +219,25 @@ train:
 ### Metrics
 
 - **`weight_noise_norm`**: Frobenius norm of the injected noise per logged step. In relative mode this grows with the LoRA's weight magnitude during training; that's normal and expected.
+- **`weight_norm`**: Frobenius norm of the LoRA weights themselves, sampled just before each injection. Flat or gently rising is healthy; a steady climb after the loss has settled is the relative-mode drift (see below). In the charts it lands in the Core group as `core/weight_norm`, next to `loss` and `grad_norm`, rather than down with `weight_noise_norm`.
 - **`grad/fisher`**: diagonal Fisher trace (sum of Adam's `exp_avg_sq` over LoRA params). Should trend downward over training in a noised run vs flat-or-rising in a baseline.
+
+### Bounding the weight norm (`bound_norm`)
+
+In `relative` mode the noise on each tensor scales with that tensor's norm, so a tensor that drifts a little bigger pulls a little more noise next step, which nudges it bigger again. On short runs you won't notice. On long ones the weight norm can wander upward on its own, and left alone it eventually pulls training apart. The `weight_norm` metric is how you catch it: a steady climb after the loss has already settled is the tell.
+
+When you see that, set `bound_norm: true`:
+
+```yaml
+train:
+  weight_noise:
+    enabled: true
+    mode: relative
+    sigma: 0.0125
+    bound_norm: true
+```
+
+It snaps each tensor back to its pre-noise norm after every injection, so the noise still moves the weights around but can't grow them. Off by default, so nothing changes unless you ask for it. Config-only for now, there's no toggle in the UI yet.
 
 ### Notes
 
@@ -226,6 +245,15 @@ train:
 - Distributed training (DDP/FSDP) not yet tested.
 - The current implementation does noise + Adam; a custom SGD+OU optimizer would save ~25% LoRA-state VRAM but isn't shipped.
 - There's also a parallel `train.gradient_noise.*` block (noise on gradients before optimizer.step rather than on weights after). Same Neelakantan-style modes; weight noise is the empirically stronger of the two.
+
+## Optimizers
+
+Any of the upstream optimizers work. `adamw8bit` is the default in every quickstart and a perfectly good place to start. The fork adds two more you can pick from the dropdown in the UI, or set with `train.optimizer` in a config:
+
+- **`automagic2`** (Automagic v2) keeps an automatic per-parameter learning rate and uses noticeably less VRAM than AdamW, which is the main reason to reach for it on a single card. It gets that saving by folding the weight update into the backward pass, and that comes with two strings attached: it does not work with gradient accumulation (keep `gradient_accumulation: 1`, the trainer will stop you if you forget), and `max_grad_norm` clipping has no effect with it. Everything else trains the same.
+- **`rose`** is a stateless optimizer that keeps no per-parameter momentum or variance, so it uses even less optimizer memory than Automagic. It's experimental and less tested here, and its learning rate does not carry over from Adam, so plan to retune `lr` if you try it.
+
+Weight noising, the depth anchor, and the perceptual anchors all behave the same whichever one you pick.
 
 ## Auto-Masking
 
@@ -281,6 +309,7 @@ Every active loss is logged so you can see during a run whether each anchor is d
 | `grad_norm` | Total gradient magnitude post-clip. Spikes usually mean a loss explosion. |
 | `grad_norm_diffusion`, `grad_norm_depth`, `grad_cos_diff_depth` | Optional gradient-cosine diagnostic. See below. |
 | `weight_noise_norm` | Frobenius norm of injected weight noise. Only logged when `train.weight_noise.enabled`; cadence set by `log_every`. |
+| `weight_norm` | Frobenius norm of the LoRA weights. Only logged when `train.weight_noise.enabled`. Flat is healthy; a steady climb after the loss settles is the relative-mode drift that `bound_norm` caps. Charts file it under Core as `core/weight_norm`. |
 | `grad/fisher` | Sum of Adam's `exp_avg_sq` across LoRA params; diagonal-Fisher proxy for `Tr(Hessian)`. Drops over training when weight noise biases toward flat minima. Free to compute (just sums optimizer state); always on. |
 
 **Gradient-cosine diagnostic.** When you suspect two anchors are pulling in opposite directions, this measures how aligned their gradients are. Cosine near +1 means they reinforce each other, near 0 means they're independent, negative means they're fighting. Off by default; enable with `train.gradient_cosine_log_every: 50`.
@@ -295,6 +324,8 @@ Visual previews are saved during training so you can see at a glance what each a
 | `id_previews/` | What the identity anchor is seeing: the face crop being scored, alongside the noisy input and the model's x0 prediction, with the cosine similarity overlaid. |
 | `body_previews/` | Skeleton overlays for reference vs. predicted poses. |
 | `subject_mask_previews/` | Mask QC: each image with its body, clothing, and subject masks overlaid, generated once at job start. |
+
+On a long run these folders would fill up, so only the most recent previews are kept. `depth_consistency.preview_max_keep` and `face_id.identity_loss_preview_max_keep` both default to the last 500 and prune older tiles as training goes; set either to 0 to keep everything. The quickstarts pick sane values for you.
 
 ## Dataset-Tools UI
 
@@ -452,6 +483,15 @@ With a style dataset this small, the diffusion loss alone tends to overfit on th
 
 Every extension-specific config option, grouped by the YAML block it lives in. Defaults shown match what you get if you omit the option entirely.
 
+### `model.*` (local and ComfyUI checkpoints)
+
+Model loading is mostly upstream, but two notes that matter for Flux 2:
+
+| Option | What it does, when to use it |
+|---|---|
+| `name_or_path` | A HuggingFace repo id, a local diffusers folder, or, for Flux 2, a single original-format / ComfyUI `.safetensors` checkpoint. The ComfyUI-style file loads directly with no conversion step, so you can point it straight at a checkpoint you already have on disk. |
+| `te_name_or_path` | Where to load the text encoder from. Leave it unset to use the model's usual encoder; set it to a local path or a different repo when you've already got the encoder downloaded or want to train fully offline. |
+
 ### `depth_consistency.*`
 
 The depth anchor.
@@ -545,7 +585,8 @@ Per-step Gaussian perturbation of LoRA weights (see [Weight Noising](#weight-noi
 | `enabled` | `false` | Master switch. When `false` the injector is a no-op regardless of other fields. |
 | `mode` | `relative` | `relative` (σ × per-param weight RMS, adapts per-layer) or `absolute` (fixed σ everywhere). |
 | `sigma` | `0.0125` | Noise scale. In `relative` mode, a multiplier on each tensor's weight RMS. Typical useful range **0.01 – 0.017**. Lower values barely do anything; higher risk noise overpowering the gradient. |
-| `log_every` | `50` | Cadence for emitting `weight_noise_norm`. `0` disables logging (still injects). |
+| `log_every` | `50` | Cadence for emitting `weight_noise_norm` and `weight_norm`. `0` disables logging (still injects). |
+| `bound_norm` | `false` | After each injection, renormalize every tensor back to its pre-noise norm. Caps the slow upward weight-norm drift that `relative` mode can cause on long runs, without touching the noise direction. Watch the `weight_norm` metric to decide if you need it. Config-only, no UI toggle. |
 
 ### `train.gradient_noise.*`
 
@@ -562,7 +603,7 @@ Per-step Gaussian noise injected into LoRA **gradients** before `optimizer.step(
 
 ### Per-dataset overrides (`datasets[].*`)
 
-Every entry in `datasets:` accepts these extension-specific overrides. `null` or omitted = inherit the global value.
+Every entry in `datasets:` accepts these extension-specific overrides. `null` or omitted = inherit the global value. In the web UI, clearing one of these fields does the same thing: it drops back to the global instead of holding the last number you typed.
 
 | Option | What it does, when to use it |
 |---|---|

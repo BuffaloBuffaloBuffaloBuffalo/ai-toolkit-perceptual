@@ -9,6 +9,12 @@ import torch.nn as nn
 from safetensors.torch import save_file, load_file
 from tqdm import tqdm
 
+# Reuse the depth writer's Windows-safe atomic save (temp file + os.replace) so
+# the shared _face_id_cache/{stem}.safetensors is never left half-written if the
+# process dies mid-write or the destination is still mmap'd from an earlier read.
+# depth_consistency imports no toolkit.* modules, so this does not cycle.
+from toolkit.depth_consistency import _atomic_save_file
+
 if TYPE_CHECKING:
     from toolkit.data_transfer_object.data_loader import FileItemDTO
     from toolkit.config_modules import FaceIDConfig
@@ -574,9 +580,18 @@ def cache_face_embeddings(
         filename_no_ext = os.path.splitext(os.path.basename(file_item.path))[0]
         cache_path = os.path.join(cache_dir, f'{filename_no_ext}.safetensors')
 
-        # Check if cache exists and has all needed keys
+        # Check if cache exists and has all needed keys. A corrupt/unreadable
+        # file (e.g. a half-written cache from a killed process, or a truncated
+        # copy) is treated as a cache miss → re-extract, mirroring the depth
+        # cache reader. Without this, load_file() raises and kills the whole
+        # caching pass; the merge step below then rewrites a clean file.
+        data = None
         if os.path.exists(cache_path):
-            data = load_file(cache_path)
+            try:
+                data = load_file(cache_path)
+            except Exception:  # noqa: BLE001 — corrupt/unreadable cache → re-extract
+                data = None
+        if data is not None:
             has_arcface = 'face_embedding' in data
             has_vision = 'vision_face_embedding' in data
             has_identity = 'identity_embedding' in data
@@ -681,7 +696,7 @@ def cache_face_embeddings(
                 save_data = existing
             except Exception:  # noqa: BLE001 — corrupt/unreadable → rewrite face-only
                 pass
-        save_file(save_data, cache_path)
+        _atomic_save_file(save_data, cache_path)
 
     # Free encoder VRAM
     if vision_encoder is not None:
@@ -892,7 +907,7 @@ def cache_video_identity_embeddings(
         save_data['identity_gt_video_valid'] = identity_gt_video_valid
         save_data[CACHE_VERSION_IDENTITY_VIDEO_KEY] = torch.ones(1)
         os.makedirs(cache_dir, exist_ok=True)
-        save_file(save_data, cache_path)
+        _atomic_save_file(save_data, cache_path)
 
     del extractor, identity_encoder, decoder
     if torch.cuda.is_available():

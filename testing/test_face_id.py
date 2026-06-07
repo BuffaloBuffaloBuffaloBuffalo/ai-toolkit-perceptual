@@ -547,6 +547,43 @@ def test_face_cache_reextract_preserves_depth():
         assert 'identity_embedding' in data, "identity_embedding not added"
 
 
+def test_face_cache_corrupt_file_fallback():
+    """A pre-existing corrupt/garbage cache file must not crash the face pass.
+
+    The merge step tries load_file() on the existing path; on a corrupt file it
+    falls back to a face-only rewrite. The result must be a *valid* safetensors
+    file that is face-keyed (the unreadable siblings are unavoidably lost, but
+    the write must not raise and must not leave a broken file behind).
+    """
+    with tempfile.TemporaryDirectory() as d:
+        img = os.path.join(d, 'im.jpg'); _make_image(img)
+        cp = os.path.join(d, '_face_id_cache', 'im.safetensors')
+        # Pre-write garbage bytes at the cache path (not a valid safetensors blob).
+        os.makedirs(os.path.dirname(cp), exist_ok=True)
+        with open(cp, 'wb') as f:
+            f.write(b'\x00\x01not a safetensors file\xff\xfe' * 8)
+        with _patch_face_models():
+            # Must not raise despite the corrupt destination.
+            cache_face_embeddings([_FakeFileItem(img)], FaceIDConfig())
+        # Resulting file is valid and face-keyed.
+        data = load_file(cp)
+        assert 'face_embedding' in data, "face_embedding not written after corrupt fallback"
+        assert np.allclose(data['face_embedding'].numpy(), _MERGE_FACE_VAL), "wrong face value"
+
+
+def test_face_cache_write_is_atomic_no_tmp_leftover():
+    """The atomic writer leaves no .tmp_* turds in the cache dir on success."""
+    with tempfile.TemporaryDirectory() as d:
+        img = os.path.join(d, 'im.jpg'); _make_image(img)
+        cache_dir = os.path.join(d, '_face_id_cache')
+        cp = os.path.join(cache_dir, 'im.safetensors')
+        with _patch_face_models():
+            cache_face_embeddings([_FakeFileItem(img)], FaceIDConfig())
+        leftovers = [f for f in os.listdir(cache_dir) if f.startswith('.tmp_')]
+        assert leftovers == [], f"atomic save left temp files behind: {leftovers}"
+        assert os.path.exists(cp) and load_file(cp), "final cache file missing/invalid"
+
+
 # ---------------------------------------------------------------------------
 # End-to-end projector pipeline test
 # ---------------------------------------------------------------------------
@@ -952,6 +989,8 @@ if __name__ == '__main__':
         ("Cache merge preserves depth+body siblings", test_face_cache_merge_preserves_all_siblings),
         ("Cache fresh file is face-only", test_face_cache_fresh_file_is_face_only),
         ("Cache re-extract preserves depth", test_face_cache_reextract_preserves_depth),
+        ("Cache corrupt-file fallback", test_face_cache_corrupt_file_fallback),
+        ("Cache write is atomic (no tmp leftover)", test_face_cache_write_is_atomic_no_tmp_leftover),
         # End-to-end (face + vision)
         ("E2E pipeline (ArcFace + vision)", test_end_to_end_pipeline),
         ("E2E pipeline (ArcFace only)", test_end_to_end_arcface_only),

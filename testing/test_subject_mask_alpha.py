@@ -225,10 +225,19 @@ def test_debug_previews(tmp: Path):
     )
     cache_subject_masks([_FakeFileItem(str(data_dir / "img.png"))], cfg,
                         preview_dir=str(preview_dir))
-    tile = preview_dir / "img.png"
-    assert tile.exists(), "debug preview tile not written"
-    assert Image.open(tile).mode == "RGB"
-    print("PASS: RGBA-safe debug previews")
+    tile_path = preview_dir / "img.png"
+    assert tile_path.exists(), "debug preview tile not written"
+    tile = Image.open(tile_path)
+    assert tile.mode == "RGB"
+    # Alpha mode collapses to 2 panels (original | mask) at col_width=380 + 8px gap.
+    assert tile.size[0] == 380 * 2 + 8, f"expected 2-panel tile, got width {tile.size[0]}"
+
+    # Cache-hit path renders the same 2-panel layout (delete the tile, rerun).
+    tile_path.unlink()
+    cache_subject_masks([_FakeFileItem(str(data_dir / "img.png"))], cfg,
+                        preview_dir=str(preview_dir))
+    assert Image.open(tile_path).size[0] == 380 * 2 + 8, "cache-hit tile not 2-panel"
+    print("PASS: RGBA-safe 2-panel debug previews")
 
 
 def test_preflight_script(tmp: Path):

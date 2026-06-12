@@ -159,6 +159,7 @@ def main():
                     masks = extractor.extract(frame_pil)
                     tiles.append(_render_preview_tile(
                         frame_pil, masks, n_classes=extractor.num_parse_classes,
+                        mask_source=args.mask_source,
                     ))
                     labels.append(f'frame {fidx}')
 

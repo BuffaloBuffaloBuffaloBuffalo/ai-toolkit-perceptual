@@ -399,11 +399,15 @@ def _render_preview_tile_from_cache(
     body_t: torch.Tensor,
     clothing_t: torch.Tensor,
     col_width: int = 380,
+    mask_source: str = 'auto',
 ):
     """4-panel tile from cached bool masks: image | person | body | clothing.
 
     Used for upfront QC previews on cache hit, where the SegFormer ``class_map``
     isn't stored. Mirrors :func:`_render_preview_tile` minus the parse colormap.
+
+    In alpha mode person == body == clothing, so the tile collapses to two
+    panels: image | alpha mask.
     """
     from PIL import Image, ImageDraw, ImageFont
     img_np = np.array(pil_image)
@@ -422,15 +426,18 @@ def _render_preview_tile_from_cache(
         return m
 
     person = _bool_to_np(person_t)
-    body = _bool_to_np(body_t)
-    clothing = _bool_to_np(clothing_t)
-
     ov_person = _overlay_mask(img_np, person, (100, 180, 255))
-    ov_body = _overlay_mask(img_np, body, (255, 120, 80))
-    ov_clothing = _overlay_mask(img_np, clothing, (120, 255, 120))
 
-    panels = [img_np, ov_person, ov_body, ov_clothing]
-    labels = ["Original", "Person", "Body (hair+face+limbs)", "Clothing"]
+    if mask_source == 'alpha':
+        panels = [img_np, ov_person]
+        labels = ["Original", "Mask (alpha channel)"]
+    else:
+        body = _bool_to_np(body_t)
+        clothing = _bool_to_np(clothing_t)
+        ov_body = _overlay_mask(img_np, body, (255, 120, 80))
+        ov_clothing = _overlay_mask(img_np, clothing, (120, 255, 120))
+        panels = [img_np, ov_person, ov_body, ov_clothing]
+        labels = ["Original", "Person", "Body (hair+face+limbs)", "Clothing"]
 
     try:
         font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 14)
@@ -456,8 +463,11 @@ def _render_preview_tile_from_cache(
 
 
 def _render_preview_tile(pil_image, masks: Dict[str, np.ndarray], n_classes: int,
-                         col_width: int = 380):
+                         col_width: int = 380, mask_source: str = 'auto'):
     """5-panel tile: image | person | body | clothing | parse colormap.
+
+    In alpha mode person == body == clothing and there is no SegFormer parse,
+    so the tile collapses to two panels: image | alpha mask.
 
     Returns a PIL Image ready to save.
     """
@@ -467,19 +477,24 @@ def _render_preview_tile(pil_image, masks: Dict[str, np.ndarray], n_classes: int
         img_np = img_np[..., :3]
 
     person = masks["person"].astype(np.uint8)
-    body = masks["body"].astype(np.uint8)
-    clothing = masks["clothing"].astype(np.uint8)
-    class_map = masks["class_map"]
-
     ov_person = _overlay_mask(img_np, person, (100, 180, 255))
-    ov_body = _overlay_mask(img_np, body, (255, 120, 80))
-    ov_clothing = _overlay_mask(img_np, clothing, (120, 255, 120))
-    color_map = _colormap_from_classes(class_map, n_classes)
-    parse_blend = (img_np.astype(np.float32) * 0.5 + color_map.astype(np.float32) * 0.5)
-    parse_blend = np.clip(parse_blend, 0, 255).astype(np.uint8)
 
-    panels = [img_np, ov_person, ov_body, ov_clothing, parse_blend]
-    labels = ["Original", "Person", "Body (hair+face+limbs)", "Clothing", "Parse colormap"]
+    if mask_source == 'alpha':
+        panels = [img_np, ov_person]
+        labels = ["Original", "Mask (alpha channel)"]
+    else:
+        body = masks["body"].astype(np.uint8)
+        clothing = masks["clothing"].astype(np.uint8)
+        class_map = masks["class_map"]
+
+        ov_body = _overlay_mask(img_np, body, (255, 120, 80))
+        ov_clothing = _overlay_mask(img_np, clothing, (120, 255, 120))
+        color_map = _colormap_from_classes(class_map, n_classes)
+        parse_blend = (img_np.astype(np.float32) * 0.5 + color_map.astype(np.float32) * 0.5)
+        parse_blend = np.clip(parse_blend, 0, 255).astype(np.uint8)
+
+        panels = [img_np, ov_person, ov_body, ov_clothing, parse_blend]
+        labels = ["Original", "Person", "Body (hair+face+limbs)", "Clothing", "Parse colormap"]
 
     try:
         font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 14)
@@ -677,7 +692,10 @@ def cache_subject_masks(
                         try:
                             raw_pil = exif_transpose(Image.open(file_item.path)).convert('RGB')
                             pil_image = _apply_dataloader_transform(raw_pil, file_item)
-                            tile = _render_preview_tile_from_cache(pil_image, person, body, clothing)
+                            tile = _render_preview_tile_from_cache(
+                                pil_image, person, body, clothing,
+                                mask_source=mask_source,
+                            )
                             tile.save(preview_path)
                         except Exception as e:
                             print(f"  -  Warning: failed to render preview for {stem}: {e}")
@@ -736,6 +754,7 @@ def cache_subject_masks(
                 tile = _render_preview_tile(
                     pil_image, masks,
                     n_classes=extractor.num_parse_classes,
+                    mask_source=mask_source,
                 )
                 tile.save(preview_path)
             except Exception as e:

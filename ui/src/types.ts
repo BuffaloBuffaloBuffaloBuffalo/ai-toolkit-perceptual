@@ -99,6 +99,7 @@ export interface DatasetConfig {
   cache_latents_to_disk?: boolean;
   resolution: number[];
   controls: string[];
+  depth_as_control?: boolean;
   control_path?: string | null;
   num_frames: number;
   shrink_video_to_frames: boolean;

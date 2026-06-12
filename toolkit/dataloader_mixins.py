@@ -962,6 +962,9 @@ class ControlFileItemDTOMixin:
         self.control_path: Union[str, List[str], None] = None
         self.control_tensor: Union[torch.Tensor, None] = None
         self.control_tensor_list: Union[List[torch.Tensor], None] = None
+        # control paths attached by setup_controls (auto-generated from the
+        # training image, e.g. depth_as_control) rather than user-supplied
+        self.generated_control_paths: List[str] = []
         sd = kwargs.get('sd', None)
         self.use_raw_control_images = sd is not None and sd.use_raw_control_images
         dataset_config: 'DatasetConfig' = kwargs.get('dataset_config', None)
@@ -989,6 +992,11 @@ class ControlFileItemDTOMixin:
             elif len(self.control_path) == 1:
                 # only do one
                 self.control_path = self.control_path[0]
+        if getattr(dataset_config, 'depth_as_control', False):
+            # generated depth controls (attached later by setup_controls) use
+            # the configured control sizing (bucket-matched / raw) instead of
+            # the legacy 512x512 scale used for `controls` without a control_path
+            self.full_size_control_images = dataset_config.full_size_control_images
 
     def load_control_image(self: 'FileItemDTO'):
         control_tensors = []
@@ -1015,12 +1023,18 @@ class ControlFileItemDTOMixin:
                 print_acc(f"Error: {e}")
                 print_acc(f"Error loading image: {control_path}")
             
+            # generated controls (e.g. depth_as_control) are derived from the
+            # training image itself, so they always follow its scale/crop —
+            # even on models that otherwise take raw control images. This also
+            # keeps shapes consistent within a batch so they can be stacked.
+            bucket_match_control = control_path in (getattr(self, 'generated_control_paths', None) or [])
+
             if not self.full_size_control_images:
                 # we just scale them to 512x512:
                 w, h = img.size
                 img = img.resize((512, 512), Image.BICUBIC)
 
-            elif not self.use_raw_control_images:
+            elif not self.use_raw_control_images or bucket_match_control:
                 w, h = img.size
                 if self.flip_x:
                     # do a flip
@@ -2330,6 +2344,7 @@ class ControlCachingMixin:
                 file_item.control_path.append(control_path)
             else:
                 raise Exception(f"Error: control_path is not a string or list: {file_item.control_path}")
+            file_item.generated_control_paths.append(control_path)
             file_item.has_control_image = True
 
     def setup_controls(self: 'AiToolkitDataset'):

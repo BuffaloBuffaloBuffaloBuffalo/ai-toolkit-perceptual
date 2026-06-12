@@ -1402,6 +1402,14 @@ class DatasetConfig:
         # remove empty strings
         self.controls = [control for control in self.controls if control.strip() != '']
 
+        # Use auto-generated depth maps of the dataset images as control
+        # images. Shorthand for adding 'depth' to `controls`: maps are
+        # rendered once to `_controls/{stem}.depth.jpg` and then fed through
+        # the normal control image pipeline alongside any control_path images.
+        self.depth_as_control: bool = kwargs.get('depth_as_control', False)
+        if self.depth_as_control and 'depth' not in self.controls:
+            self.controls.append('depth')
+
         # Optional override for the depth model used when generating
         # `_controls/{stem}.depth.jpg` images. Defaults to None — the
         # ControlGenerator falls back to its built-in default. The

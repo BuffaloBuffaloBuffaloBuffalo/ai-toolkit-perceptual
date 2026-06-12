@@ -1889,6 +1889,17 @@ export default function SimpleJob({
                           checked={dataset.is_reg || false}
                           onChange={value => setJobConfig(value, `config.process[0].datasets[${i}].is_reg`)}
                         />
+                        {(modelArch?.additionalSections?.includes('datasets.control_path') ||
+                          modelArch?.additionalSections?.includes('datasets.multi_control_paths')) && (
+                          <Checkbox
+                            label="Depth as Control"
+                            checked={dataset.depth_as_control || false}
+                            onChange={value =>
+                              setJobConfig(value, `config.process[0].datasets[${i}].depth_as_control`)
+                            }
+                            docKey="datasets.depth_as_control"
+                          />
+                        )}
                         {modelArch?.additionalSections?.includes('datasets.do_i2v') && (
                           <Checkbox
                             label="Do I2V"

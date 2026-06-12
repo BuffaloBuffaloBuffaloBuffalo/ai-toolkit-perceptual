@@ -398,6 +398,14 @@ class Flux2Model(BaseModel):
                     raise ValueError(
                         "Control tensor list length does not match batch size"
                     )
+
+                # when latents are cached the trainer offloads the vae to cpu, but
+                # control refs are encoded live here; encode_image_refs runs on the
+                # vae's device, so pull it back to the gpu first or img_cond_seq comes
+                # back on cpu and the cat below mismatches devices
+                if self.vae.device == torch.device("cpu"):
+                    self.vae.to(self.device_torch)
+
                 for control_tensor_list in batch_control_tensor_list:
                     # control tensor list is a list of tensors for this batch item
                     controls = []
@@ -451,6 +459,8 @@ class Flux2Model(BaseModel):
                 assert img_cond_seq_ids is not None, (
                     "You need to provide either both or neither of the sequence conditioning"
                 )
+                img_cond_seq = img_cond_seq.to(img_input.device)
+                img_cond_seq_ids = img_cond_seq_ids.to(img_input_ids.device)
                 img_input = torch.cat((img_input, img_cond_seq), dim=1)
                 img_input_ids = torch.cat((img_input_ids, img_cond_seq_ids), dim=1)
 

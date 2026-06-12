@@ -77,6 +77,21 @@ const docs: { [key: string]: ConfigDoc } = {
       </>
     ),
   },
+  'datasets.depth_as_control': {
+    title: 'Depth as Control',
+    description: (
+      <>
+        Automatically generates a depth map for every image in this dataset and feeds it as a control/input image
+        during training, in addition to any control datasets you set above. Depth maps are generated once with
+        Depth Anything V2 and saved to a <code>_controls</code> folder inside the dataset folder, so later runs reuse
+        them.
+        <br />
+        <br />
+        Use this to train depth-conditioned LoRAs without preparing a separate control dataset. When sampling or
+        running inference, provide a depth map as the control image to get the same conditioning.
+      </>
+    ),
+  },
   'datasets.num_frames': {
     title: 'Number of Frames',
     description: (

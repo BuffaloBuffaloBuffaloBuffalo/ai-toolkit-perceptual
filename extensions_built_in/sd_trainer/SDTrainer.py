@@ -959,6 +959,9 @@ class SDTrainer(BaseSDTrainProcess):
             train_has_depth = any(
                 'depth' in (ds.controls or []) for ds in self.datasets
             )
+            train_depth_as_control = any(
+                getattr(ds, 'depth_as_control', False) for ds in self.datasets
+            )
             if train_has_depth:
                 # Inherit the loss perceptor's model_id so reg conditioning
                 # depth comes from the same model the user picked in the UI.
@@ -971,6 +974,9 @@ class SDTrainer(BaseSDTrainProcess):
                     if reg_ds.controls or reg_ds.control_path is not None:
                         continue
                     reg_ds.controls = ['depth']
+                    if train_depth_as_control:
+                        # match the train side's control sizing behavior
+                        reg_ds.depth_as_control = True
                     if _depth_model_id and reg_ds.depth_model_id is None:
                         reg_ds.depth_model_id = _depth_model_id
                     print_acc(

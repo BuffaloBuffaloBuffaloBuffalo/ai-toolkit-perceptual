@@ -1236,53 +1236,70 @@ export default function SimpleJob({
                 {jobConfig.config.process[0].subject_mask?.enabled && (
                   <>
                     <SelectInput
-                      label="SAM 2 Size"
-                      docKey="subject_mask.sam_size"
+                      label="Mask Source"
+                      docKey="subject_mask.mask_source"
                       className="pt-2"
-                      value={jobConfig.config.process[0].subject_mask?.sam_size ?? 'small'}
+                      value={jobConfig.config.process[0].subject_mask?.mask_source ?? 'auto'}
                       onChange={value =>
-                        setJobConfig(value, 'config.process[0].subject_mask.sam_size')
+                        setJobConfig(value, 'config.process[0].subject_mask.mask_source')
                       }
                       options={[
-                        { label: 'tiny (31M params)', value: 'tiny' },
-                        { label: 'small (39M params)', value: 'small' },
-                        { label: 'base_plus (73M params)', value: 'base_plus' },
-                        { label: 'large (217M params)', value: 'large' },
+                        { label: 'Auto (YOLO + SegFormer)', value: 'auto' },
+                        { label: 'Dataset Alpha Channel', value: 'alpha' },
                       ]}
                     />
-                    <NumberInput
-                      label="YOLO Confidence Threshold"
-                      docKey="subject_mask.yolo_conf"
-                      className="pt-2"
-                      value={jobConfig.config.process[0].subject_mask?.yolo_conf ?? 0.25}
-                      onChange={value =>
-                        setJobConfig(value, 'config.process[0].subject_mask.yolo_conf')
-                      }
-                      placeholder="0.25"
-                      min={0.05}
-                      max={0.95}
-                    />
-                    <Checkbox
-                      label="Primary Person Only"
-                      docKey="subject_mask.primary_only"
-                      className="pt-2"
-                      checked={jobConfig.config.process[0].subject_mask?.primary_only ?? true}
-                      onChange={value =>
-                        setJobConfig(value, 'config.process[0].subject_mask.primary_only')
-                      }
-                    />
-                    <NumberInput
-                      label="SegFormer Resolution"
-                      docKey="subject_mask.segformer_res"
-                      className="pt-2"
-                      value={jobConfig.config.process[0].subject_mask?.segformer_res ?? 768}
-                      onChange={value =>
-                        setJobConfig(value, 'config.process[0].subject_mask.segformer_res')
-                      }
-                      placeholder="768"
-                      min={256}
-                      max={1536}
-                    />
+                    {(jobConfig.config.process[0].subject_mask?.mask_source ?? 'auto') !== 'alpha' && (
+                      <>
+                        <SelectInput
+                          label="SAM 2 Size"
+                          docKey="subject_mask.sam_size"
+                          className="pt-2"
+                          value={jobConfig.config.process[0].subject_mask?.sam_size ?? 'small'}
+                          onChange={value =>
+                            setJobConfig(value, 'config.process[0].subject_mask.sam_size')
+                          }
+                          options={[
+                            { label: 'tiny (31M params)', value: 'tiny' },
+                            { label: 'small (39M params)', value: 'small' },
+                            { label: 'base_plus (73M params)', value: 'base_plus' },
+                            { label: 'large (217M params)', value: 'large' },
+                          ]}
+                        />
+                        <NumberInput
+                          label="YOLO Confidence Threshold"
+                          docKey="subject_mask.yolo_conf"
+                          className="pt-2"
+                          value={jobConfig.config.process[0].subject_mask?.yolo_conf ?? 0.25}
+                          onChange={value =>
+                            setJobConfig(value, 'config.process[0].subject_mask.yolo_conf')
+                          }
+                          placeholder="0.25"
+                          min={0.05}
+                          max={0.95}
+                        />
+                        <Checkbox
+                          label="Primary Person Only"
+                          docKey="subject_mask.primary_only"
+                          className="pt-2"
+                          checked={jobConfig.config.process[0].subject_mask?.primary_only ?? true}
+                          onChange={value =>
+                            setJobConfig(value, 'config.process[0].subject_mask.primary_only')
+                          }
+                        />
+                        <NumberInput
+                          label="SegFormer Resolution"
+                          docKey="subject_mask.segformer_res"
+                          className="pt-2"
+                          value={jobConfig.config.process[0].subject_mask?.segformer_res ?? 768}
+                          onChange={value =>
+                            setJobConfig(value, 'config.process[0].subject_mask.segformer_res')
+                          }
+                          placeholder="768"
+                          min={256}
+                          max={1536}
+                        />
+                      </>
+                    )}
                     <NumberInput
                       label="Cache Resolution"
                       docKey="subject_mask.cache_resolution"
@@ -1295,18 +1312,20 @@ export default function SimpleJob({
                       min={64}
                       max={1024}
                     />
-                    <NumberInput
-                      label="Body Close Radius"
-                      docKey="subject_mask.body_close_radius"
-                      className="pt-2"
-                      value={jobConfig.config.process[0].subject_mask?.body_close_radius ?? 2}
-                      onChange={value =>
-                        setJobConfig(value, 'config.process[0].subject_mask.body_close_radius')
-                      }
-                      placeholder="2 (higher fills blotchy gaps; re-extracts cache)"
-                      min={0}
-                      max={12}
-                    />
+                    {(jobConfig.config.process[0].subject_mask?.mask_source ?? 'auto') !== 'alpha' && (
+                      <NumberInput
+                        label="Body Close Radius"
+                        docKey="subject_mask.body_close_radius"
+                        className="pt-2"
+                        value={jobConfig.config.process[0].subject_mask?.body_close_radius ?? 2}
+                        onChange={value =>
+                          setJobConfig(value, 'config.process[0].subject_mask.body_close_radius')
+                        }
+                        placeholder="2 (higher fills blotchy gaps; re-extracts cache)"
+                        min={0}
+                        max={12}
+                      />
+                    )}
                     <NumberInput
                       label="Background Loss Weight"
                       docKey="subject_mask.background_loss_weight"

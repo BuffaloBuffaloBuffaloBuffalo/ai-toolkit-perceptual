@@ -608,9 +608,31 @@ const docs: { [key: string]: ConfigDoc } = {
         Caches per-image person/body/clothing masks (YOLO person detection → SAM 2 silhouette →
         SegFormer-clothes semantic parse). Masks are stored once per image in <code>_face_id_cache/</code>
         alongside face embeddings, then used at training time to weight the diffusion loss by region.
+        Prefer hand-authored masks instead? Switch <i>Mask Source</i> to <b>Dataset Alpha Channel</b>.
         <br /><br />
         Enabling this alone has no effect on training — you must also set one of the region loss weights
         (Background / Clothing / Body) or enable <i>Restrict Perceptual Losses to Body</i>.
+      </>
+    ),
+  },
+  'subject_mask.mask_source': {
+    title: 'Mask Source',
+    description: (
+      <>
+        <b>Auto</b> runs the YOLO → SAM 2 → SegFormer pipeline to detect the person, body, and clothing
+        regions automatically.
+        <br /><br />
+        <b>Dataset Alpha Channel</b> reads the mask straight from each image's PNG alpha channel instead
+        (kohya-ss style). Pixels with more than 50% opacity count as subject; transparent pixels count as
+        background and get the <i>Background Loss Weight</i>. The mask is used exactly as you authored
+        it, with no smoothing, dilation, or model inference. No segmentation models are loaded, so this
+        costs zero VRAM. Useful for fine-grained concepts (socks, shoes, accessories) where automatic
+        person segmentation grabs too much.
+        <br /><br />
+        Images without an alpha channel get a full-coverage mask and train normally. In this mode the
+        person, body, and clothing regions are all the same alpha mask, so the Clothing / Body loss
+        weights apply to the whole masked region. Switching source re-extracts the mask cache
+        automatically.
       </>
     ),
   },

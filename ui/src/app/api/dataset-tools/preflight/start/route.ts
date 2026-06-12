@@ -75,6 +75,7 @@ export async function POST(request: NextRequest) {
       '--primary-only', String(cfg.primary_only === false ? 0 : 1),
       '--sam-size', String(cfg.sam_size ?? 'small'),
       '--dtype', String(cfg.dtype ?? 'fp16'),
+      '--mask-source', cfg.mask_source === 'alpha' ? 'alpha' : 'auto',
       '--limit', String(cfg.limit ?? 0),
       '--video-frames', String(cfg.video_frames ?? 4),
     ];

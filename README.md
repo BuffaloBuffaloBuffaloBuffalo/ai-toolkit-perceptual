@@ -284,6 +284,20 @@ The depth anchor picks which mask it uses via `depth_consistency.mask_source` (`
 
 QC tiles for visual inspection are saved at job start and can be regenerated from the dataset-tools UI.
 
+### Bring your own masks (PNG alpha channels)
+
+The auto pipeline is built for people, so it falls over on fine-grained targets like socks, shoes, or accessories. If you already have masks (from ComfyUI SAM3, Photoshop, wherever), bake them into your PNGs as alpha transparency and switch the mask source:
+
+```yaml
+subject_mask:
+  enabled: true
+  mask_source: alpha    # default is 'auto'
+```
+
+Pixels over 50% opacity count as subject, transparent pixels count as background and get `background_loss_weight`. Your mask is used exactly as authored, with no smoothing or dilation, and none of the segmentation models get loaded, so it costs zero VRAM and caches instantly. Images without an alpha channel just train normally on the full frame.
+
+In alpha mode there's only one region: body, clothing, and subject are all the same mask, so `clothing_loss_weight` and `body_loss_weight` apply to the whole masked area. Switching between `auto` and `alpha` re-extracts the cache automatically. The preflight QC tool in dataset-tools supports alpha mode too, so you can eyeball your masks before training.
+
 ## Reg Dataset Semantics
 
 Reg datasets (`is_reg: true`) work the classic Dreambooth way: they're prior-preservation samples that train the model on generic non-subject images alongside your subject samples, so it doesn't forget how to make non-subject content while it's learning the subject. In this extension, reg semantics are tightened up:

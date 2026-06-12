@@ -339,6 +339,9 @@ export interface BodyIDConfig {
 
 export interface SubjectMaskConfig {
   enabled: boolean;
+  // 'auto' = YOLO + SAM 2 + SegFormer; 'alpha' = read masks from each image's
+  // PNG alpha channel (kohya-style), skipping model loading entirely
+  mask_source?: 'auto' | 'alpha';
   yolo_ckpt?: string;
   yolo_conf?: number;
   primary_only?: boolean;

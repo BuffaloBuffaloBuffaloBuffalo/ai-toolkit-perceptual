@@ -69,6 +69,7 @@ export const defaultBodyIDConfig: BodyIDConfig = {
 
 export const defaultSubjectMaskConfig: SubjectMaskConfig = {
   enabled: false,
+  mask_source: 'auto',
   yolo_ckpt: 'yolo11n.pt',
   yolo_conf: 0.25,
   primary_only: true,

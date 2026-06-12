@@ -65,6 +65,9 @@ def main():
     p.add_argument('--primary-only', type=int, default=1, help='1 = use only the largest YOLO box')
     p.add_argument('--sam-size', default='small', choices=['tiny', 'small', 'base_plus', 'large'])
     p.add_argument('--dtype', default='fp16', choices=['fp16', 'bf16', 'fp32'])
+    p.add_argument('--mask-source', default='auto', choices=['auto', 'alpha'],
+                   help="'auto' = YOLO+SegFormer models; 'alpha' = read masks "
+                        "from PNG alpha channels (no models loaded)")
     p.add_argument('--limit', type=int, default=0, help='If >0, only process the first N files')
     p.add_argument('--video-frames', type=int, default=4,
                    help='Frames uniformly sampled per video for the QC montage')
@@ -97,7 +100,8 @@ def main():
 
     _write_progress(progress_path, {
         'status': 'starting',
-        'message': 'Loading models (YOLO + SegFormer)...',
+        'message': ('Reading alpha-channel masks...' if args.mask_source == 'alpha'
+                    else 'Loading models (YOLO + SegFormer)...'),
         'done': 0, 'total': total, 'started_at': time.time(),
     })
 
@@ -124,6 +128,7 @@ def main():
             primary_only=bool(args.primary_only),
             sam_size=args.sam_size,
             dtype=args.dtype,
+            mask_source=args.mask_source,
         )
         extractor = SubjectMaskExtractor(cfg)
 
@@ -142,13 +147,19 @@ def main():
                     if not frames:
                         raise Exception('No readable frames in video')
                 else:
-                    frames = [(None, exif_transpose(Image.open(path)).convert('RGB'))]
+                    raw_img = exif_transpose(Image.open(path))
+                    # Alpha mode: the mask lives in the alpha channel, so keep it.
+                    raw_img = raw_img.convert(
+                        'RGBA' if args.mask_source == 'alpha' else 'RGB'
+                    )
+                    frames = [(None, raw_img)]
 
                 tiles, labels = [], []
                 for fidx, frame_pil in frames:
                     masks = extractor.extract(frame_pil)
                     tiles.append(_render_preview_tile(
-                        frame_pil, masks, n_classes=extractor.seg_cfg.num_labels,
+                        frame_pil, masks, n_classes=extractor.num_parse_classes,
+                        mask_source=args.mask_source,
                     ))
                     labels.append(f'frame {fidx}')
 

@@ -8,6 +8,7 @@ import { apiClient } from '@/utils/api';
 import { Button } from '@headlessui/react';
 
 type PreflightConfig = {
+  mask_source: 'auto' | 'alpha';
   segformer_res: number;
   body_close_radius: number;
   mask_dilate_radius: number;
@@ -85,6 +86,7 @@ type RunListItem = {
 };
 
 const DEFAULT_CFG: PreflightConfig = {
+  mask_source: 'auto',
   segformer_res: 768,
   body_close_radius: 2,
   mask_dilate_radius: 0,
@@ -404,47 +406,60 @@ export default function DatasetToolsPage() {
                 options={datasetOptions}
                 disabled={dsStatus !== 'success'}
               />
-              <NumberInput
-                label="SegFormer Resolution"
-                value={cfg.segformer_res}
-                onChange={v => setCfg(c => ({ ...c, segformer_res: Number(v ?? DEFAULT_CFG.segformer_res) }))}
-                min={256}
-                max={2048}
-              />
-              <NumberInput
-                label="Body Close Radius (fills holes)"
-                value={cfg.body_close_radius}
-                onChange={v => setCfg(c => ({ ...c, body_close_radius: Number(v ?? DEFAULT_CFG.body_close_radius) }))}
-                min={0}
-                max={12}
-              />
-              <NumberInput
-                label="Mask Dilate Radius (grows boundary)"
-                value={cfg.mask_dilate_radius}
-                onChange={v => setCfg(c => ({ ...c, mask_dilate_radius: Number(v ?? DEFAULT_CFG.mask_dilate_radius) }))}
-                min={0}
-                max={64}
-              />
-              <NumberInput
-                label="Skin Bias (push skin → body)"
-                value={cfg.skin_bias}
-                onChange={v => setCfg(c => ({ ...c, skin_bias: Number(v ?? DEFAULT_CFG.skin_bias) }))}
-                min={0}
-                max={8}
-              />
-              <NumberInput
-                label="YOLO Confidence"
-                value={cfg.yolo_conf}
-                onChange={v => setCfg(c => ({ ...c, yolo_conf: Number(v ?? DEFAULT_CFG.yolo_conf) }))}
-                min={0}
-                max={1}
-              />
               <SelectInput
-                label="SAM Size (loaded but unused)"
-                value={cfg.sam_size}
-                onChange={v => setCfg(c => ({ ...c, sam_size: v as PreflightConfig['sam_size'] }))}
-                options={samOptions}
+                label="Mask Source"
+                value={cfg.mask_source}
+                onChange={v => setCfg(c => ({ ...c, mask_source: v as PreflightConfig['mask_source'] }))}
+                options={[
+                  { label: 'Auto (YOLO + SegFormer)', value: 'auto' },
+                  { label: 'Dataset Alpha Channel', value: 'alpha' },
+                ]}
               />
+              {cfg.mask_source !== 'alpha' && (
+                <>
+                  <NumberInput
+                    label="SegFormer Resolution"
+                    value={cfg.segformer_res}
+                    onChange={v => setCfg(c => ({ ...c, segformer_res: Number(v ?? DEFAULT_CFG.segformer_res) }))}
+                    min={256}
+                    max={2048}
+                  />
+                  <NumberInput
+                    label="Body Close Radius (fills holes)"
+                    value={cfg.body_close_radius}
+                    onChange={v => setCfg(c => ({ ...c, body_close_radius: Number(v ?? DEFAULT_CFG.body_close_radius) }))}
+                    min={0}
+                    max={12}
+                  />
+                  <NumberInput
+                    label="Mask Dilate Radius (grows boundary)"
+                    value={cfg.mask_dilate_radius}
+                    onChange={v => setCfg(c => ({ ...c, mask_dilate_radius: Number(v ?? DEFAULT_CFG.mask_dilate_radius) }))}
+                    min={0}
+                    max={64}
+                  />
+                  <NumberInput
+                    label="Skin Bias (push skin → body)"
+                    value={cfg.skin_bias}
+                    onChange={v => setCfg(c => ({ ...c, skin_bias: Number(v ?? DEFAULT_CFG.skin_bias) }))}
+                    min={0}
+                    max={8}
+                  />
+                  <NumberInput
+                    label="YOLO Confidence"
+                    value={cfg.yolo_conf}
+                    onChange={v => setCfg(c => ({ ...c, yolo_conf: Number(v ?? DEFAULT_CFG.yolo_conf) }))}
+                    min={0}
+                    max={1}
+                  />
+                  <SelectInput
+                    label="SAM Size (loaded but unused)"
+                    value={cfg.sam_size}
+                    onChange={v => setCfg(c => ({ ...c, sam_size: v as PreflightConfig['sam_size'] }))}
+                    options={samOptions}
+                  />
+                </>
+              )}
               <NumberInput
                 label="File Limit (0 = all)"
                 value={cfg.limit}
@@ -458,13 +473,15 @@ export default function DatasetToolsPage() {
                 min={1}
                 max={64}
               />
-              <div className="col-span-2 md:col-span-3 pt-2">
-                <Checkbox
-                  label="Primary person only (largest YOLO box)"
-                  checked={cfg.primary_only}
-                  onChange={v => setCfg(c => ({ ...c, primary_only: v }))}
-                />
-              </div>
+              {cfg.mask_source !== 'alpha' && (
+                <div className="col-span-2 md:col-span-3 pt-2">
+                  <Checkbox
+                    label="Primary person only (largest YOLO box)"
+                    checked={cfg.primary_only}
+                    onChange={v => setCfg(c => ({ ...c, primary_only: v }))}
+                  />
+                </div>
+              )}
             </div>
 
             <div className="mt-4 flex items-center gap-3">

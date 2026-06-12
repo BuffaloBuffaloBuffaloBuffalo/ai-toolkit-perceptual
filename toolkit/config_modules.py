@@ -1172,6 +1172,18 @@ class SubjectMaskConfig:
 
     def __init__(self, **kwargs):
         self.enabled: bool = kwargs.get('enabled', False)
+        # Where masks come from:
+        #   'auto'  — YOLO + SAM 2 + SegFormer pipeline (default)
+        #   'alpha' — read the image's alpha channel as the mask (kohya-style
+        #             hand-authored masks baked into PNG transparency). Skips
+        #             loading the segmentation models entirely. person = body =
+        #             clothing = (alpha > 127); images without an alpha channel
+        #             get a full-coverage mask (i.e. normal training).
+        self.mask_source: str = kwargs.get('mask_source', 'auto')
+        if self.mask_source not in ('auto', 'alpha'):
+            raise ValueError(
+                f"subject_mask.mask_source must be 'auto' or 'alpha', got {self.mask_source!r}"
+            )
         self.yolo_ckpt: str = kwargs.get('yolo_ckpt', 'yolo11n.pt')
         self.yolo_conf: float = kwargs.get('yolo_conf', 0.25)
         self.primary_only: bool = kwargs.get('primary_only', True)

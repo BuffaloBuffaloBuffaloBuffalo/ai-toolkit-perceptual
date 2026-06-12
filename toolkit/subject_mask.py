@@ -8,6 +8,9 @@ masks (SAM drops pixels on low-contrast boundaries, SegFormer is semantic).
 
 Phase 1: caching only. The resulting masks are attached to FileItemDTO but
 are not consumed by any loss. See `toolkit/config_modules.SubjectMaskConfig`.
+
+`mask_source: alpha` bypasses all three models and reads the mask from each
+image's PNG alpha channel instead (kohya-style hand-authored masks).
 """
 
 import os
@@ -44,6 +47,14 @@ CLOTHING_CLASSES = {"Hat", "Sunglasses", "Upper-clothes", "Skirt", "Pants",
                     "Dress", "Belt", "Left-shoe", "Right-shoe", "Bag", "Scarf"}
 
 CACHE_VERSION_KEY = "subject_mask_v2"  # v2: cached from dataloader-transformed pixels (flip+scale+crop), not raw file
+
+# Alpha pixels above this are subject, at or below are background. Matches the
+# >50% opacity convention used by kohya-style alpha masks.
+ALPHA_MASK_THRESHOLD = 127
+
+# Numeric codes stored in the cache file so masks extracted by one source are
+# never served when the config asks for the other.
+MASK_SOURCE_CODES = {"auto": 0.0, "alpha": 1.0}
 
 
 # ============================================================
@@ -97,6 +108,36 @@ def _smooth_mask(mask: np.ndarray, close_radius: int = 3, do_fill: bool = True) 
 
 
 # ============================================================
+# Alpha-channel extraction (no models)
+# ============================================================
+
+
+def _extract_alpha_masks(pil_image) -> Dict[str, np.ndarray]:
+    """Read the image's alpha channel as the subject mask.
+
+    person = body = clothing = (alpha > ALPHA_MASK_THRESHOLD), used verbatim —
+    no smoothing or dilation, the mask is treated as hand-authored ground
+    truth. Images without an alpha channel get a full-coverage mask so they
+    train normally. ``class_map``/``boxes`` are empty placeholders so preview
+    rendering keeps working.
+    """
+    W, H = pil_image.size
+    if pil_image.mode != "RGBA":
+        # Resolves LA / PA / palette transparency too; plain RGB becomes
+        # alpha=255 everywhere, i.e. a full-coverage mask.
+        pil_image = pil_image.convert("RGBA")
+    alpha_np = np.array(pil_image.getchannel("A"))
+    final_mask = (alpha_np > ALPHA_MASK_THRESHOLD).astype(np.bool_)
+    return {
+        "person": final_mask,
+        "body": final_mask.copy(),
+        "clothing": final_mask.copy(),
+        "class_map": np.zeros((H, W), dtype=np.int32),
+        "boxes": [],
+    }
+
+
+# ============================================================
 # Extractor
 # ============================================================
 
@@ -117,6 +158,20 @@ class SubjectMaskExtractor:
         dtype_map = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}
         self.dtype = dtype_map.get(config.dtype, torch.float16)
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.mask_source = getattr(config, 'mask_source', 'auto')
+
+        if self.mask_source == 'alpha':
+            # Masks come straight from the image's alpha channel — no model
+            # loading at all (the whole point: zero VRAM, instant extraction).
+            self.yolo = None
+            self.sam = None
+            self.sam_processor = None
+            self.seg = None
+            self.seg_processor = None
+            self.seg_cfg = None
+            self._body_ids = set()
+            self._clothing_ids = set()
+            return
 
         # Lazy imports — keep import cost out of general toolkit import graph.
         from ultralytics import YOLO
@@ -237,7 +292,13 @@ class SubjectMaskExtractor:
 
         SAM is run (for debug / reference) but NOT intersected into the final
         masks — SegFormer is primary source of truth.
+
+        In ``mask_source: alpha`` mode none of the models run; the mask is the
+        image's alpha channel, used verbatim.
         """
+        if self.mask_source == 'alpha':
+            return _extract_alpha_masks(pil_image)
+
         # YOLO for detection (unused in final mask but kept to signal "no subject")
         boxes = self._run_yolo(pil_image)
 
@@ -275,6 +336,11 @@ class SubjectMaskExtractor:
             "boxes": boxes,
         }
 
+    @property
+    def num_parse_classes(self) -> int:
+        """SegFormer label count for parse-colormap previews (1 in alpha mode)."""
+        return int(self.seg_cfg.num_labels) if self.seg_cfg is not None else 1
+
     def cleanup(self):
         """Free GPU memory held by loaded models."""
         try:
@@ -302,6 +368,9 @@ class SubjectMaskExtractor:
 
 def _overlay_mask(image_rgb: np.ndarray, mask: np.ndarray, color, alpha: float = 0.55) -> np.ndarray:
     """Blend a binary mask onto an RGB image with a solid color + yellow outline."""
+    if image_rgb.shape[-1] == 4:
+        # RGBA source (alpha mask source) — previews render in RGB.
+        image_rgb = image_rgb[..., :3]
     out = image_rgb.astype(np.float32).copy()
     m = mask[..., None].astype(np.float32)
     color_layer = np.array(color, dtype=np.float32)
@@ -330,14 +399,20 @@ def _render_preview_tile_from_cache(
     body_t: torch.Tensor,
     clothing_t: torch.Tensor,
     col_width: int = 380,
+    mask_source: str = 'auto',
 ):
     """4-panel tile from cached bool masks: image | person | body | clothing.
 
     Used for upfront QC previews on cache hit, where the SegFormer ``class_map``
     isn't stored. Mirrors :func:`_render_preview_tile` minus the parse colormap.
+
+    In alpha mode person == body == clothing, so the tile collapses to two
+    panels: image | alpha mask.
     """
     from PIL import Image, ImageDraw, ImageFont
     img_np = np.array(pil_image)
+    if img_np.ndim == 3 and img_np.shape[-1] == 4:
+        img_np = img_np[..., :3]
     H, W = img_np.shape[:2]
 
     def _bool_to_np(t: torch.Tensor) -> np.ndarray:
@@ -351,15 +426,18 @@ def _render_preview_tile_from_cache(
         return m
 
     person = _bool_to_np(person_t)
-    body = _bool_to_np(body_t)
-    clothing = _bool_to_np(clothing_t)
-
     ov_person = _overlay_mask(img_np, person, (100, 180, 255))
-    ov_body = _overlay_mask(img_np, body, (255, 120, 80))
-    ov_clothing = _overlay_mask(img_np, clothing, (120, 255, 120))
 
-    panels = [img_np, ov_person, ov_body, ov_clothing]
-    labels = ["Original", "Person", "Body (hair+face+limbs)", "Clothing"]
+    if mask_source == 'alpha':
+        panels = [img_np, ov_person]
+        labels = ["Original", "Mask (alpha channel)"]
+    else:
+        body = _bool_to_np(body_t)
+        clothing = _bool_to_np(clothing_t)
+        ov_body = _overlay_mask(img_np, body, (255, 120, 80))
+        ov_clothing = _overlay_mask(img_np, clothing, (120, 255, 120))
+        panels = [img_np, ov_person, ov_body, ov_clothing]
+        labels = ["Original", "Person", "Body (hair+face+limbs)", "Clothing"]
 
     try:
         font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 14)
@@ -385,28 +463,38 @@ def _render_preview_tile_from_cache(
 
 
 def _render_preview_tile(pil_image, masks: Dict[str, np.ndarray], n_classes: int,
-                         col_width: int = 380):
+                         col_width: int = 380, mask_source: str = 'auto'):
     """5-panel tile: image | person | body | clothing | parse colormap.
+
+    In alpha mode person == body == clothing and there is no SegFormer parse,
+    so the tile collapses to two panels: image | alpha mask.
 
     Returns a PIL Image ready to save.
     """
     from PIL import Image, ImageDraw, ImageFont
     img_np = np.array(pil_image)
+    if img_np.ndim == 3 and img_np.shape[-1] == 4:
+        img_np = img_np[..., :3]
 
     person = masks["person"].astype(np.uint8)
-    body = masks["body"].astype(np.uint8)
-    clothing = masks["clothing"].astype(np.uint8)
-    class_map = masks["class_map"]
-
     ov_person = _overlay_mask(img_np, person, (100, 180, 255))
-    ov_body = _overlay_mask(img_np, body, (255, 120, 80))
-    ov_clothing = _overlay_mask(img_np, clothing, (120, 255, 120))
-    color_map = _colormap_from_classes(class_map, n_classes)
-    parse_blend = (img_np.astype(np.float32) * 0.5 + color_map.astype(np.float32) * 0.5)
-    parse_blend = np.clip(parse_blend, 0, 255).astype(np.uint8)
 
-    panels = [img_np, ov_person, ov_body, ov_clothing, parse_blend]
-    labels = ["Original", "Person", "Body (hair+face+limbs)", "Clothing", "Parse colormap"]
+    if mask_source == 'alpha':
+        panels = [img_np, ov_person]
+        labels = ["Original", "Mask (alpha channel)"]
+    else:
+        body = masks["body"].astype(np.uint8)
+        clothing = masks["clothing"].astype(np.uint8)
+        class_map = masks["class_map"]
+
+        ov_body = _overlay_mask(img_np, body, (255, 120, 80))
+        ov_clothing = _overlay_mask(img_np, clothing, (120, 255, 120))
+        color_map = _colormap_from_classes(class_map, n_classes)
+        parse_blend = (img_np.astype(np.float32) * 0.5 + color_map.astype(np.float32) * 0.5)
+        parse_blend = np.clip(parse_blend, 0, 255).astype(np.uint8)
+
+        panels = [img_np, ov_person, ov_body, ov_clothing, parse_blend]
+        labels = ["Original", "Person", "Body (hair+face+limbs)", "Clothing", "Parse colormap"]
 
     try:
         font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 14)
@@ -540,6 +628,14 @@ def cache_subject_masks(
     from PIL.ImageOps import exif_transpose
 
     target_hw = int(config.cache_resolution)
+    mask_source = getattr(config, 'mask_source', 'auto')
+    source_code = MASK_SOURCE_CODES.get(mask_source, 0.0)
+
+    def _load_pil(path: str):
+        """Load + EXIF-orient. Alpha mode keeps the alpha channel (the mask
+        lives there); auto mode converts to RGB as before."""
+        img = exif_transpose(Image.open(path))
+        return img.convert('RGBA' if mask_source == 'alpha' else 'RGB')
 
     # Determine whether we can skip loading the extractor altogether (all cached).
     extractor: Optional[SubjectMaskExtractor] = None
@@ -574,7 +670,12 @@ def cache_subject_masks(
             # when the config value changes so users can iterate on it.
             cached_bcr = int(data['body_close_radius'].item()) if 'body_close_radius' in data else 2
             radius_match = cached_bcr == int(config.body_close_radius)
-            if has_keys and has_version and radius_match:
+            # Masks from one source must never be served for the other —
+            # switching mask_source re-extracts. Pre-existing caches have no
+            # 'mask_source' key and were always model-extracted ('auto').
+            cached_source = float(data['mask_source'].item()) if 'mask_source' in data else 0.0
+            source_match = cached_source == source_code
+            if has_keys and has_version and radius_match and source_match:
                 person = (data['person'].clone() > 127).to(torch.bool)
                 body = (data['body'].clone() > 127).to(torch.bool)
                 clothing = (data['clothing'].clone() > 127).to(torch.bool)
@@ -591,7 +692,10 @@ def cache_subject_masks(
                         try:
                             raw_pil = exif_transpose(Image.open(file_item.path)).convert('RGB')
                             pil_image = _apply_dataloader_transform(raw_pil, file_item)
-                            tile = _render_preview_tile_from_cache(pil_image, person, body, clothing)
+                            tile = _render_preview_tile_from_cache(
+                                pil_image, person, body, clothing,
+                                mask_source=mask_source,
+                            )
                             tile.save(preview_path)
                         except Exception as e:
                             print(f"  -  Warning: failed to render preview for {stem}: {e}")
@@ -607,7 +711,7 @@ def cache_subject_masks(
         # masks align with the training tensor (and thus latent grid). Applies
         # the same flip → resize → crop chain as
         # toolkit/dataloader_mixins.load_and_process_image (lines 774-793).
-        raw_pil = exif_transpose(Image.open(file_item.path)).convert('RGB')
+        raw_pil = _load_pil(file_item.path)
         pil_image = _apply_dataloader_transform(raw_pil, file_item)
         masks = extractor.extract(pil_image)
 
@@ -632,6 +736,7 @@ def cache_subject_masks(
             'body': (body_t.to(torch.uint8) * 255),
             'clothing': (clothing_t.to(torch.uint8) * 255),
             'body_close_radius': torch.tensor([float(config.body_close_radius)]),
+            'mask_source': torch.tensor([source_code]),
             CACHE_VERSION_KEY: torch.ones(1),
         }
         save_file(save_data, cache_path)
@@ -648,7 +753,8 @@ def cache_subject_masks(
             try:
                 tile = _render_preview_tile(
                     pil_image, masks,
-                    n_classes=extractor.seg_cfg.num_labels,
+                    n_classes=extractor.num_parse_classes,
+                    mask_source=mask_source,
                 )
                 tile.save(preview_path)
             except Exception as e:

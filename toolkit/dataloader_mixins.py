@@ -5,6 +5,7 @@ import json
 import math
 import os
 import random
+import time
 from collections import OrderedDict
 from typing import TYPE_CHECKING, List, Dict, Union
 import traceback
@@ -42,6 +43,46 @@ if TYPE_CHECKING:
     from toolkit.stable_diffusion_model import StableDiffusion
 
 accelerator = get_accelerator()
+
+# safetensors' Rust exception advertises __module__ 'safetensors_rust', which
+# is not an importable module, so the class can never be pickled. When a
+# SafetensorError is raised inside a DataLoader worker, PyTorch wraps it in an
+# ExceptionWrapper (which carries the exception class) and the worker's result
+# queue fails to pickle it: the feeder thread prints a PicklingError, drops
+# the batch, and the main process waits on that batch index forever. The run
+# hangs instead of reporting the real error. Repointing the class at its
+# importable home lets worker errors survive the trip to the main process.
+try:
+    from safetensors import SafetensorError as _SafetensorError
+    if _SafetensorError.__module__ == 'safetensors_rust':
+        _SafetensorError.__module__ = 'safetensors'
+except Exception:
+    pass
+
+
+def load_cached_tensors(load_fn, path, what, attempts=3, delay=5.0):
+    """Run a cache-file read with bounded retries.
+
+    Per-step cache reads happen inside DataLoader workers, often against
+    network volumes (RunPod etc.) whose transient I/O faults surface as
+    SafetensorError mid-run. Without retries a single blip kills a multi-day
+    run. If every attempt fails, raise a plain RuntimeError naming the file:
+    always picklable, so it reaches the main process instead of dying in the
+    worker's result queue.
+    """
+    last_err = None
+    for attempt in range(attempts):
+        if attempt > 0:
+            time.sleep(delay * attempt)
+        try:
+            return load_fn()
+        except Exception as e:  # noqa: BLE001 — unreadable/corrupt cache
+            last_err = e
+    raise RuntimeError(
+        f"Failed to load cached {what} '{path}' after {attempts} attempts: {last_err}. "
+        f"If this repeats, the cache file is corrupt: delete it and restart; "
+        f"the caching pass will regenerate it."
+    ) from last_err
 
 # def get_associated_caption_from_img_path(img_path):
 # https://demo.albumentations.ai/
@@ -1215,12 +1256,20 @@ class ClipImageFileItemDTOMixin:
         if self.clip_image_processor is None:
             is_dynamic_size_and_aspect = True # serving it raw
         if self.is_vision_clip_cached:
-            self.clip_image_embeds = load_file(self.get_clip_vision_embeddings_path())
+            self.clip_image_embeds = load_cached_tensors(
+                lambda: load_file(self.get_clip_vision_embeddings_path()),
+                self.get_clip_vision_embeddings_path(),
+                'clip vision embedding',
+            )
 
             # get a random unconditional image
             if self.clip_vision_unconditional_paths is not None:
                 unconditional_path = random.choice(self.clip_vision_unconditional_paths)
-                self.clip_image_embeds_unconditional = load_file(unconditional_path)
+                self.clip_image_embeds_unconditional = load_cached_tensors(
+                    lambda: load_file(unconditional_path),
+                    unconditional_path,
+                    'clip vision unconditional embedding',
+                )
 
             return
         clip_image_path = self.get_new_clip_image_path()
@@ -1818,10 +1867,14 @@ class LatentCachingFileItemDTOMixin:
             return None
         if self._encoded_latent is None:
             # load it from disk
-            state_dict = load_file(
+            state_dict = load_cached_tensors(
+                lambda: load_file(
+                    self.get_latent_path(),
+                    # device=device if device is not None else self.latent_load_device
+                    device='cpu'
+                ),
                 self.get_latent_path(),
-                # device=device if device is not None else self.latent_load_device
-                device='cpu'
+                'latent',
             )
             self._encoded_latent = state_dict['latent']
             if 'first_frame_latent' in state_dict:
@@ -2064,7 +2117,11 @@ class TextEmbeddingFileItemDTOMixin:
             return
         if self.prompt_embeds is None:
             # load it from disk
-            self.prompt_embeds = PromptEmbeds.load(self.get_text_embedding_path())
+            self.prompt_embeds = load_cached_tensors(
+                lambda: PromptEmbeds.load(self.get_text_embedding_path()),
+                self.get_text_embedding_path(),
+                'text embedding',
+            )
 
 class TextEmbeddingCachingMixin:
     def __init__(self: 'AiToolkitDataset', **kwargs):

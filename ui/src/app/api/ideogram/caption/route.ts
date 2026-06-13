@@ -22,6 +22,19 @@ function normExt(raw: unknown): string {
   return CAPTION_EXTS.includes(dotted) ? dotted : '.txt';
 }
 
+// Mirrors the frontend isIdeogramCaption: a structured Ideogram caption is JSON
+// with a compositional_deconstruction block.
+function isStructured(text: string): boolean {
+  const t = text.trim();
+  if (!t.startsWith('{')) return false;
+  try {
+    const d = JSON.parse(t);
+    return !!d && typeof d === 'object' && typeof d.compositional_deconstruction === 'object';
+  } catch {
+    return false;
+  }
+}
+
 // GET-equivalent (POST so the body carries the absolute path like the fork's
 // other img routes): returns { caption, ext } for the first existing sidecar,
 // preferring the requested ext.
@@ -45,14 +58,19 @@ export async function POST(request: Request) {
       return NextResponse.json({ success: true, ext });
     }
 
-    // read: prefer requested ext, then the other known exts.
+    // read: gather all existing sidecars (requested ext first, then others),
+    // then PREFER a structured (Ideogram JSON) one so the form editor shows even
+    // when a plain .txt prompt also exists alongside the .json. Fall back to the
+    // first existing sidecar, else blank.
     const preferred = normExt(body?.ext);
     const order = [preferred, ...CAPTION_EXTS.filter(e => e !== preferred)];
-    for (const ext of order) {
-      const p = captionPathFor(imgPath, ext);
-      if (fs.existsSync(p)) {
-        return NextResponse.json({ caption: fs.readFileSync(p, 'utf-8'), ext });
-      }
+    const existing = order
+      .map(ext => ({ ext, path: captionPathFor(imgPath, ext) }))
+      .filter(e => fs.existsSync(e.path))
+      .map(e => ({ ext: e.ext, caption: fs.readFileSync(e.path, 'utf-8') }));
+    const chosen = existing.find(e => isStructured(e.caption)) ?? existing[0];
+    if (chosen) {
+      return NextResponse.json({ caption: chosen.caption, ext: chosen.ext });
     }
     // no sidecar yet
     return NextResponse.json({ caption: '', ext: preferred });

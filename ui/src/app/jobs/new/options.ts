@@ -786,6 +786,30 @@ export const modelArchs: ModelArch[] = [
       'model.qie.match_target_res',
     ],
   },
+  {
+    name: 'ideogram4',
+    label: 'Ideogram 4',
+    group: 'image',
+    defaults: {
+      // default updates when [selected, unselected] in the UI
+      'config.process[0].model.name_or_path': ['ideogram-ai/ideogram-4-fp8', defaultNameOrPath],
+      'config.process[0].model.quantize': [true, false],
+      'config.process[0].model.quantize_te': [true, false],
+      // Qwen3-VL-8B text encoder is large; cache its embeds then unload it so the
+      // run fits 24GB. low_vram keeps the transformer offload-ready too.
+      'config.process[0].model.low_vram': [true, false],
+      'config.process[0].train.cache_text_embeddings': [true, false],
+      'config.process[0].train.unload_text_encoder': [true, false],
+      'config.process[0].sample.sampler': ['flowmatch', 'flowmatch'],
+      'config.process[0].train.noise_scheduler': ['flowmatch', 'flowmatch'],
+      'config.process[0].train.timestep_type': ['weighted', 'sigmoid'],
+      'config.process[0].model.qtype': ['qfloat8', 'qfloat8'],
+      'config.process[0].model.qtype_te': ['qfloat8', 'qfloat8'],
+      'config.process[0].model.model_kwargs': [{ max_text_length: 3072 }, {}],
+    },
+    disableSections: ['network.conv'],
+    additionalSections: ['model.low_vram', 'model.layer_offloading'],
+  },
 ].sort((a, b) => {
   // Sort by label, case-insensitive
   return a.label.localeCompare(b.label, undefined, { sensitivity: 'base' });
@@ -795,6 +819,7 @@ export const modelArchs: ModelArch[] = [
 const enabledModelNames = new Set([
   'sdxl',
   'flux2_klein_9b',
+  'ideogram4',
   'zimage',
   'zimage:turbo',
   'ltx2.3',

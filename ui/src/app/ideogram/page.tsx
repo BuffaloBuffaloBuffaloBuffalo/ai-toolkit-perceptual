@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import classNames from 'classnames';
-import { SquareDashed, X, Wand2, RefreshCw, ImageOff } from 'lucide-react';
+import { SquareDashed, X, Wand2, RefreshCw, ImageOff, ChevronLeft, ChevronRight } from 'lucide-react';
 import { TopBar, MainContent } from '@/components/layout';
 import { apiClient } from '@/utils/api';
 import { BoundingBoxEditor, extractBoxes } from '@/components/BoundingBoxOverlay';
@@ -55,6 +55,17 @@ export default function IdeogramPage() {
   const [capProgress, setCapProgress] = useState<{ captioned: number; total: number; status: string } | null>(null);
   // Free-text extra instructions passed to the captioner (e.g. naming subjects).
   const [capInstructions, setCapInstructions] = useState('');
+  // Absolute paths of images that already have a (non-empty) caption sidecar.
+  const [captionedSet, setCaptionedSet] = useState<Set<string>>(new Set());
+
+  // Fetch which images in the dataset are already captioned (for the grid outline).
+  const refreshCaptionStatus = useCallback((ds: string) => {
+    if (!ds) return;
+    apiClient
+      .post('/api/ideogram/caption-status', { datasetName: ds })
+      .then(res => setCaptionedSet(new Set<string>(res.data?.captioned ?? [])))
+      .catch(err => console.error('caption-status failed', err));
+  }, []);
 
   // Load dataset list once.
   useEffect(() => {
@@ -83,8 +94,11 @@ export default function IdeogramPage() {
   }, []);
 
   useEffect(() => {
-    if (dataset) loadImages(dataset);
-  }, [dataset, loadImages]);
+    if (dataset) {
+      loadImages(dataset);
+      refreshCaptionStatus(dataset);
+    }
+  }, [dataset, loadImages, refreshCaptionStatus]);
 
   // Load the caption sidecar for the active image.
   const openImage = useCallback((absPath: string) => {
@@ -120,9 +134,67 @@ export default function IdeogramPage() {
         ext: captionExt,
         caption,
       })
-      .then(() => setSavedCaption(caption))
+      .then(() => {
+        setSavedCaption(caption);
+        const hasCaption = caption.trim().length > 0;
+        setCaptionedSet(prev => {
+          const next = new Set(prev);
+          if (hasCaption) next.add(activeImg);
+          else next.delete(activeImg);
+          return next;
+        });
+      })
       .catch(err => console.error('Failed to save caption', err));
   }, [activeImg, caption, captionExt]);
+
+  // Position of the open image in the dataset, for prev/next navigation.
+  const activeIdx = useMemo(
+    () => (activeImg ? images.findIndex(im => im.img_path === activeImg) : -1),
+    [activeImg, images],
+  );
+
+  // Step to the prev/next image in the editor. Persists unsaved edits first so
+  // captioning a dataset is a smooth left-to-right pass (no trip back to the grid).
+  const goTo = useCallback(
+    (delta: number) => {
+      if (activeIdx < 0) return;
+      const nextIdx = activeIdx + delta;
+      if (nextIdx < 0 || nextIdx >= images.length) return;
+      const target = images[nextIdx].img_path;
+      const fromImg = activeImg;
+      if (fromImg && caption.trim() !== savedCaption.trim()) {
+        apiClient
+          .post('/api/ideogram/caption', { imgPath: fromImg, action: 'write', ext: captionExt, caption })
+          .then(() => {
+            if (caption.trim().length > 0) setCaptionedSet(prev => new Set(prev).add(fromImg));
+          })
+          .catch(err => console.error('Failed to save before navigating', err))
+          .finally(() => openImage(target));
+      } else {
+        openImage(target);
+      }
+    },
+    [activeIdx, images, activeImg, caption, savedCaption, captionExt, openImage],
+  );
+
+  // Arrow keys navigate in the editor (ignored while typing in a field).
+  useEffect(() => {
+    if (!activeImg) return;
+    const onKey = (e: KeyboardEvent) => {
+      const el = e.target as HTMLElement | null;
+      const tag = el?.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || el?.isContentEditable) return;
+      if (e.key === 'ArrowLeft') {
+        e.preventDefault();
+        goTo(-1);
+      } else if (e.key === 'ArrowRight') {
+        e.preventDefault();
+        goTo(1);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [activeImg, goTo]);
 
   // Mutate the caption JSON's element array (local state only).
   const editCaption = useCallback(
@@ -205,9 +277,11 @@ export default function IdeogramPage() {
           setCapProgress({ captioned, total, status });
           if (done) {
             setCapRunId(null);
+            refreshCaptionStatus(dataset);
             if (activeImg) openImage(activeImg);
             setTimeout(() => setCapProgress(null), 4000);
           } else {
+            refreshCaptionStatus(dataset); // live-update grid outlines as captions land
             setTimeout(tick, 2000);
           }
         })
@@ -220,7 +294,7 @@ export default function IdeogramPage() {
       stop = true;
       clearTimeout(id);
     };
-  }, [capRunId, activeImg, openImage]);
+  }, [capRunId, activeImg, openImage, dataset, refreshCaptionStatus]);
 
   return (
     <>
@@ -287,13 +361,36 @@ export default function IdeogramPage() {
             </span>
           )}
           {activeImg && (
-            <button
-              type="button"
-              onClick={() => setActiveImg(null)}
-              className="ml-auto text-xs text-gray-400 hover:text-gray-200 border border-gray-700 rounded px-2 py-1"
-            >
-              ← Back to grid
-            </button>
+            <div className="ml-auto flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => goTo(-1)}
+                disabled={activeIdx <= 0}
+                title="Previous image (←)"
+                className="text-gray-300 hover:text-white disabled:opacity-30 disabled:cursor-default"
+              >
+                <ChevronLeft className="w-5 h-5" />
+              </button>
+              <span className="text-xs text-gray-400 tabular-nums">
+                {activeIdx + 1} / {images.length}
+              </span>
+              <button
+                type="button"
+                onClick={() => goTo(1)}
+                disabled={activeIdx < 0 || activeIdx >= images.length - 1}
+                title="Next image (→)"
+                className="text-gray-300 hover:text-white disabled:opacity-30 disabled:cursor-default"
+              >
+                <ChevronRight className="w-5 h-5" />
+              </button>
+              <button
+                type="button"
+                onClick={() => setActiveImg(null)}
+                className="text-xs text-gray-400 hover:text-gray-200 border border-gray-700 rounded px-2 py-1"
+              >
+                ← Back to grid
+              </button>
+            </div>
           )}
         </div>
       </TopBar>
@@ -320,8 +417,13 @@ export default function IdeogramPage() {
                     key={img.img_path}
                     type="button"
                     onClick={() => openImage(img.img_path)}
-                    className="group relative aspect-square overflow-hidden rounded-lg border border-gray-800 hover:border-blue-500 transition-colors"
-                    title={img.img_path}
+                    className={classNames(
+                      'group relative aspect-square overflow-hidden rounded-lg border transition-colors',
+                      captionedSet.has(img.img_path)
+                        ? 'border-green-400/70 ring-2 ring-green-400/50 hover:border-green-300'
+                        : 'border-gray-800 hover:border-blue-500',
+                    )}
+                    title={captionedSet.has(img.img_path) ? `${img.img_path} (captioned)` : img.img_path}
                   >
                     {/* eslint-disable-next-line @next/next/no-img-element */}
                     <img

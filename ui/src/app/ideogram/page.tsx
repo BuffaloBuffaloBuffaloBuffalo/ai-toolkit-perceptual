@@ -50,6 +50,10 @@ export default function IdeogramPage() {
   const [isDrawing, setIsDrawing] = useState(false);
   const [showBoxes, setShowBoxes] = useState(true);
 
+  // Auto-caption (Qwen3-VL over the whole dataset) run state.
+  const [capRunId, setCapRunId] = useState<string | null>(null);
+  const [capProgress, setCapProgress] = useState<{ captioned: number; total: number; status: string } | null>(null);
+
   // Load dataset list once.
   useEffect(() => {
     apiClient
@@ -166,6 +170,52 @@ export default function IdeogramPage() {
     );
   }, [caption, isIdeogram]);
 
+  // Auto-caption the whole dataset with Qwen3-VL (writes .json sidecars).
+  const startAutocaption = useCallback(() => {
+    if (!dataset || capRunId) return;
+    setCapProgress({ captioned: 0, total: 0, status: 'starting' });
+    apiClient
+      .post('/api/ideogram/autocaption/start', { datasetName: dataset, captionExt: 'json' })
+      .then(res => {
+        setCapRunId(res.data.runId);
+        setCapProgress({ captioned: 0, total: res.data.total ?? 0, status: 'running' });
+      })
+      .catch(err => {
+        console.error('autocaption start failed', err);
+        setCapProgress(null);
+      });
+  }, [dataset, capRunId]);
+
+  // Poll autocaption progress; on completion, reload the open image's caption.
+  useEffect(() => {
+    if (!capRunId) return;
+    let stop = false;
+    const tick = () => {
+      apiClient
+        .get(`/api/ideogram/autocaption/${capRunId}`)
+        .then(res => {
+          if (stop) return;
+          const { captioned, total, status, done } = res.data;
+          setCapProgress({ captioned, total, status });
+          if (done) {
+            setCapRunId(null);
+            if (activeImg) openImage(activeImg);
+            setTimeout(() => setCapProgress(null), 4000);
+          } else {
+            setTimeout(tick, 2000);
+          }
+        })
+        .catch(() => {
+          if (!stop) setTimeout(tick, 3000);
+        });
+    };
+    const id = setTimeout(tick, 1500);
+    return () => {
+      stop = true;
+      clearTimeout(id);
+    };
+  }, [capRunId, activeImg, openImage]);
+
   return (
     <>
       <TopBar>
@@ -192,6 +242,32 @@ export default function IdeogramPage() {
             >
               <RefreshCw className="w-4 h-4" />
             </button>
+          )}
+          {dataset && (
+            <button
+              type="button"
+              onClick={startAutocaption}
+              disabled={!!capRunId}
+              title="Auto-caption every image in this dataset with Qwen3-VL (Ideogram structured JSON)"
+              className={classNames(
+                'flex items-center gap-1.5 px-3 py-1 rounded-md border text-xs transition-colors',
+                capRunId
+                  ? 'border-gray-700 text-gray-500 cursor-default'
+                  : 'border-cyan-500 bg-cyan-600/20 text-cyan-200 hover:bg-cyan-600/30',
+              )}
+            >
+              <Wand2 className="w-3.5 h-3.5" />
+              {capRunId ? 'Captioning…' : 'Auto-caption dataset'}
+            </button>
+          )}
+          {capProgress && (
+            <span className="text-xs text-gray-400">
+              {capProgress.status === 'starting'
+                ? 'starting…'
+                : capProgress.status === 'completed'
+                  ? `done (${capProgress.captioned}/${capProgress.total})`
+                  : `${capProgress.captioned}/${capProgress.total}`}
+            </span>
           )}
           {activeImg && (
             <button

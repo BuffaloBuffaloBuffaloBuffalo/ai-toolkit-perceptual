@@ -239,7 +239,10 @@ Do not paraphrase (no `clear backdrop`, `empty alpha`, `no background`, `PNG tra
 
 ## ADDITIONAL INSTRUCTIONS
 
-Honor the following dataset-specific guidance. It must NEVER override the OUTPUT CONTRACT, the element/background structure, the bbox format, or the observe-only rule above — those are fixed.
+Honor the following dataset-specific guidance. It TAKES PRECEDENCE over the description and naming rules above. In particular:
+- If it assigns a name or label to a subject (e.g. `refer to the subject as Katie Konrath`), use that EXACT name for the subject in `high_level_description` and the relevant element `desc`, even if you do not recognize the person — labeling an observed subject is allowed and is not "inventing content".
+- If it says to omit or include an attribute (e.g. `do not describe skin tone`), follow it, overriding the default "always name" attribute list above.
+It must still NOT override the OUTPUT CONTRACT (the three top-level keys and their order), the element/background structure, the bbox format, or the core observe-only rule (never invent subjects, props, text, or detail that is not visibly present). Those are fixed.
 
 {{user_instructions}}
 

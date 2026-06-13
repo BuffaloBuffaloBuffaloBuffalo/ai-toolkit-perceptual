@@ -76,8 +76,9 @@ export async function POST(request: NextRequest) {
     const runDir = path.join(trainingRoot, 'ideogram_caption', runId);
     fs.mkdirSync(runDir, { recursive: true });
 
-    // Captioner job config consumed by run.py (matches the Ideogram4Captioner
-    // extension's CaptionConfig fields).
+    // Captioner job config consumed by run.py. BaseCaptioner reads its settings
+    // from a nested `caption` block (self.get_conf("caption", {})), not the
+    // process top level.
     const captionerConfig = {
       job: 'extension',
       config: {
@@ -85,14 +86,17 @@ export async function POST(request: NextRequest) {
         process: [
           {
             type: 'Ideogram4Captioner',
-            model_name_or_path: model,
-            path_to_caption: datasetDir,
-            caption_extension: captionExt,
-            recaption,
-            device: 'cuda',
-            dtype: 'bf16',
-            quantize: false,
-            max_res: 1024,
+            caption: {
+              model_name_or_path: model,
+              path_to_caption: datasetDir,
+              caption_extension: captionExt,
+              extensions: ['jpg', 'jpeg', 'png', 'webp', 'bmp', 'gif'],
+              recaption,
+              device: 'cuda',
+              dtype: 'bf16',
+              quantize: false,
+              max_res: 1024,
+            },
           },
         ],
       },

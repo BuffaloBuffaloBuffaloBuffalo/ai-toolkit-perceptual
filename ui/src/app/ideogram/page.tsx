@@ -53,6 +53,8 @@ export default function IdeogramPage() {
   // Auto-caption (Qwen3-VL over the whole dataset) run state.
   const [capRunId, setCapRunId] = useState<string | null>(null);
   const [capProgress, setCapProgress] = useState<{ captioned: number; total: number; status: string } | null>(null);
+  // Free-text extra instructions passed to the captioner (e.g. naming subjects).
+  const [capInstructions, setCapInstructions] = useState('');
 
   // Load dataset list once.
   useEffect(() => {
@@ -175,7 +177,11 @@ export default function IdeogramPage() {
     if (!dataset || capRunId) return;
     setCapProgress({ captioned: 0, total: 0, status: 'starting' });
     apiClient
-      .post('/api/ideogram/autocaption/start', { datasetName: dataset, captionExt: 'json' })
+      .post('/api/ideogram/autocaption/start', {
+        datasetName: dataset,
+        captionExt: 'json',
+        captionPrompt: capInstructions.trim(),
+      })
       .then(res => {
         setCapRunId(res.data.runId);
         setCapProgress({ captioned: 0, total: res.data.total ?? 0, status: 'running' });
@@ -184,7 +190,7 @@ export default function IdeogramPage() {
         console.error('autocaption start failed', err);
         setCapProgress(null);
       });
-  }, [dataset, capRunId]);
+  }, [dataset, capRunId, capInstructions]);
 
   // Poll autocaption progress; on completion, reload the open image's caption.
   useEffect(() => {
@@ -242,6 +248,17 @@ export default function IdeogramPage() {
             >
               <RefreshCw className="w-4 h-4" />
             </button>
+          )}
+          {dataset && (
+            <input
+              type="text"
+              value={capInstructions}
+              onChange={e => setCapInstructions(e.target.value)}
+              disabled={!!capRunId}
+              placeholder="Extra caption instructions (optional) — e.g. call the woman SCARLETT"
+              title="Free-text instructions passed to the captioner for every image (naming subjects, style notes, etc.)"
+              className="w-72 bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs text-gray-100 outline-none focus:border-cyan-500 disabled:opacity-50"
+            />
           )}
           {dataset && (
             <button

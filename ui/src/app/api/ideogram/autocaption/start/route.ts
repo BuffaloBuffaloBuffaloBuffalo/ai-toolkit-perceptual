@@ -51,6 +51,9 @@ export async function POST(request: NextRequest) {
     const datasetName: string | undefined = body?.datasetName;
     const captionExt: string = body?.captionExt === 'json' ? 'json' : 'txt';
     const recaption: boolean = body?.recaption === true;
+    // Free-text extra instructions, injected into the captioner prompt's
+    // {{user_instructions}} slot (e.g. "call the woman SCARLETT"). Empty -> "None.".
+    const captionPrompt: string = typeof body?.captionPrompt === 'string' ? body.captionPrompt : '';
     const model: string =
       typeof body?.model === 'string' && body.model.trim()
         ? body.model.trim()
@@ -90,6 +93,7 @@ export async function POST(request: NextRequest) {
               model_name_or_path: model,
               path_to_caption: datasetDir,
               caption_extension: captionExt,
+              caption_prompt: captionPrompt,
               extensions: ['jpg', 'jpeg', 'png', 'webp', 'bmp', 'gif'],
               recaption,
               device: 'cuda',

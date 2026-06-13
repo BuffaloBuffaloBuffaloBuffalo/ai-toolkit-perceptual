@@ -35,7 +35,7 @@ The model dropdown in the web UI is split into two groups, and the same split ap
 
 **Supported:** SDXL, FLUX.2 Klein 9B, and Z-Image Turbo. These are known to work well with both weight noising and perceptual anchors, so they're the safest place to start. FLUX.2 Klein 9B and Z-Image Turbo each have a ready-made [Quickstart Template](#quickstart-templates) you can apply in one click.
 
-**Experimental:** everything else in the selector, including Chroma 1 Base, Chroma 1 HD, Chroma Radiance, Z-Image (base), and LTX-2.3, plus the other architectures you can load from a config. These may work, but they haven't had enough testing to call them validated. When you train one:
+**Experimental:** everything else in the selector, including Chroma 1 Base, Chroma 1 HD, Chroma Radiance, Z-Image (base), Ideogram 4, and LTX-2.3, plus the other architectures you can load from a config. These may work, but they haven't had enough testing to call them validated. When you train one:
 
 - Start from values close to the [Quickstart Templates](#quickstart-templates) and tweak from there.
 - Turn on weight noising first, before you add a perceptual anchor. Weight noising is generally safe and improves results in most cases. Perceptual anchors are stronger but can destabilize training if the strength is wrong, so add one only after the plain weight-noise run looks healthy.

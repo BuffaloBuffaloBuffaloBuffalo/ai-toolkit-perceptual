@@ -2,10 +2,11 @@ import os
 from typing import Optional, TYPE_CHECKING, List, Union, Tuple
 
 import torch
-from safetensors.torch import load_file, save_file
+from safetensors.torch import load_file, save_file, safe_open
 from tqdm import tqdm
 import random
 
+from toolkit.advanced_prompt_embeds import AdvancedPromptEmbeds
 from toolkit.train_tools import get_torch_dtype
 import itertools
 
@@ -145,6 +146,13 @@ class PromptEmbeds:
         :param path: The path to load the prompt embeds from.
         :return: An instance of PromptEmbeds.
         """
+        # advanced prompt embed files (e.g. ideogram4) are tagged in metadata;
+        # round-trip them through their own loader instead of this fixed schema.
+        f = safe_open(path, framework='pt')
+        metadata = f.metadata()
+        if metadata is not None and metadata.get("class_name", "") == "AdvancedPromptEmbeds":
+            return AdvancedPromptEmbeds.load(path=path)
+
         state_dict = load_file(path, device='cpu')
         text_embeds = []
         pooled_embeds = None
@@ -245,6 +253,11 @@ class EncodedPromptPair:
 
 
 def concat_prompt_embeds(prompt_embeds: list["PromptEmbeds"], padding_side: str = "right") -> PromptEmbeds:
+    # advanced containers (e.g. AdvancedPromptEmbeds for ideogram4) carry their
+    # own batch-concat logic; delegate so per-sample variable-length captions
+    # concat correctly instead of going through the fixed text_embeds path.
+    if hasattr(prompt_embeds[0].__class__, "concat_prompt_embeds"):
+        return prompt_embeds[0].__class__.concat_prompt_embeds(prompt_embeds, padding_side=padding_side)
     # --- pad text_embeds ---
     if isinstance(prompt_embeds[0].text_embeds, (list, tuple)):
         # Two flavors of list-form text_embeds:

@@ -222,6 +222,13 @@ class BaseModel:
         return unwrap_model(self.model)
 
     @property
+    def text_embedding_space_version(self):
+        # Identifies the text-embedding space for caption-cache keying. Models
+        # whose text conditioning changed (e.g. ideogram4) override this to
+        # invalidate stale caches. Defaults to the arch name.
+        return self.arch
+
+    @property
     def is_xl(self):
         return self.arch == 'sdxl'
 

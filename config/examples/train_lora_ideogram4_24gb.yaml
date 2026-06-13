@@ -87,9 +87,9 @@ config:
         content_or_style: balanced
         optimizer_params:
           weight_decay: 0.0001
-        unload_text_encoder: false
+        unload_text_encoder: true     # free Qwen3-VL-8B after caching embeds (24GB fit)
         cache_text_embeddings: true
-        lr: 5e-5
+        lr: 0.00005                   # NOTE: write floats as 0.00005, not 5e-5 (YAML parses 5e-5 as a string)
         ema_config:
           use_ema: false
           ema_decay: 0.99
@@ -120,7 +120,7 @@ config:
         quantize_te: true
         qtype_te: qfloat8
         arch: ideogram4
-        low_vram: false
+        low_vram: true                      # REQUIRED on 24GB: fp8->bf16 dequant is tensor-by-tensor + CPU offload
         model_kwargs:
           max_text_length: 3072
         layer_offloading: false

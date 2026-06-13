@@ -84,13 +84,24 @@ def get_qwen3_vl_features(
     text_position_ids = position_ids_4d[0]
     mrope_position_ids = position_ids_4d[1:]
 
-    causal_mask = create_causal_mask(
-        config=language_model.config,
-        inputs_embeds=inputs_embeds,
-        attention_mask=attention_mask,
-        past_key_values=None,
-        position_ids=text_position_ids,
-    )
+    # create_causal_mask's signature shifted across transformers versions: newer
+    # builds use `inputs_embeds` with no required cache_position; 4.57.x renamed it
+    # to `input_embeds` and made `cache_position` required. Build kwargs to match
+    # whatever is installed so this works across versions.
+    import inspect
+    _mask_params = inspect.signature(create_causal_mask).parameters
+    _mask_kwargs = {
+        "config": language_model.config,
+        "attention_mask": attention_mask,
+        "past_key_values": None,
+        "position_ids": text_position_ids,
+    }
+    _mask_kwargs["input_embeds" if "input_embeds" in _mask_params else "inputs_embeds"] = inputs_embeds
+    if "cache_position" in _mask_params:
+        _mask_kwargs["cache_position"] = torch.arange(
+            inputs_embeds.shape[1], device=inputs_embeds.device
+        )
+    causal_mask = create_causal_mask(**_mask_kwargs)
     position_embeddings = language_model.rotary_emb(inputs_embeds, mrope_position_ids)
 
     tap_set = set(QWEN3_VL_ACTIVATION_LAYERS)

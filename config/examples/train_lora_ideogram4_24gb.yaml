@@ -1,0 +1,182 @@
+# Ideogram 4 (experimental) — LoRA + Weight Noise + perceptual anchors, 24GB
+#
+# Ideogram 4 is experimental here. It uses a retrained Flux2-style KL-VAE
+# (32-ch latents, 2x2 patchified to 128) with its own per-channel latent
+# normalization, so the perceptual losses decode the predicted latents through
+# the model's full VAE decoder (no taef2 — that tiny decoder is not latent-
+# compatible). At 512px the gradient decode is ~4GB; per-block decoder
+# checkpointing is auto-enabled so 1024px stays bounded.
+#
+# Text encoder is stock Qwen3-VL-8B-Instruct (frozen). Captions are fed to it
+# verbatim, so plain `.txt` captions work; set caption_ext: json to train on
+# Ideogram's structured captions (edit them in the Ideogram Captions UI tab).
+#
+# Per the README guidance: weight noising is on by default; depth is a light
+# anchor. Turn identity/body perceptors on (set their *_loss_weight > 0) only
+# after a plain weight-noise run looks healthy.
+#
+# Fill in:
+#   - config.name                                (your training name)
+#   - config.process[0].datasets[0].folder_path  (path to your images)
+---
+job: extension
+config:
+  name: ""                                             # FILL IN: training name (folder + filename)
+  process:
+    - type: "diffusion_trainer"
+      training_folder: "output"
+      sqlite_db_path: "./aitk_db.db"
+      device: cuda
+      trigger_word: null
+      performance_log_every: 10
+      network:
+        type: "lokr"
+        linear: 32
+        linear_alpha: 32
+        conv: 16
+        conv_alpha: 16
+        lokr_full_rank: true
+        lokr_factor: 8
+        network_kwargs:
+          ignore_if_contains: []
+      save:
+        dtype: bf16
+        save_every: 25
+        max_step_saves_to_keep: 120
+        save_format: diffusers
+        push_to_hub: false
+      datasets:
+        - folder_path: ""                              # FILL IN: path to training images
+          mask_path: null
+          mask_min_value: 0.1
+          default_caption: ""
+          caption_ext: txt                             # set to `json` for Ideogram structured captions
+          caption_dropout_rate: 0.05
+          cache_latents_to_disk: true
+          is_reg: false
+          network_weight: 1
+          resolution: [512, 768, 1024]
+          controls: []
+          shrink_video_to_frames: true
+          num_frames: 1
+          flip_x: false
+          flip_y: false
+          num_repeats: [16, 4, 1]
+          diffusion_loss_weight: 1
+          depth_loss_weight: 0.005
+          loss_split: sum
+      train:
+        # Headline feature: Gaussian noise on LoRA weights each optimizer step.
+        # sigma=0.0125 in relative mode = 1.25% of per-tensor weight RMS.
+        weight_noise:
+          enabled: true
+          mode: relative
+          sigma: 0.0125
+          log_every: 1
+        max_grad_norm: 1
+        batch_size: 1
+        bypass_guidance_embedding: false
+        steps: 1200
+        gradient_accumulation: 4
+        train_unet: true
+        train_text_encoder: false
+        gradient_checkpointing: true
+        noise_scheduler: flowmatch
+        optimizer: adamw8bit
+        timestep_type: linear
+        content_or_style: balanced
+        optimizer_params:
+          weight_decay: 0.0001
+        unload_text_encoder: false
+        cache_text_embeddings: true
+        lr: 5e-5
+        ema_config:
+          use_ema: false
+          ema_decay: 0.99
+        skip_first_sample: false
+        force_first_sample: true
+        disable_sampling: false
+        dtype: bf16
+        diff_output_preservation: false
+        diff_output_preservation_multiplier: 1
+        diff_output_preservation_class: person
+        switch_boundary_every: 1
+        loss_type: mse
+        diffusion_loss_weight: 1
+        diffusion_loss_max_t: 1
+        diffusion_loss_min_t: 0
+        custom_timestep_distribution: null
+        custom_timestep_curve: null
+        max_denoising_steps: 999
+        min_denoising_steps: 0
+        loss_split: null
+      logging:
+        log_every: 1
+        use_ui_logger: true
+      model:
+        name_or_path: "ideogram-ai/ideogram-4-fp8"      # gated; HF account must accept terms
+        quantize: true
+        qtype: qfloat8
+        quantize_te: true
+        qtype_te: qfloat8
+        arch: ideogram4
+        low_vram: false
+        model_kwargs:
+          max_text_length: 3072
+        layer_offloading: false
+        layer_offloading_text_encoder_percent: 1
+        layer_offloading_transformer_percent: 1
+      sample:
+        sampler: flowmatch
+        sample_every: 100
+        width: 1024
+        height: 1024
+        samples:
+          - prompt: "a photo of a person"
+        neg: ""
+        seed: 42
+        walk_seed: false
+        guidance_scale: 4
+        sample_steps: 25
+        num_frames: 1
+        fps: 1
+      face_id:
+        # Identity / body perceptors. Off by default (weights 0) — turn on after
+        # a clean weight-noise run. Decode routes through Ideogram's full VAE.
+        enabled: false
+        init_scale: 0.3
+        identity_loss_weight: 0
+        landmark_loss_weight: 0
+        body_proportion_loss_weight: 0
+        body_proportion_loss_min_t: 0.8
+        body_proportion_loss_max_t: 1
+        body_shape_loss_weight: 0
+        body_shape_loss_max_t: 1
+        body_shape_loss_min_t: 0.8
+        identity_loss_min_t: 0
+        identity_loss_max_t: 0.9
+        identity_metrics: false
+        identity_loss_use_average: true
+        identity_loss_min_cos: 0.4
+      depth_consistency:
+        loss_weight: 0.005
+        input_size: 518
+        preview_every: 100
+        mask_source: none
+        loss_max_t: 1
+        model_id: "depth-anything/Depth-Anything-V2-Large-hf"
+        loss_min_t: 0
+        grad_checkpoint: true
+        ssi_weight: 0
+        grad_weight: 1
+        grad_scales: 6
+      subject_mask:
+        enabled: false
+        background_loss_weight: 0
+        clothing_loss_weight: 1
+        save_debug_previews: true
+        cache_resolution: 768
+        segformer_res: 768
+meta:
+  name: "[name]"
+  version: "1.0"

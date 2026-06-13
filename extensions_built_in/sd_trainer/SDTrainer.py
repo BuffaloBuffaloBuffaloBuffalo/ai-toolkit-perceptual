@@ -782,6 +782,57 @@ class SDTrainer(BaseSDTrainProcess):
             lat = cfg.get('latent_channels', None)
         return lat == 3
 
+    def _is_ideogram_vae(self) -> bool:
+        """Ideogram4 ships a RETRAINED KL-VAE: per-channel latent_norm (not a
+        diffusers scalar scaling_factor) and no taef2-compatible tiny decoder
+        (spike: best taef2 20 dB vs full 34 dB, washed/hazy). So the perceptor
+        x0->pixel decode must route through the model's own decode_latents
+        (denormalize -> unpatchify -> full conv decoder), not the taef2/taesd/
+        scalar-VAE branches."""
+        return getattr(self.sd, 'arch', None) == 'ideogram4'
+
+    def _decode_ideogram_pixels(self, latents):
+        """Decode Ideogram normalized latents to [0,1] pixels, gradient intact
+        (grad flows through the frozen decoder back to `latents`). ~4GB at 512px;
+        fine-grained decoder checkpointing (enabled at load) bounds 1024px."""
+        imgs = self.sd.decode_latents(latents)  # [-1,1]
+        return ((imgs.float() + 1.0) * 0.5).clamp(0, 1)
+
+    def _enable_ideogram_decoder_checkpointing(self):
+        """Per-block gradient checkpointing on the Ideogram VAE decoder so the
+        gradient decode fits at 1024px (~16GB unbounded). Cheap recompute on the
+        small decoder; harmless at 512px. Idempotent."""
+        dec = getattr(self.sd.vae, 'decoder', None)
+        if dec is None or getattr(dec, '_aitk_ckpt_patched', False):
+            return
+        import types
+        from torch.utils.checkpoint import checkpoint as _ckpt
+        from extensions_built_in.diffusion_models.ideogram4.src.vae import swish as _swish
+
+        def fwd(self_dec, z):
+            z = self_dec.post_quant_conv(z)
+            upscale_dtype = next(self_dec.up.parameters()).dtype
+            h = self_dec.conv_in(z)
+            h = _ckpt(self_dec.mid.block_1, h, use_reentrant=False)
+            h = _ckpt(self_dec.mid.attn_1, h, use_reentrant=False)
+            h = _ckpt(self_dec.mid.block_2, h, use_reentrant=False)
+            h = h.to(upscale_dtype)
+            for i_level in reversed(range(self_dec.num_resolutions)):
+                for i_block in range(self_dec.num_res_blocks + 1):
+                    h = _ckpt(self_dec.up[i_level].block[i_block], h, use_reentrant=False)
+                    if len(self_dec.up[i_level].attn) > 0:
+                        h = _ckpt(self_dec.up[i_level].attn[i_block], h, use_reentrant=False)
+                if i_level != 0:
+                    h = self_dec.up[i_level].upsample(h)
+            h = self_dec.norm_out(h)
+            h = _swish(h)
+            h = self_dec.conv_out(h)
+            return h
+
+        dec.forward = types.MethodType(fwd, dec)
+        dec._aitk_ckpt_patched = True
+        print_acc("  Ideogram VAE decoder: per-block gradient checkpointing enabled")
+
     def _get_video_x0_frames(self, noise_pred, noisy_latents, timesteps, needs_grad):
         """Decode the x0 prediction to ``(B, 3, T, H, W)`` pixel frames in [0, 1].
 
@@ -1603,7 +1654,14 @@ class SDTrainer(BaseSDTrainProcess):
                 print_acc("  VAE decoder: fine-grained gradient checkpointing enabled")
 
         # Load lightweight decoder for face losses (identity)
-        if _need_face_decoder and self.taesd is None and self._is_pixel_space_vae():
+        if _need_face_decoder and self.taesd is None and self._is_ideogram_vae():
+            # Ideogram4: retrained VAE with no taef2-compatible tiny decoder, so the
+            # perceptor x0->pixel decode routes through the model's own full VAE
+            # (decode_latents). Load no tiny decoder; enable per-block gradient
+            # checkpointing on the decoder so the gradient decode fits at 1024px.
+            print_acc("  Ideogram4 VAE — perceptor decode uses the full VAE (no taef2)")
+            self._enable_ideogram_decoder_checkpointing()
+        elif _need_face_decoder and self.taesd is None and self._is_pixel_space_vae():
             # Pixel-space models (chroma_radiance / zeta_chroma) use FakeVAE, an
             # identity encode/decode — x0 already IS the image in [-1,1]. Load no
             # tiny decoder; the live x0 decode and depth-GT roundtrip detect
@@ -1695,6 +1753,17 @@ class SDTrainer(BaseSDTrainProcess):
 
             def _vae_roundtrip_for_depth(arr: torch.Tensor) -> torch.Tensor:
                 """[0,1] pixels → VAE encode → trainer decoder → [0,1] pixels."""
+                if self._is_ideogram_vae():
+                    # Ideogram per-channel norm + patchify: route through the model's
+                    # own encode/decode so the cached GT is the exact frame the loss
+                    # decode produces (true zero-floor target).
+                    if next(self.sd.vae.parameters()).device != self.device_torch:
+                        self.sd.vae.to(self.device_torch)
+                    img_m1 = (arr * 2.0 - 1.0).to(self.sd.vae_torch_dtype)
+                    latents = self.sd.encode_images(
+                        img_m1, device=self.device_torch, dtype=self.sd.vae_torch_dtype
+                    )
+                    return self._decode_ideogram_pixels(latents)
                 if self._is_pixel_space_vae():
                     # Pixel-space (FakeVAE): encode and decode are identity, so the
                     # round-trip is a no-op and GT depth is computed on the original
@@ -2858,7 +2927,9 @@ class SDTrainer(BaseSDTrainProcess):
                         x0_pred = (noisy_latents - sqrt_one_minus_alpha_bar * noise_pred) / sqrt_alpha_bar.clamp(min=1e-8)
 
                 # Decode x0 prediction to pixel space for face recognition
-                if self._is_pixel_space_vae():
+                if self._is_ideogram_vae():
+                    x0_pixels = self._decode_ideogram_pixels(x0_pred)
+                elif self._is_pixel_space_vae():
                     # Pixel-space (FakeVAE: chroma_radiance / zeta_chroma): the x0
                     # "latent" already IS the image in [-1,1]; no decode needed.
                     x0_pixels = (x0_pred.float() + 1.0) * 0.5
@@ -3086,7 +3157,9 @@ class SDTrainer(BaseSDTrainProcess):
                             id_preview_dir = os.path.join(self.save_root, 'id_previews')
                             os.makedirs(id_preview_dir, exist_ok=True)
                             noisy_for_decode = noisy_latents
-                            if self._is_pixel_space_vae():
+                            if self._is_ideogram_vae():
+                                noisy_pixels = self._decode_ideogram_pixels(noisy_for_decode)
+                            elif self._is_pixel_space_vae():
                                 # Pixel-space (FakeVAE): the noisy latent already IS
                                 # a (noised) image in [-1,1].
                                 noisy_pixels = ((noisy_for_decode.float() + 1.0) * 0.5).clamp(0, 1)
@@ -3837,7 +3910,9 @@ class SDTrainer(BaseSDTrainProcess):
                         _dc_x0_pred = (noisy_latents - _dc_s1ma * noise_pred) / _dc_sa.clamp(min=1e-8)
 
                 # Decode x0 to pixel space (same path the face-losses block uses).
-                if self._is_pixel_space_vae():
+                if self._is_ideogram_vae():
+                    _dc_pixels = self._decode_ideogram_pixels(_dc_x0_pred)
+                elif self._is_pixel_space_vae():
                     # Pixel-space (FakeVAE): x0 already IS the image in [-1,1].
                     _dc_pixels = (_dc_x0_pred.float() + 1.0) * 0.5
                 elif hasattr(self, '_taef2_decoder') and self._taef2_decoder is not None:
@@ -5982,7 +6057,9 @@ class SDTrainer(BaseSDTrainProcess):
                                 else:
                                     pure_x0 = (pure_z - _pn_s1mab * pure_v) / _pn_sab.clamp(min=1e-8)
                             # decode through TAEF2/TAESD
-                            if hasattr(self, '_taef2_decoder') and self._taef2_decoder is not None:
+                            if self._is_ideogram_vae():
+                                pn_pixels = self._decode_ideogram_pixels(pure_x0)
+                            elif hasattr(self, '_taef2_decoder') and self._taef2_decoder is not None:
                                 pn_decode = pure_x0
                                 if pn_decode.shape[1] != 32:
                                     from einops import rearrange

@@ -21,7 +21,7 @@ from optimum.quanto import freeze, QTensor
 
 import huggingface_hub
 from huggingface_hub.errors import EntryNotFoundError
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoModel, AutoTokenizer, Qwen3VLForConditionalGeneration
 
 from .src.transformer import Ideogram4Config, Ideogram4Transformer2DModel
 from .src.vae import AutoEncoder, AutoEncoderParams, convert_diffusers_state_dict
@@ -191,7 +191,9 @@ class Ideogram4Model(BaseModel):
     @property
     def text_embedding_space_version(self):
         # we changed the embeddings. invalidate cache.
-        return self.arch + "_te_v2"
+        # _te_v3: prior caches were built with a randomly-initialized Qwen3-VL
+        # (AutoModel prefix mismatch) and hold garbage features -- force a recache.
+        return self.arch + "_te_v3"
 
     @staticmethod
     def get_train_scheduler():
@@ -213,9 +215,26 @@ class Ideogram4Model(BaseModel):
         self.print_and_status_update(f"Loading Qwen3-VL text encoder from {te_path}")
 
         tokenizer = AutoTokenizer.from_pretrained(te_path, token=HF_TOKEN)
-        text_encoder = AutoModel.from_pretrained(
-            te_path, torch_dtype=dtype, token=HF_TOKEN
+        # Must load the full Qwen3VLForConditionalGeneration: the published
+        # checkpoint nests every weight under a top-level ``model.`` prefix
+        # (``model.language_model.*`` / ``model.visual.*``). ``AutoModel`` returns
+        # the inner ``Qwen3VLModel`` whose params are ``language_model.*`` (no
+        # ``model.`` prefix), so the load silently MISSES every transformer weight
+        # and runs a RANDOMLY-INITIALIZED language model -> garbage conditioning.
+        # The CG class keeps the ``model.`` nesting so the prefixes match, and it
+        # still exposes ``.language_model`` (delegating to ``model.language_model``)
+        # which is all get_qwen3_vl_features needs.
+        text_encoder = Qwen3VLForConditionalGeneration.from_pretrained(
+            te_path, dtype=dtype, token=HF_TOKEN
         )
+        # We only read the language tower's hidden states; drop the vision tower
+        # (and the unused lm_head) to reclaim VRAM. ``.language_model`` still works.
+        if getattr(text_encoder, "model", None) is not None and hasattr(
+            text_encoder.model, "visual"
+        ):
+            text_encoder.model.visual = None
+        if hasattr(text_encoder, "lm_head"):
+            text_encoder.lm_head = None
         flush()
 
         text_encoder.eval()

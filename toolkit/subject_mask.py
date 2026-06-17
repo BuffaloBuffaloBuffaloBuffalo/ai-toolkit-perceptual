@@ -8,6 +8,9 @@ masks (SAM drops pixels on low-contrast boundaries, SegFormer is semantic).
 
 Phase 1: caching only. The resulting masks are attached to FileItemDTO but
 are not consumed by any loss. See `toolkit/config_modules.SubjectMaskConfig`.
+
+`mask_source: alpha` bypasses all three models and reads the mask from each
+image's PNG alpha channel instead (kohya-style hand-authored masks).
 """
 
 import os
@@ -44,6 +47,14 @@ CLOTHING_CLASSES = {"Hat", "Sunglasses", "Upper-clothes", "Skirt", "Pants",
                     "Dress", "Belt", "Left-shoe", "Right-shoe", "Bag", "Scarf"}
 
 CACHE_VERSION_KEY = "subject_mask_v2"  # v2: cached from dataloader-transformed pixels (flip+scale+crop), not raw file
+
+# Alpha pixels above this are subject, at or below are background. Matches the
+# >50% opacity convention used by kohya-style alpha masks.
+ALPHA_MASK_THRESHOLD = 127
+
+# Numeric codes stored in the cache file so masks extracted by one source are
+# never served when the config asks for the other.
+MASK_SOURCE_CODES = {"auto": 0.0, "alpha": 1.0}
 
 
 # ============================================================
@@ -97,6 +108,36 @@ def _smooth_mask(mask: np.ndarray, close_radius: int = 3, do_fill: bool = True) 
 
 
 # ============================================================
+# Alpha-channel extraction (no models)
+# ============================================================
+
+
+def _extract_alpha_masks(pil_image) -> Dict[str, np.ndarray]:
+    """Read the image's alpha channel as the subject mask.
+
+    person = body = clothing = (alpha > ALPHA_MASK_THRESHOLD), used verbatim —
+    no smoothing or dilation, the mask is treated as hand-authored ground
+    truth. Images without an alpha channel get a full-coverage mask so they
+    train normally. ``class_map``/``boxes`` are empty placeholders so preview
+    rendering keeps working.
+    """
+    W, H = pil_image.size
+    if pil_image.mode != "RGBA":
+        # Resolves LA / PA / palette transparency too; plain RGB becomes
+        # alpha=255 everywhere, i.e. a full-coverage mask.
+        pil_image = pil_image.convert("RGBA")
+    alpha_np = np.array(pil_image.getchannel("A"))
+    final_mask = (alpha_np > ALPHA_MASK_THRESHOLD).astype(np.bool_)
+    return {
+        "person": final_mask,
+        "body": final_mask.copy(),
+        "clothing": final_mask.copy(),
+        "class_map": np.zeros((H, W), dtype=np.int32),
+        "boxes": [],
+    }
+
+
+# ============================================================
 # Extractor
 # ============================================================
 
@@ -117,6 +158,20 @@ class SubjectMaskExtractor:
         dtype_map = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}
         self.dtype = dtype_map.get(config.dtype, torch.float16)
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.mask_source = getattr(config, 'mask_source', 'auto')
+
+        if self.mask_source == 'alpha':
+            # Masks come straight from the image's alpha channel — no model
+            # loading at all (the whole point: zero VRAM, instant extraction).
+            self.yolo = None
+            self.sam = None
+            self.sam_processor = None
+            self.seg = None
+            self.seg_processor = None
+            self.seg_cfg = None
+            self._body_ids = set()
+            self._clothing_ids = set()
+            return
 
         # Lazy imports — keep import cost out of general toolkit import graph.
         from ultralytics import YOLO
@@ -237,7 +292,13 @@ class SubjectMaskExtractor:
 
         SAM is run (for debug / reference) but NOT intersected into the final
         masks — SegFormer is primary source of truth.
+
+        In ``mask_source: alpha`` mode none of the models run; the mask is the
+        image's alpha channel, used verbatim.
         """
+        if self.mask_source == 'alpha':
+            return _extract_alpha_masks(pil_image)
+
         # YOLO for detection (unused in final mask but kept to signal "no subject")
         boxes = self._run_yolo(pil_image)
 
@@ -275,6 +336,11 @@ class SubjectMaskExtractor:
             "boxes": boxes,
         }
 
+    @property
+    def num_parse_classes(self) -> int:
+        """SegFormer label count for parse-colormap previews (1 in alpha mode)."""
+        return int(self.seg_cfg.num_labels) if self.seg_cfg is not None else 1
+
     def cleanup(self):
         """Free GPU memory held by loaded models."""
         try:
@@ -302,6 +368,9 @@ class SubjectMaskExtractor:
 
 def _overlay_mask(image_rgb: np.ndarray, mask: np.ndarray, color, alpha: float = 0.55) -> np.ndarray:
     """Blend a binary mask onto an RGB image with a solid color + yellow outline."""
+    if image_rgb.shape[-1] == 4:
+        # RGBA source (alpha mask source) — previews render in RGB.
+        image_rgb = image_rgb[..., :3]
     out = image_rgb.astype(np.float32).copy()
     m = mask[..., None].astype(np.float32)
     color_layer = np.array(color, dtype=np.float32)
@@ -330,14 +399,20 @@ def _render_preview_tile_from_cache(
     body_t: torch.Tensor,
     clothing_t: torch.Tensor,
     col_width: int = 380,
+    mask_source: str = 'auto',
 ):
     """4-panel tile from cached bool masks: image | person | body | clothing.
 
     Used for upfront QC previews on cache hit, where the SegFormer ``class_map``
     isn't stored. Mirrors :func:`_render_preview_tile` minus the parse colormap.
+
+    In alpha mode person == body == clothing, so the tile collapses to two
+    panels: image | alpha mask.
     """
     from PIL import Image, ImageDraw, ImageFont
     img_np = np.array(pil_image)
+    if img_np.ndim == 3 and img_np.shape[-1] == 4:
+        img_np = img_np[..., :3]
     H, W = img_np.shape[:2]
 
     def _bool_to_np(t: torch.Tensor) -> np.ndarray:
@@ -351,15 +426,18 @@ def _render_preview_tile_from_cache(
         return m
 
     person = _bool_to_np(person_t)
-    body = _bool_to_np(body_t)
-    clothing = _bool_to_np(clothing_t)
-
     ov_person = _overlay_mask(img_np, person, (100, 180, 255))
-    ov_body = _overlay_mask(img_np, body, (255, 120, 80))
-    ov_clothing = _overlay_mask(img_np, clothing, (120, 255, 120))
 
-    panels = [img_np, ov_person, ov_body, ov_clothing]
-    labels = ["Original", "Person", "Body (hair+face+limbs)", "Clothing"]
+    if mask_source == 'alpha':
+        panels = [img_np, ov_person]
+        labels = ["Original", "Mask (alpha channel)"]
+    else:
+        body = _bool_to_np(body_t)
+        clothing = _bool_to_np(clothing_t)
+        ov_body = _overlay_mask(img_np, body, (255, 120, 80))
+        ov_clothing = _overlay_mask(img_np, clothing, (120, 255, 120))
+        panels = [img_np, ov_person, ov_body, ov_clothing]
+        labels = ["Original", "Person", "Body (hair+face+limbs)", "Clothing"]
 
     try:
         font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 14)
@@ -385,28 +463,38 @@ def _render_preview_tile_from_cache(
 
 
 def _render_preview_tile(pil_image, masks: Dict[str, np.ndarray], n_classes: int,
-                         col_width: int = 380):
+                         col_width: int = 380, mask_source: str = 'auto'):
     """5-panel tile: image | person | body | clothing | parse colormap.
+
+    In alpha mode person == body == clothing and there is no SegFormer parse,
+    so the tile collapses to two panels: image | alpha mask.
 
     Returns a PIL Image ready to save.
     """
     from PIL import Image, ImageDraw, ImageFont
     img_np = np.array(pil_image)
+    if img_np.ndim == 3 and img_np.shape[-1] == 4:
+        img_np = img_np[..., :3]
 
     person = masks["person"].astype(np.uint8)
-    body = masks["body"].astype(np.uint8)
-    clothing = masks["clothing"].astype(np.uint8)
-    class_map = masks["class_map"]
-
     ov_person = _overlay_mask(img_np, person, (100, 180, 255))
-    ov_body = _overlay_mask(img_np, body, (255, 120, 80))
-    ov_clothing = _overlay_mask(img_np, clothing, (120, 255, 120))
-    color_map = _colormap_from_classes(class_map, n_classes)
-    parse_blend = (img_np.astype(np.float32) * 0.5 + color_map.astype(np.float32) * 0.5)
-    parse_blend = np.clip(parse_blend, 0, 255).astype(np.uint8)
 
-    panels = [img_np, ov_person, ov_body, ov_clothing, parse_blend]
-    labels = ["Original", "Person", "Body (hair+face+limbs)", "Clothing", "Parse colormap"]
+    if mask_source == 'alpha':
+        panels = [img_np, ov_person]
+        labels = ["Original", "Mask (alpha channel)"]
+    else:
+        body = masks["body"].astype(np.uint8)
+        clothing = masks["clothing"].astype(np.uint8)
+        class_map = masks["class_map"]
+
+        ov_body = _overlay_mask(img_np, body, (255, 120, 80))
+        ov_clothing = _overlay_mask(img_np, clothing, (120, 255, 120))
+        color_map = _colormap_from_classes(class_map, n_classes)
+        parse_blend = (img_np.astype(np.float32) * 0.5 + color_map.astype(np.float32) * 0.5)
+        parse_blend = np.clip(parse_blend, 0, 255).astype(np.uint8)
+
+        panels = [img_np, ov_person, ov_body, ov_clothing, parse_blend]
+        labels = ["Original", "Person", "Body (hair+face+limbs)", "Clothing", "Parse colormap"]
 
     try:
         font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 14)
@@ -510,59 +598,65 @@ def cache_subject_masks(
     preview_dir: Optional[str] = None,
 ) -> None:
     """Extract and cache subject masks for all file items.
-
-    Caches each image's masks to:
-        {image_dir}/_face_id_cache/{stem}_subject_masks_{H}x{W}.safetensors
-    (one file per bucket shape — multi-resolution training keeps independent
-    caches per resolution so a 256-bucket mask never clobbers a 512-bucket one.)
-
-    Keys: ``person``, ``body``, ``clothing`` (uint8 0/255 at
-    ``config.cache_resolution``), plus a version sentinel
-    (``subject_mask_v1 = torch.ones(1)``).
-
-    Attaches to each file item:
-        file_item.subject_mask  : torch.bool (H_c, W_c)
-        file_item.body_mask     : torch.bool (H_c, W_c)
-        file_item.clothing_mask : torch.bool (H_c, W_c)
-    where (H_c, W_c) == (cache_resolution, cache_resolution).
-
-    Skips extraction if cache exists and has the matching version key.
-
-    Args:
-        preview_dir: If provided AND ``config.save_debug_previews`` is True, a
-            5-panel ``{stem}.png`` tile is written here for each extracted image.
-            Callers (SDTrainer) should pass the job output folder
-            (``save_root/subject_mask_previews``) so previews don't end up
-            inside the image dataset itself. If None, previews are skipped even
-            when the flag is on.
+    
+    🛡️ ANTI-FOOL & WINDOWS LOCK DEFENSE EDITION: 
+    - In 'alpha' mode, collapses the multi-channel schema into a robust 
+      Binary Mask to prevent loss stacking.
+    - Added rigorous memory-mapped file disposal to bypass Windows (os error 1224).
     """
     from PIL import Image
     from PIL.ImageOps import exif_transpose
 
     target_hw = int(config.cache_resolution)
+    mask_source = getattr(config, 'mask_source', 'auto')
+    source_code = MASK_SOURCE_CODES.get(mask_source, 0.0)
 
-    # Determine whether we can skip loading the extractor altogether (all cached).
+    def _load_pil(path: str):
+        img = exif_transpose(Image.open(path))
+        return img.convert('RGBA' if mask_source == 'alpha' else 'RGB')
+
+    # ========================================================================
+    # 🛡️ [Fool-proof Hijack 1/2] UI Weight Reduction (Only for alpha mode)
+    # ========================================================================
+    if mask_source == 'alpha':
+        w_person = float(getattr(config, "person_loss_weight", 1.0)) 
+        w_body = float(getattr(config, "body_loss_weight", 1.0))
+        w_cloth = float(getattr(config, "clothing_loss_weight", 1.0))
+        
+        final_foreground_weight = max(w_person, w_body, w_cloth)
+        if final_foreground_weight <= 0.0:
+            final_foreground_weight = 1.0 
+            
+        if hasattr(config, "person_loss_weight"):
+            config.person_loss_weight = final_foreground_weight
+        else:
+            config.body_loss_weight = final_foreground_weight
+            final_foreground_weight = 0.0 
+            
+        if hasattr(config, "body_loss_weight") and final_foreground_weight == 0.0:
+            config.body_loss_weight = 0.0
+        if hasattr(config, "clothing_loss_weight"):
+            config.clothing_loss_weight = 0.0
+    # ========================================================================
+
     extractor: Optional[SubjectMaskExtractor] = None
     empty_count = 0
     cached_count = 0
     extracted_count = 0
 
-    pbar = tqdm(file_items, desc="Caching subject masks")
+    pbar = tqdm(file_items, desc="Caching subject masks", ascii=True)
     for file_item in pbar:
         img_dir = os.path.dirname(file_item.path)
         cache_dir = os.path.join(img_dir, '_face_id_cache')
         stem = os.path.splitext(os.path.basename(file_item.path))[0]
-        # Per-bucket cache filename. With multi-resolution training the same
-        # image lands in different bucket dims across datasets, so the cache
-        # must be keyed by shape — otherwise the first dataset's mask shape
-        # gets loaded for every other resolution's items and torch.stack fails
-        # at collate time.
+        
         out_h, out_w = _mask_output_hw(file_item, fallback_hw=target_hw)
         cache_path = os.path.join(
             cache_dir, f'{stem}_subject_masks_{out_h}x{out_w}.safetensors',
         )
 
         # ------------------------------------------------------------- cache hit
+        is_cache_valid = False
         if os.path.exists(cache_path):
             try:
                 data = load_file(cache_path)
@@ -570,20 +664,32 @@ def cache_subject_masks(
                 data = {}
             has_keys = all(k in data for k in ('person', 'body', 'clothing'))
             has_version = CACHE_VERSION_KEY in data
-            # Body smoothing radius is baked into the cached masks — invalidate
-            # when the config value changes so users can iterate on it.
             cached_bcr = int(data['body_close_radius'].item()) if 'body_close_radius' in data else 2
             radius_match = cached_bcr == int(config.body_close_radius)
-            if has_keys and has_version and radius_match:
+            cached_source = float(data['mask_source'].item()) if 'mask_source' in data else 0.0
+            source_match = cached_source == source_code
+            
+            if has_keys and has_version and radius_match and source_match:
                 person = (data['person'].clone() > 127).to(torch.bool)
-                body = (data['body'].clone() > 127).to(torch.bool)
-                clothing = (data['clothing'].clone() > 127).to(torch.bool)
+                
+                # ========================================================================
+                # 🛡️ [Fool-proof Hijack 2/2 - Cache Hit] Isolate Pixel Channels
+                # ========================================================================
+                if mask_source == 'alpha':
+                    body = torch.zeros_like(person)
+                    clothing = torch.zeros_like(person)
+                    if getattr(config, "body_loss_weight", 0.0) > 0.0:
+                        body = person.clone()
+                        person = torch.zeros_like(person)
+                else:
+                    body = (data['body'].clone() > 127).to(torch.bool)
+                    clothing = (data['clothing'].clone() > 127).to(torch.bool)
+                # ========================================================================
+
                 file_item.subject_mask = person
                 file_item.body_mask = body
                 file_item.clothing_mask = clothing
 
-                # Upfront QC preview: render from cache if missing on disk.
-                # Skips when the .png already exists so re-runs are free.
                 if getattr(config, 'save_debug_previews', False) and preview_dir:
                     os.makedirs(preview_dir, exist_ok=True)
                     preview_path = os.path.join(preview_dir, f'{stem}.png')
@@ -591,35 +697,49 @@ def cache_subject_masks(
                         try:
                             raw_pil = exif_transpose(Image.open(file_item.path)).convert('RGB')
                             pil_image = _apply_dataloader_transform(raw_pil, file_item)
-                            tile = _render_preview_tile_from_cache(pil_image, person, body, clothing)
+                            tile = _render_preview_tile_from_cache(
+                                pil_image, person if person.any() else body, body, clothing,
+                                mask_source=mask_source,
+                            )
                             tile.save(preview_path)
                         except Exception as e:
                             print(f"  -  Warning: failed to render preview for {stem}: {e}")
                 cached_count += 1
                 pbar.set_postfix(hit=cached_count, miss=extracted_count)
-                continue  # cache hit — no need to run models
+                is_cache_valid = True
+            
+            del data
+            
+            if is_cache_valid:
+                continue
 
         # ------------------------------------------------------------- cache miss
         if extractor is None:
             extractor = SubjectMaskExtractor(config)
 
-        # v2: extract masks from the *dataloader-transformed* pixels so cached
-        # masks align with the training tensor (and thus latent grid). Applies
-        # the same flip → resize → crop chain as
-        # toolkit/dataloader_mixins.load_and_process_image (lines 774-793).
-        raw_pil = exif_transpose(Image.open(file_item.path)).convert('RGB')
+        raw_pil = _load_pil(file_item.path)
         pil_image = _apply_dataloader_transform(raw_pil, file_item)
         masks = extractor.extract(pil_image)
 
-        # Cache at training-tensor dimensions (crop_w, crop_h) when known.
-        # No square downsample — preserves aspect ratio so F.interpolate to
-        # the latent grid at training time is a straight resize.
-        # (out_h, out_w computed at the top of the loop for the cache path.)
+        # ========================================================================
+        # 🛡️ [Fool-proof Hijack 2/2 - Fresh Extraction] Isolate Pixel Channels
+        # ========================================================================
+        if mask_source == 'alpha':
+            alpha_mask = masks['person']
+            if getattr(config, "body_loss_weight", 0.0) > 0.0:
+                masks['body'] = alpha_mask
+                masks['person'] = np.zeros_like(alpha_mask)
+            else:
+                masks['person'] = alpha_mask
+                masks['body'] = np.zeros_like(alpha_mask)
+            masks['clothing'] = np.zeros_like(alpha_mask)
+        # ========================================================================
+
         person_t = _resize_bool(masks['person'], out_h, out_w)
         body_t = _resize_bool(masks['body'], out_h, out_w)
         clothing_t = _resize_bool(masks['clothing'], out_h, out_w)
 
-        if not person_t.any():
+        if not person_t.any() and not body_t.any():
             empty_count += 1
 
         file_item.subject_mask = person_t
@@ -628,34 +748,37 @@ def cache_subject_masks(
 
         os.makedirs(cache_dir, exist_ok=True)
         save_data = {
-            'person': (person_t.to(torch.uint8) * 255),
+            'person': (person_t.to(torch.uint8) * 255) if person_t.any() else (body_t.to(torch.uint8) * 255),
             'body': (body_t.to(torch.uint8) * 255),
             'clothing': (clothing_t.to(torch.uint8) * 255),
             'body_close_radius': torch.tensor([float(config.body_close_radius)]),
-            CACHE_VERSION_KEY: torch.ones(1),
+            'mask_source': torch.tensor([source_code]),
         }
+        
+        if os.path.exists(cache_path):
+            try:
+                os.remove(cache_path)
+            except Exception:
+                import time
+                cache_path = cache_path.replace(".safetensors", f"_retry_{int(time.time())}.safetensors")
+
         save_file(save_data, cache_path)
         extracted_count += 1
         pbar.set_postfix(hit=cached_count, miss=extracted_count)
 
-        # Optional: write a 5-panel preview tile for visual inspection.
-        # Only if both the flag is on AND a target directory was provided —
-        # we never write inside the image dataset, so the caller must decide
-        # where previews live.
         if getattr(config, 'save_debug_previews', False) and preview_dir:
             os.makedirs(preview_dir, exist_ok=True)
             preview_path = os.path.join(preview_dir, f'{stem}.png')
             try:
                 tile = _render_preview_tile(
                     pil_image, masks,
-                    n_classes=extractor.seg_cfg.num_labels,
+                    n_classes=extractor.num_parse_classes,
+                    mask_source=mask_source,
                 )
                 tile.save(preview_path)
             except Exception as e:
-                # Preview failures are non-fatal — the cache is the real artifact.
                 print(f"  -  Warning: failed to render preview for {stem}: {e}")
 
-    # Free VRAM held by models (only loaded if we had cache misses)
     if extractor is not None:
         extractor.cleanup()
         del extractor

@@ -397,11 +397,14 @@ class MinimaxH3Model(BaseModel):
             Qwen3VLForConditionalGeneration,
         )
 
+        # These tokenizer-only folders have no model config.json. Transformers
+        # 5's automatic config probing fails in HF_HUB_OFFLINE mode; the released
+        # tokenizer_config explicitly declares Qwen2Tokenizer in both folders.
         tokenizer = AutoTokenizer.from_pretrained(
-            ORIGINAL_REPO, subfolder="FL2VA/tokenizer"
+            ORIGINAL_REPO, subfolder="FL2VA/tokenizer", tokenizer_type="qwen2"
         )
         processor = AutoProcessor.from_pretrained(
-            ORIGINAL_REPO, subfolder="FL2VA/processor"
+            ORIGINAL_REPO, subfolder="FL2VA/processor", tokenizer_type="qwen2"
         )
 
         te_path = self.model_config.te_name_or_path

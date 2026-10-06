@@ -94,9 +94,11 @@ RUN cd /app/ai-toolkit/ui && npm ci
 # ---------------------------------------------------------------------------- #
 COPY . /app/ai-toolkit/
 
-# Fail the image build on runtime drift or broken native-H3 training imports,
-# before paying for a GPU Pod. Real CUDA forward/backward is checked on the Pod.
-RUN python -c "import torch, torchvision, torchaudio; assert torch.__version__.split('+')[0] == '2.13.0', torch.__version__; assert torch.version.cuda.startswith('13.'), torch.version.cuda; from extensions_built_in.diffusion_models.minimax_h3.minimax_h3 import MinimaxH3Model; from toolkit.util.convrot_quant import ConvRotInt8Quantizer; print('Blackwell runtime and H3 imports OK:', torch.__version__, torch.version.cuda)"
+# Fail on runtime drift before paying for a GPU Pod. The diffusion-model
+# registry eagerly imports Triton modules that query the CUDA device, so its
+# import and real forward/backward checks must run on the Pod, not CPU CI.
+RUN python -c "import torch, torchvision, torchaudio; assert torch.__version__.split('+')[0] == '2.13.0', torch.__version__; assert torch.version.cuda.startswith('13.'), torch.version.cuda; from toolkit.util.convrot_quant import ConvRotInt8Quantizer; print('Blackwell runtime and quantization imports OK:', torch.__version__, torch.version.cuda)" && \
+    python -m compileall -q extensions_built_in/diffusion_models/minimax_h3 extensions_built_in/sd_trainer toolkit/depth_consistency.py
 
 # Build UI (re-runs on code change, but reuses the cached node_modules above).
 # update_db runs first because it does `prisma generate`, which creates the

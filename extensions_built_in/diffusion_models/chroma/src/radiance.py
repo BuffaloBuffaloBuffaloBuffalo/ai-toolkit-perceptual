@@ -1,4 +1,6 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+
+from toolkit.models.v2._mixin import OstrisModelMixin
 
 import torch
 from torch import Tensor, nn
@@ -101,10 +103,33 @@ def modify_mask_to_attend_padding(mask, max_seq_length, num_extra_padding=8):
     return modified_mask
 
 
-class Chroma(nn.Module):
+class Chroma(nn.Module, OstrisModelMixin):
     """
     Transformer model for flow matching on sequences.
     """
+
+    @classmethod
+    def aitk_config_from_state_dict(cls, state_dict):
+        double_blocks = 0
+        single_blocks = 0
+        for key in state_dict:
+            if key.startswith("double_blocks."):
+                double_blocks = max(double_blocks, int(key.split(".")[1]) + 1)
+            elif key.startswith("single_blocks."):
+                single_blocks = max(single_blocks, int(key.split(".")[1]) + 1)
+        return replace(
+            chroma_params, depth=double_blocks, depth_single_blocks=single_blocks,
+            use_x0="__x0__" in state_dict,
+        )
+
+    @classmethod
+    def aitk_from_config(cls, config):
+        with torch.device("meta"):
+            return cls(config)
+
+    @classmethod
+    def get_transformer_block_names(cls):
+        return ["double_blocks", "single_blocks"]
 
     def __init__(self, params: ChromaParams):
         super().__init__()

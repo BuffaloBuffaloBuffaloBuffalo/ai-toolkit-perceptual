@@ -313,6 +313,30 @@ def multiscale_grad_loss(
     return loss / scales
 
 
+def depth_mask_for_frames(batch, mask_source, sample_index, depth_frames):
+    """Map a cached sample mask onto THW depth frames, including native images.
+
+    H3 still images use the video loss path (T=1). Honor the same subject/body
+    selection as the 4D image path. Cached masks are spatial B1HW maps, so a
+    selected map is shared across frames rather than treated as a time axis.
+    """
+    field = {'subject': 'subject_masks', 'body': 'body_masks'}.get(mask_source)
+    masks = getattr(batch, field, None) if field else None
+    if masks is None or sample_index >= masks.shape[0]:
+        return None
+    mask = masks[sample_index].to(device=depth_frames.device, dtype=depth_frames.dtype)
+    if mask.ndim == 2:
+        mask = mask.unsqueeze(0)
+    if mask.ndim != 3 or mask.shape[0] != 1:
+        raise ValueError(f'Expected spatial 1HW depth mask, got {mask.shape}')
+    if mask.shape[-2:] != depth_frames.shape[-2:]:
+        mask = F.interpolate(
+            mask.unsqueeze(0), size=depth_frames.shape[-2:],
+            mode='bilinear', align_corners=False,
+        ).squeeze(0)
+    return mask.expand(depth_frames.shape[0], -1, -1)
+
+
 def compute_depth_consistency_loss(
     encoder: DifferentiableDepthEncoder,
     x0_pixels: torch.Tensor,
@@ -439,6 +463,7 @@ def cache_depth_gt_embeddings(
     device: Optional[torch.device] = None,
     vae_roundtrip_fn: Optional[callable] = None,  # noqa: A002 (lower-case callable is fine here)
     store_as_single_frame_video: bool = False,
+    cache_key_suffix: str = "",
 ) -> None:
     """Extract and cache GT depth maps for all file items.
 
@@ -463,6 +488,9 @@ def cache_depth_gt_embeddings(
             ``CACHE_VERSION_VIDEO_KEY``) and ``is_depth_video_cached`` is set,
             instead of the 2D ``depth_gt*`` image map. Same v3 GT, different
             consumer.
+        cache_key_suffix: optional suffix for model-specific roundtrip decoders
+            that share the same version key but must not reuse each other's GT
+            maps.
     """
     from PIL import Image
     from PIL.ImageOps import exif_transpose
@@ -489,6 +517,7 @@ def cache_depth_gt_embeddings(
     # block reads it; otherwise everything below is the standard image path.
     _key_base = "depth_gt_video" if store_as_single_frame_video else "depth_gt"
     _ver_key = CACHE_VERSION_VIDEO_KEY if store_as_single_frame_video else CACHE_VERSION_KEY
+    _extra_sfx = f"_{cache_key_suffix}" if cache_key_suffix else ""
 
     def _record_lazy_meta(fi, cpath, ckey):
         # Drop the resident tensor and point the DataLoader worker at the cache
@@ -522,9 +551,9 @@ def cache_depth_gt_embeddings(
         _ch = getattr(file_item, 'crop_height', None)
         _cw = getattr(file_item, 'crop_width', None)
         if isinstance(_ch, int) and isinstance(_cw, int) and _ch > 0 and _cw > 0:
-            depth_key = f"{_key_base}_{int(_ch)}x{int(_cw)}{_blur_sfx}"
+            depth_key = f"{_key_base}_{int(_ch)}x{int(_cw)}{_blur_sfx}{_extra_sfx}"
         else:
-            depth_key = f"{_key_base}{_blur_sfx}"
+            depth_key = f"{_key_base}{_blur_sfx}{_extra_sfx}"
 
         if os.path.exists(cache_path):
             # Header-only hit check — record where to read from and defer the
@@ -615,14 +644,14 @@ def cache_depth_gt_embeddings(
 
 
 def load_taehv_wan21(device: str = "cuda", dtype: torch.dtype = torch.bfloat16):
-    """Load TAEHV (tiny autoencoder) pretrained for Wan 2.1 latents.
+    """Load TAEHV (tiny autoencoder) pretrained for Wan 2.1 / Qwen latents.
 
     11M-param decoder — decodes 100+ frames with gradients in ~10 GB peak
     (vs ~20 GB+ for the full Wan 3D VAE). Output is [0, 1] directly
     (no latents_mean/std denormalization needed).
 
-    Weights (``taew2_1.pth``) live at ``toolkit/taehv/taew2_1.pth``; they
-    are gitignored and must be placed there manually.
+    Weights (``taew2_1.pth``) live at ``toolkit/taehv/taew2_1.pth`` and are
+    auto-downloaded if missing (they are gitignored).
     """
     import sys
     _here = os.path.dirname(os.path.abspath(__file__))
@@ -632,10 +661,10 @@ def load_taehv_wan21(device: str = "cuda", dtype: torch.dtype = torch.bfloat16):
     from taehv import TAEHV  # noqa: E402
     ckpt = os.path.join(_taehv_dir, "taew2_1.pth")
     if not os.path.exists(ckpt):
-        raise FileNotFoundError(
-            f"TAEHV checkpoint not found at {ckpt}. "
-            "Download taew2_1.pth and place it there before training."
-        )
+        import urllib.request
+        url = "https://raw.githubusercontent.com/madebyollin/taehv/main/taew2_1.pth"
+        print(f"DepthConsistency: downloading Wan/Qwen tiny decoder taew2_1.pth from {url} ...")
+        urllib.request.urlretrieve(url, ckpt)
     tae = TAEHV(checkpoint_path=ckpt).to(device).to(dtype).eval()
     for p in tae.parameters():
         p.requires_grad_(False)
@@ -724,6 +753,9 @@ def cache_video_depth_gt_embeddings(
     device: Optional[torch.device] = None,
     num_frames: Optional[int] = None,
     batch_size: int = 4,
+    decode_file_fn=None,
+    cache_namespace: str = "",
+    include_images: bool = False,
 ) -> None:
     """Extract and cache per-frame GT depth maps for video file items.
 
@@ -739,13 +771,18 @@ def cache_video_depth_gt_embeddings(
             before caching. Must match the training ``num_frames`` so the
             cached T lines up with the decoded x0 T at training time.
         batch_size: frames per DA2 forward pass during caching.
+        decode_file_fn: optional native-codec callback returning TCHW [0,1].
+        cache_namespace: codec version, isolates decoded GT from raw/tiny GT.
+        include_images: cache stills as one-frame clips for 5D-latent models.
     """
     from toolkit.video_frames import read_video_frames_with_transform
 
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    video_items = [f for f in file_items if getattr(f, "is_video", False)]
+    if decode_file_fn is not None and not cache_namespace:
+        raise ValueError('Native depth decoding requires a cache_namespace')
+    video_items = [f for f in file_items if include_images or getattr(f, "is_video", False)]
     if not video_items:
         return
 
@@ -768,6 +805,13 @@ def cache_video_depth_gt_embeddings(
         vid_dir = os.path.dirname(file_item.path)
         cache_dir = os.path.join(vid_dir, "_face_id_cache")
         stem = os.path.splitext(os.path.basename(file_item.path))[0]
+        if cache_namespace:
+            from toolkit.perceptor_utils import perceptor_cache_suffix
+            suffix = perceptor_cache_suffix(
+                file_item, cache_namespace, model=config.model_id,
+                input_size=config.input_size, blur=_pix_blur_sigma, num_frames=num_frames,
+            )
+            stem = f'{stem}.depth-{suffix}'
         cache_path = os.path.join(cache_dir, f"{stem}.safetensors")
 
         # Cache hit: reuse if version matches AND cached T == requested T.
@@ -778,7 +822,7 @@ def cache_video_depth_gt_embeddings(
                 cache_path, video_depth_key, CACHE_VERSION_VIDEO_KEY
             )
             if _shape is not None and (
-                num_frames is None or _shape[0] == num_frames
+                decode_file_fn is not None or num_frames is None or _shape[0] == num_frames
             ):
                 file_item.depth_gt_video = None
                 file_item._depth_video_cache_path = cache_path
@@ -789,7 +833,9 @@ def cache_video_depth_gt_embeddings(
         # Read + transform frames exactly as the dataloader does (flip → resize
         # → crop), uniformly subsampled to num_frames so cached T matches the
         # decoded x0 T at training time.
-        video_tensor = read_video_frames_with_transform(file_item, num_frames)
+        with torch.no_grad():
+            video_tensor = (decode_file_fn(file_item) if decode_file_fn is not None
+                            else read_video_frames_with_transform(file_item, num_frames))
         if video_tensor is None:
             print(f"  -  Warning: cannot read video frames: {file_item.path}")
             continue

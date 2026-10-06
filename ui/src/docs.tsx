@@ -52,6 +52,16 @@ const docs: { [key: string]: ConfigDoc } = {
       </>
     ),
   },
+  'config.process[0].model.merge_loras': {
+    title: 'Base LoRA Merges',
+    description: (
+      <>
+        LoRAs listed here are merged into the base model before training starts. The trained LoRA is therefore relative
+        to the merged base, not the original checkpoint. Keep the same base LoRAs available for inference unless you
+        save or deploy a fully merged model.
+      </>
+    ),
+  },
   'datasets.control_path': {
     title: 'Control Dataset',
     description: (
@@ -847,6 +857,60 @@ const docs: { [key: string]: ConfigDoc } = {
         Trades a small amount of compute for a large VRAM reduction during backward through DA2. Keep this
         on unless you have verified extra VRAM to spare — roughly 3× activation memory savings at a ~20–30%
         fwd+bwd time cost on the perceptor.
+      </>
+    ),
+  },
+  'datasets.auto_frame_count': {
+    title: 'Auto Frame Count',
+    description: (
+      <>
+        This will automatically determine the number of frames to use for each video in your dataset instead of relying
+        on a fixed num_frames. This allows you to include videos of different lengths in the dataset, and each video
+        will be processed without speeding up or slowing down. Be careful about adding long videos into your dataset, as
+        they use up more VRAM. This currently will not work with a batch size greater than 1.
+      </>
+    ),
+  },
+  'model.model_kwargs.instruction': {
+    title: 'LLM Prompt',
+    description: (
+      <>
+        The instruction the model is asked for every training item, as the user turn of the chat. The item's caption
+        file is the answer it learns to give. Use the same wording when running the trained LoRA, and it is also what
+        samples use when their own prompt is left blank.
+      </>
+    ),
+  },
+  'model.model_kwargs.kv_cache': {
+    title: 'KV Cache',
+    description: (
+      <>
+        This will enable KV Cache for control images in a model that supports it. LoRAs trained with this on need to
+        also be inferenced with it, and vice versa. This does not speed up or slow down training, but on inference, the
+        control images only need to be processed once for the entire generation, vs being processed for every step.
+        Which leads to a significant speedup on inference.
+      </>
+    ),
+  },
+  'train.guidance_loss_target': {
+    title: 'Guidance Loss Target',
+    description: <>For contrastive guidance loss, this is the target CGF to amplify predictions to.</>,
+  },
+  'datasets.caption_dropout_rate': {
+    title: 'Caption Dropout Rate',
+    description: (
+      <>
+        Caption dropout rate is the probability that the caption for an image will be dropped (replaced with a blank
+        caption) for any given training step. For example, a value of 0.05 will drop the caption around 5% of the time.
+        Dropping captions helps the model learn the concept being trained without relying entirely on the caption, and
+        helps preserve the model&apos;s ability to generate without a prompt. If a trigger word is set, the trigger word
+        is still used when the caption is dropped, so the model still associates the dropped samples with your trigger
+        word. Regularization images, or images without a trigger word, drop to a fully blank caption.
+        <br />
+        <br />
+        Caption dropout also works when caching text embeddings. An additional embedding for the dropout caption (blank,
+        or the trigger word alone) is cached to disk alongside the normal one, and it is randomly swapped in at train
+        time at this rate.
       </>
     ),
   },

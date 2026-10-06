@@ -70,11 +70,11 @@ def test_global_config_unchanged():
     """FaceIDConfig global defaults are correct and unchanged."""
     from toolkit.config_modules import FaceIDConfig
     g = FaceIDConfig()
-    assert g.identity_loss_min_t == 0.6
-    assert g.identity_loss_max_t == 0.9
+    assert g.identity_loss_min_t == 0.0
+    assert g.identity_loss_max_t == 1.0
     assert g.identity_loss_min_cos == 0.2
-    assert g.body_proportion_loss_min_t == 0.4
-    assert g.body_proportion_loss_max_t == 0.8
+    assert g.body_proportion_loss_min_t == 0.0
+    assert g.body_proportion_loss_max_t == 1.0
     assert g.body_shape_loss_min_t == 0.4
     assert g.body_shape_loss_max_t == 0.8
     assert g.body_shape_loss_min_cos == 0.2

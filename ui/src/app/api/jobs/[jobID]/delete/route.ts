@@ -1,12 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { PrismaClient } from '@prisma/client';
+import prisma from '@/server/prisma';
 import { getTrainingFolder } from '@/server/settings';
 import path from 'path';
 import fs from 'fs';
 
-const prisma = new PrismaClient();
-
-export async function GET(request: NextRequest, { params }: { params: { jobID: string } }) {
+export async function GET(request: NextRequest, { params }: { params: Promise<{ jobID: string }> }) {
   const { jobID } = await params;
 
   const job = await prisma.job.findUnique({
@@ -20,9 +18,8 @@ export async function GET(request: NextRequest, { params }: { params: { jobID: s
   const trainingRoot = await getTrainingFolder();
   const trainingFolder = path.join(trainingRoot, job.name);
 
-  if (fs.existsSync(trainingFolder)) {
-    fs.rmSync(trainingFolder, { recursive: true, force: true });
-  }
+  // force:true makes this a no-op if the folder is already gone
+  await fs.promises.rm(trainingFolder, { recursive: true, force: true });
 
   await prisma.job.delete({
     where: { id: jobID },

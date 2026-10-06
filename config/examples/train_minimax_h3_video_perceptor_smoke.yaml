@@ -1,0 +1,95 @@
+# End-to-end depth + ArcFace smoke on the standard dance clip; 5 decoded frames.
+# Local ComfyUI paths below avoid re-downloading the large checkpoints.
+# Run: SEED=42 python run.py config/examples/train_minimax_h3_video_perceptor_smoke.yaml
+job: extension
+config:
+  name: minimax_h3_video_perceptor_smoke
+  process:
+    - type: sd_trainer
+      training_folder: output
+      device: cuda:0
+      network:
+        type: lora
+        linear: 4
+        linear_alpha: 4
+      save:
+        dtype: float16
+        save_every: 100
+        max_step_saves_to_keep: 2
+      logging:
+        log_every: 1
+        use_ui_logger: true
+      datasets:
+        - folder_path: test_data/minimax_video_smoke
+          default_caption: a person dancing
+          caption_dropout_rate: 0.0
+          cache_latents_to_disk: true
+          resolution: [384]
+          num_frames: 5
+          shrink_video_to_frames: true
+          fps: 16
+          do_i2v: false
+          do_audio: false
+      train:
+        batch_size: 1
+        steps: 3
+        gradient_accumulation: 1
+        gradient_checkpointing: true
+        noise_scheduler: flowmatch
+        timestep_type: linear
+        min_denoising_steps: 600
+        max_denoising_steps: 850
+        optimizer: adamw8bit
+        lr: 0.0001
+        dtype: bf16
+        cache_text_embeddings: true
+        disable_sampling: true
+        gradient_cosine_log_every: 1
+        loss_split: null
+      model:
+        name_or_path: MiniMaxAI/MiniMax-H3
+        arch: minimax_h3
+        quantize: true
+        qtype: convrot8
+        quantize_te: true
+        qtype_te: nvfp4
+        low_vram: true
+        layer_offloading: true
+        layer_offloading_transformer_percent: 0.9
+        layer_offloading_text_encoder_percent: 1.0
+        model_kwargs:
+          max_text_length: 128
+          dit_fl2va_pruned_path: /home/z/storage/ComfyUI/models/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors
+          text_encoder_path: /home/z/storage/ComfyUI/models/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors
+          video_vae_path: /home/z/storage/ComfyUI/models/vae/minimax_h3_video_vae_fp16.safetensors
+          audio_vae_path: /home/z/storage/ComfyUI/models/vae/minimax_h3_audio_vae_fp32.safetensors
+      face_id:
+        enabled: false
+        identity_loss_weight: 0.1
+        identity_loss_min_t: 0.0
+        identity_loss_max_t: 1.0
+        identity_loss_min_cos: 0.0
+        identity_loss_use_average: false
+        identity_loss_frames_per_chunk: 1
+        identity_loss_preview_every: 1
+      depth_consistency:
+        loss_weight: 0.05
+        loss_min_t: 0.0
+        loss_max_t: 1.0
+        model_id: depth-anything/Depth-Anything-V2-Small-hf
+        input_size: 252
+        mask_source: none
+        grad_checkpoint: true
+        frames_per_chunk: 1
+        preview_every: 1
+        preview_min_t: 0.0
+      sample:
+        sample_every: 10000
+        sampler: flowmatch
+        width: 384
+        height: 384
+        num_frames: 5
+        prompts: [a person dancing]
+meta:
+  name: '[name]'
+  version: '1.0'

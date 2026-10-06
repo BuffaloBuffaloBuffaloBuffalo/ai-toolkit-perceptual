@@ -1,0 +1,82 @@
+# End-to-end smoke, not a quality recipe. Uses the standard scarlett_full data.
+# Run from the repository root: SEED=42 python run.py config/examples/train_krea2_perceptor_smoke.yaml
+job: extension
+config:
+  name: krea2_perceptor_smoke
+  process:
+    - type: sd_trainer
+      training_folder: output
+      device: cuda:0
+      network:
+        type: lora
+        linear: 4
+        linear_alpha: 4
+      save:
+        dtype: float16
+        save_every: 4
+        max_step_saves_to_keep: 2
+      logging:
+        log_every: 1
+        use_ui_logger: true
+      datasets:
+        - folder_path: test_data/scarlett_full
+          default_caption: a photograph of a woman
+          caption_dropout_rate: 0.0
+          cache_latents_to_disk: true
+          resolution: [384]
+          num_frames: 1
+      train:
+        batch_size: 1
+        steps: 8
+        gradient_accumulation: 1
+        gradient_checkpointing: true
+        noise_scheduler: flowmatch
+        timestep_type: linear
+        min_denoising_steps: 150
+        max_denoising_steps: 450
+        optimizer: adamw8bit
+        lr: 0.0001
+        dtype: bf16
+        cache_text_embeddings: true
+        disable_sampling: true
+        gradient_cosine_log_every: 1
+      model:
+        name_or_path: krea/Krea-2-Raw
+        arch: krea2
+        quantize: true
+        qtype: qfloat8
+        quantize_te: true
+        qtype_te: qfloat8
+        low_vram: true
+        layer_offloading: true
+        layer_offloading_transformer_percent: 0.7
+        layer_offloading_text_encoder_percent: 1.0
+        model_kwargs:
+          max_text_length: 128
+      face_id:
+        enabled: false
+        identity_loss_weight: 0.1
+        identity_loss_min_t: 0.0
+        identity_loss_max_t: 1.0
+        identity_loss_min_cos: 0.0
+        identity_loss_use_average: false
+        identity_loss_preview_every: 1
+      depth_consistency:
+        loss_weight: 0.05
+        loss_min_t: 0.0
+        loss_max_t: 1.0
+        model_id: depth-anything/Depth-Anything-V2-Small-hf
+        input_size: 252
+        mask_source: none
+        grad_checkpoint: true
+        preview_every: 1
+        preview_min_t: 0.0
+      sample:
+        sample_every: 10000
+        sampler: flowmatch
+        width: 384
+        height: 384
+        prompts: [a photograph of a woman]
+meta:
+  name: '[name]'
+  version: '1.0'

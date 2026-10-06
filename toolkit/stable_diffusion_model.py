@@ -42,7 +42,7 @@ from toolkit.train_tools import get_torch_dtype, apply_noise_offset
 from einops import rearrange, repeat
 import torch
 from toolkit.pipelines import CustomStableDiffusionXLPipeline, CustomStableDiffusionPipeline, \
-    StableDiffusionKDiffusionXLPipeline, StableDiffusionXLRefinerPipeline, FluxWithCFGPipeline, \
+    StableDiffusionXLRefinerPipeline, FluxWithCFGPipeline, \
     FluxAdvancedControlPipeline
 from diffusers import StableDiffusionPipeline, StableDiffusionXLPipeline, T2IAdapter, DDPMScheduler, \
     StableDiffusionXLAdapterPipeline, StableDiffusionAdapterPipeline, DiffusionPipeline, PixArtTransformer2DModel, \
@@ -70,6 +70,7 @@ from typing import TYPE_CHECKING
 from toolkit.print import print_acc
 from diffusers import FluxFillPipeline
 from transformers import AutoModel, AutoTokenizer, Gemma2Model, Qwen2Model, LlamaModel
+from toolkit.basic import flush
 
 if TYPE_CHECKING:
     from toolkit.lora_special import LoRASpecialNetwork
@@ -100,6 +101,46 @@ DO_NOT_TRAIN_WEIGHTS = [
 DeviceStatePreset = Literal['cache_latents', 'generate']
 
 
+# diffusers-class name -> v2 wrapper for the legacy archs' components. The
+# adoption is an in-place class swap, so pipeline-held references stay valid.
+_V2_ADOPTION_MAP = {
+    "UNet2DConditionModel": ("toolkit.models.v2.diffusion_models.unet", "UNet2DConditionModel"),
+    "AutoencoderKL": ("toolkit.models.v2.vae.autoencoder_kl", "KLVAE"),
+    "CLIPTextModel": ("toolkit.models.v2.text_encoders.clip", "CLIPTextEncoder"),
+    "CLIPTextModelWithProjection": ("toolkit.models.v2.text_encoders.clip", "CLIPTextEncoderWithProjection"),
+    "T5EncoderModel": ("toolkit.models.v2.text_encoders.t5", "T5TextEncoder"),
+    "UMT5EncoderModel": ("toolkit.models.v2.text_encoders.umt5", "UMT5TextEncoder"),
+    "SD3Transformer2DModel": ("toolkit.models.v2.diffusion_models.sd3", "SD3Transformer2DModel"),
+    "PixArtTransformer2DModel": ("toolkit.models.v2.diffusion_models.pixart", "PixArtTransformer2DModel"),
+    "Transformer2DModel": ("toolkit.models.v2.diffusion_models.pixart", "Transformer2DModel"),
+    "AuraFlowTransformer2DModel": ("toolkit.models.v2.diffusion_models.auraflow", "AuraFlowTransformer2DModel"),
+    "FluxTransformer2DModel": ("toolkit.models.v2.diffusion_models.flux", "FluxTransformer2DModel"),
+    "Lumina2Transformer2DModel": ("toolkit.models.v2.diffusion_models.lumina2", "Lumina2Transformer2DModel"),
+    "Gemma2Model": ("toolkit.models.v2.text_encoders.gemma2", "Gemma2ModelEncoder"),
+}
+
+
+def _adopt_v2(module):
+    """Rebind a loaded legacy component onto its v2 wrapper class so every
+    resident component is an OstrisModelMixin instance the inference engine
+    can pool and hot-swap. No-op for unknown or already-adopted classes."""
+    import importlib
+
+    from toolkit.models.v2._mixin import OstrisModelMixin, adopt_component
+
+    if module is None or isinstance(module, OstrisModelMixin):
+        return module
+    entry = _V2_ADOPTION_MAP.get(type(module).__name__)
+    if entry is None:
+        return module
+    try:
+        wrapper = getattr(importlib.import_module(entry[0]), entry[1])
+        return adopt_component(module, wrapper)
+    except (ImportError, TypeError):
+        return module
+
+
+
 class BlankNetwork:
 
     def __init__(self):
@@ -116,11 +157,6 @@ class BlankNetwork:
     
     def train(self):
         pass
-
-
-def flush():
-    torch.cuda.empty_cache()
-    gc.collect()
 
 
 UNET_IN_CHANNELS = 4  # Stable Diffusion の in_channels は 4 で固定。XLも同じ。
@@ -155,6 +191,8 @@ class StableDiffusion:
         self.te_torch_dtype = get_torch_dtype(model_config.te_dtype)
 
         self.model_config = model_config
+        # inference engine: hook(step_index, num_steps, latents) per scheduler step
+        self.sample_step_hook = None
         self.prediction_type = "v_prediction" if self.model_config.is_v_pred else "epsilon"
         self.arch = model_config.arch
 
@@ -219,6 +257,15 @@ class StableDiffusion:
         
         # set true for models that encode control image into text embeddings
         self.encode_control_in_text_embeddings = False
+        # control files may be VIDEOS (paths exposed on the batch as
+        # control_video_paths_list); see minimax_h3 ref2va
+        self.supports_video_control_images = False
+        # D-OPSD: cache per-item teacher text embeds (item's own media as reference 1)
+        self.dopsd_self_ref = False
+        # weight of the normal-target loss added alongside the D-OPSD teacher loss
+        self.dopsd_bleed_strength = 1.0
+        # forces cache_tensors_to_disk on latent-caching datasets (BaseSDTrainProcess)
+        self.require_pixel_tensor_cache = False
         # control images will come in as a list for encoding some things if true
         self.has_multiple_control_images = False
         # do not resize control images
@@ -233,6 +280,15 @@ class StableDiffusion:
         # some llms need left side padding, others need right side
         self.te_padding_side = "right"
         
+        # can be used on models to invalidate cache if things change.
+        self.latent_space_version = None
+        
+        # if a mask is passed, do the loss with the mask. May be set false for models that use a mask for other reasons.
+        self.do_masked_loss = True
+        
+        # if the model outputs an x0 prediction (clean latent)
+        self.x0_pred = False
+        
     # properties for old arch for backwards compatibility
     @property
     def is_xl(self):
@@ -245,6 +301,11 @@ class StableDiffusion:
     @property
     def is_ssd(self):
         return self.arch == 'ssd'
+
+    @property
+    def load_rgba(self) -> bool:
+        # no legacy arch has an RGBA VAE
+        return False
     
     @property
     def is_v3(self):
@@ -271,6 +332,32 @@ class StableDiffusion:
         return self.arch == 'lumina2'
     
     @property
+    def text_embedding_space_version(self):
+        return self.arch
+
+    def get_latent_space_version(self) -> str:
+        """Latent cache key. Override to invalidate caches when model_kwargs change what gets cached."""
+        if self.model_config.latent_space_version is not None:
+            return self.model_config.latent_space_version
+        if self.latent_space_version is not None:
+            return self.latent_space_version
+        if self.is_xl:
+            return 'sdxl'
+        if self.is_v3:
+            return 'sd3'
+        if self.is_auraflow:
+            return 'sdxl'
+        if self.is_flux:
+            return 'flux1'
+        if self.model_config.is_pixart_sigma:
+            return 'sdxl'
+        return self.model_config.arch
+
+    def get_text_embedding_space_version(self) -> str:
+        """Text embedding cache key. Override like get_latent_space_version."""
+        return self.text_embedding_space_version
+    
+    @property
     def unet_unwrapped(self):
         return unwrap_model(self.unet)
     
@@ -283,7 +370,20 @@ class StableDiffusion:
         if self.is_flux or self.is_v3:
             divisibility = divisibility * 2
         return divisibility * 2 # todo remove this
-        
+
+    def get_frame_count_snapper(self):
+        """Optional hook for video models whose VAE accepts frame counts on a
+        grid other than the default ``temporal_compression * n + 1``. Return a
+        MODULE-LEVEL function ``(num_frames) -> int`` (picklable — file items
+        travel into dataloader workers) that snaps a frame count DOWN to a
+        valid count, or None for the default auto_frame_count math."""
+        return None
+
+    def prepare_sample_prompt_context(self, gen_config):
+        """Optional hook called right before a sample prompt is encoded, with
+        the sample's GenerateImageConfig, for models whose control conditioning
+        in the text embeds depends on sample settings."""
+        return None
 
     def load_model(self):
         if self.is_loaded:
@@ -1019,6 +1119,16 @@ class StableDiffusion:
         self.unet.requires_grad_(False)
         self.unet.eval()
 
+        # every resident component joins the v2 mixin system (in-place class
+        # adoption for components the pipeline loaders built directly)
+        _adopt_v2(self.unet)
+        _adopt_v2(self.vae)
+        if isinstance(text_encoder, list):
+            for te in text_encoder:
+                _adopt_v2(te)
+        elif text_encoder is not None:
+            _adopt_v2(text_encoder)
+
         # load any loras we have
         if self.model_config.lora_path is not None and not self.is_flux and not self.is_lumina2:
             pipe.load_lora_weights(self.model_config.lora_path, adapter_name="lora1")
@@ -1203,10 +1313,7 @@ class StableDiffusion:
                 except:
                     pass
 
-            if sampler.startswith("sample_") and self.is_xl:
-                # using kdiffusion
-                Pipe = StableDiffusionKDiffusionXLPipeline
-            elif self.is_xl:
+            if self.is_xl:
                 Pipe = StableDiffusionXLPipeline
             elif self.is_v3:
                 Pipe = StableDiffusion3Pipeline
@@ -1339,8 +1446,9 @@ class StableDiffusion:
             # disable progress bar
             pipeline.set_progress_bar_config(disable=True)
 
-            if sampler.startswith("sample_"):
-                pipeline.set_scheduler(sampler)
+        from toolkit.sample_step_hook import install_sample_step_hooks
+
+        unwrap_step_hooks = install_sample_step_hooks(self, pipeline)
 
         refiner_pipeline = None
         if self.refiner_unet:
@@ -1420,6 +1528,7 @@ class StableDiffusion:
 
                     if network is not None:
                         network.multiplier = gen_config.network_multiplier
+                    self._sample_step_index = 0
                     torch.manual_seed(gen_config.seed)
                     torch.cuda.manual_seed(gen_config.seed)
                     
@@ -1709,7 +1818,7 @@ class StableDiffusion:
                             generator=generator,
                         ).images[0]
 
-                    gen_config.save_image(img, i)
+                    gen_config.save_image_atomic(img, i)
                     gen_config.log_image(img, i)
                     self._after_sample_image(i, len(image_configs))
                     flush()
@@ -1717,6 +1826,7 @@ class StableDiffusion:
                 if self.adapter is not None and isinstance(self.adapter, ReferenceAdapter):
                     self.adapter.clear_memory()
 
+        unwrap_step_hooks()
         # clear pipeline and cache to reduce vram usage
         del pipeline
         if refiner_pipeline is not None:
@@ -2375,6 +2485,7 @@ class StableDiffusion:
             max_length=None,
             dropout_prob=0.0,
             control_images=None,
+            target_size=None,  # accepted for parity with BaseModel; legacy archs ignore it
     ) -> PromptEmbeds:
         # sd1.5 embeddings are (bs, 77, 768)
         prompt = prompt
@@ -3132,6 +3243,12 @@ class StableDiffusion:
         # override in child classes to get transformer block names for lora targeting
         return None
     
+    def get_quantization_exclude_modules(self) -> Optional[List[str]]:
+        # override in child classes to keep sensitive modules in full precision when
+        # quantizing. Returns fnmatch patterns matched against the transformer's module
+        # names (e.g. "model.x_embedder*").
+        return None
+    
     def get_base_model_version(self) -> str:
         if self.is_pixart:
             return 'pixart'
@@ -3155,3 +3272,7 @@ class StableDiffusion:
 
     def get_model_to_train(self):
         return self.unet
+        
+    def scale_loss(self, loss):
+        # called to get the loss scaler for the model. Can be overridden in child classes
+        return loss

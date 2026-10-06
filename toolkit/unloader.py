@@ -1,5 +1,5 @@
 import torch
-from toolkit.basic import flush
+from toolkit.memory_management import MemoryManager
 from typing import TYPE_CHECKING
 
 
@@ -61,33 +61,50 @@ def unload_text_encoder(model: "BaseModel"):
 
     if model.text_encoder is not None:
         if isinstance(model.text_encoder, list):
-            text_encoder_list = []
             pipe = model.pipeline
+            freed = set()
+
+            def _free(te):
+                if te is None or isinstance(te, FakeTextEncoder) or id(te) in freed:
+                    return
+                MemoryManager.free(te)
+                freed.add(id(te))
+
+            def _new_fake(real_encoder=None):
+                return FakeTextEncoder(
+                    device=model.device_torch, dtype=model.torch_dtype,
+                    real_encoder=real_encoder,
+                )
+
+            # model.text_encoder is the source of truth; some pipelines (self-referencing
+            # or built with text_encoder=None) never expose the TE as an attribute
+            for real_te in model.text_encoder:
+                _free(real_te)
+            fakes = [_new_fake(te) for te in model.text_encoder]
+            model.text_encoder = fakes
+
+            def _fake(idx):
+                return fakes[idx] if idx < len(fakes) else _new_fake()
 
             # the pipeline stores text encoders like text_encoder, text_encoder_2, text_encoder_3, etc.
-            if hasattr(pipe, "text_encoder"):
-                real_te = pipe.text_encoder
-                te = FakeTextEncoder(device=model.device_torch, dtype=model.torch_dtype, real_encoder=real_te)
-                text_encoder_list.append(te)
-                real_te.to('cpu')
-                del real_te
-                pipe.text_encoder = te
+            if getattr(pipe, "text_encoder", None) is not None:
+                _free(pipe.text_encoder)
+                pipe.text_encoder = _fake(0)
 
             i = 2
             while hasattr(pipe, f"text_encoder_{i}"):
                 real_te = getattr(pipe, f"text_encoder_{i}")
-                te = FakeTextEncoder(device=model.device_torch, dtype=model.torch_dtype, real_encoder=real_te)
-                text_encoder_list.append(te)
-                real_te.to('cpu')
-                del real_te
-                setattr(pipe, f"text_encoder_{i}", te)
+                if real_te is not None:
+                    _free(real_te)
+                    setattr(pipe, f"text_encoder_{i}", _fake(i - 1))
                 i += 1
-            model.text_encoder = text_encoder_list
         else:
             # only has a single text encoder
+            MemoryManager.free(model.text_encoder)
             model.text_encoder = FakeTextEncoder(
-                device=model.device_torch, dtype=model.torch_dtype,
+                device=model.device_torch,
+                dtype=model.torch_dtype,
                 real_encoder=model.text_encoder,
             )
 
-    flush()
+    MemoryManager.release_cached_memory()

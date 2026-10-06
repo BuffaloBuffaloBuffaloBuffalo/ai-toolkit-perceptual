@@ -2,6 +2,7 @@
 
 import { useEffect, useState, useRef, useCallback, useMemo } from 'react';
 import { apiClient } from '@/utils/api';
+import usePollLoop from '@/hooks/usePollLoop';
 
 // =====================================================================
 // Step 4: legacy-to-canonical rename map.
@@ -177,11 +178,6 @@ export interface LossPoint {
 
 type SeriesMap = Record<string, LossPoint[]>;
 
-function isGraphableKey(key: string) {
-  // treat anything containing "loss", "grad_norm", or "face_token_norm" as a graphable series
-  return /loss|grad_norm|weight_norm|face_token_norm|txt_token_norm|vision_token_norm|body_token_norm|timestep|id_sim|id_clean|shape_sim|bp_sim|bsh_sim|body_shape_cos|body_shape_l1|body_shape_gated|normal_cos|normal_loss|pure_noise|va_level|va_mid|va_edge|fisher|noise_snr|noise_norm/i.test(key);
-}
-
 export default function useJobLossLog(jobID: string, reloadInterval: null | number = null) {
   const [series, setSeries] = useState<SeriesMap>({});
   const [keys, setKeys] = useState<string[]>([]);
@@ -194,10 +190,10 @@ export default function useJobLossLog(jobID: string, reloadInterval: null | numb
   const lastStepByKeyRef = useRef<Record<string, number | null>>({});
 
   const lossKeys = useMemo(() => {
-    const base = (keys ?? []).filter(isGraphableKey);
+    const base = keys ?? [];
     // if keys table is empty early on, fall back to just "loss"
     if (base.length === 0) return ['loss'];
-    return base.sort();
+    return [...base].sort();
   }, [keys]);
 
   const refreshLoss = useCallback(async () => {
@@ -219,7 +215,7 @@ export default function useJobLossLog(jobID: string, reloadInterval: null | numb
       const newKeys = first.keys ?? [];
       setKeys(newKeys);
 
-      const wantedLossKeys = (newKeys.filter(isGraphableKey).length ? newKeys.filter(isGraphableKey) : ['loss']).sort();
+      const wantedLossKeys = (newKeys.length ? [...newKeys] : ['loss']).sort();
 
       // Step 2: fetch each loss key incrementally (since_step per key if polling)
       const requests = wantedLossKeys.map(k => {
@@ -265,9 +261,9 @@ export default function useJobLossLog(jobID: string, reloadInterval: null | numb
             : (lastStepByKeyRef.current[k] ?? null);
         }
 
-        // remove stale loss keys that no longer exist (rare, but keeps UI clean)
+        // remove stale keys that no longer exist (rare, but keeps UI clean)
         for (const existingKey of Object.keys(next)) {
-          if (isGraphableKey(existingKey) && !wantedLossKeys.includes(existingKey)) {
+          if (!wantedLossKeys.includes(existingKey)) {
             delete next[existingKey];
             delete lastStepByKeyRef.current[existingKey];
           }
@@ -286,26 +282,40 @@ export default function useJobLossLog(jobID: string, reloadInterval: null | numb
     }
   }, [jobID, reloadInterval]);
 
+  // Delete every logged step in [minStep, maxStep] from the on-disk log, then
+  // drop those points locally so the chart updates without a full reload.
+  const deleteRange = useCallback(
+    async (minStep: number, maxStep: number) => {
+      if (!jobID) return;
+      await apiClient.delete(`/api/jobs/${jobID}/loss`, { data: { min_step: minStep, max_step: maxStep } });
+      setSeries(prev => {
+        const next: SeriesMap = {};
+        for (const k of Object.keys(prev)) {
+          const kept = prev[k].filter(p => p.step < minStep || p.step > maxStep);
+          next[k] = kept;
+          // Re-anchor incremental polling to the new tail so a deleted tail
+          // isn't treated as already-fetched.
+          lastStepByKeyRef.current[k] = kept.length ? kept[kept.length - 1].step : null;
+        }
+        return next;
+      });
+    },
+    [jobID],
+  );
+
+  // reset when job changes. Declared before the poll loop so the reset runs
+  // before the first fetch when jobID changes.
   useEffect(() => {
-    // reset when job changes
     didInitialLoadRef.current = false;
     lastStepByKeyRef.current = {};
     setSeries({});
     setKeys([]);
     setStatus('idle');
+  }, [jobID]);
 
-    refreshLoss();
+  usePollLoop(refreshLoss, reloadInterval, [jobID]);
 
-    if (reloadInterval) {
-      const interval = setInterval(() => {
-        refreshLoss();
-      }, reloadInterval);
-
-      return () => clearInterval(interval);
-    }
-  }, [jobID, reloadInterval, refreshLoss]);
-
-  return { series, keys, lossKeys, status, refreshLoss, setSeries };
+  return { series, keys, lossKeys, status, refreshLoss, deleteRange, setSeries };
 }
 
 // =====================================================================

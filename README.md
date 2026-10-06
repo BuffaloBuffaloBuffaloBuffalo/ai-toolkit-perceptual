@@ -31,16 +31,24 @@ These can be used independently or together. Weight noising is the bigger practi
 
 ## Supported and Experimental Models
 
-The model dropdown in the web UI is split into two groups, and the same split applies when you train from a config file.
+The training dropdown separates models with established perceptual-anchor recipes from experimental/upstream models. All upstream architectures remain selectable; this grouping does not change their image, video, audio, or LLM behavior. Availability in the toolkit is not a claim that every custom perceptual loss works with every architecture.
 
 **Supported:** SDXL, FLUX.2 Klein 9B, and Z-Image Turbo. These are known to work well with both weight noising and perceptual anchors, so they're the safest place to start. FLUX.2 Klein 9B and Z-Image Turbo each have a ready-made [Quickstart Template](#quickstart-templates) you can apply in one click.
 
-**Experimental:** everything else in the selector, including Chroma 1 Base, Chroma 1 HD, Chroma Radiance, Z-Image (base), and LTX-2.3, plus the other architectures you can load from a config. These may work, but they haven't had enough testing to call them validated. When you train one:
+**Experimental:** everything else in the selector, including Chroma 1 Base, Chroma 1 HD, Chroma Radiance, Krea 2, Z-Image (base), and LTX-2.3, plus the other architectures you can load from a config. These may work, but they haven't had enough testing to call them validated. When you train one:
 
 - Start from values close to the [Quickstart Templates](#quickstart-templates) and tweak from there.
 - Turn on weight noising first, before you add a perceptual anchor. Weight noising is generally safe and improves results in most cases. Perceptual anchors are stronger but can destabilize training if the strength is wrong, so add one only after the plain weight-noise run looks healthy.
 
 If you get an experimental model working well, please [open an issue](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/issues) with your config and samples so we can move it into the supported set.
+
+### Upstream synchronization
+
+This branch incorporates upstream `ecee894ed2b1f3716d9d7326693061ec1a3105bb` (2026-09-27), including the v2 model loaders and quantization/offload infrastructure, newer image/video/audio/LLM architectures, extension-defined model controls, generation UI, fixed-set training validation, captioners, and the environment manager. Custom perceptual losses, per-dataset overrides, weight/gradient noising, base-LoRA merges, metrics, and dataset tools are retained.
+
+Krea2 depth and ArcFace identity use the compatible TAEW2.1 decoder. MiniMax H3 uses its native differentiable video VAE: its normalized 24-channel latents are **not** compatible with the Wan tiny decoder. H3 ground-truth depth and identity are computed from the same cached training latents, and its target caches are isolated by codec, crop, flip, frame selection, and perceptor settings. H3 body-proportion loss is not supported by this path.
+
+Both Krea2 Raw and MiniMax H3 FL2VA passed real eight-step LoRA runs on the standard test images with active depth and identity losses, nonzero gradients, and saved checkpoints. See the [validation record and reproducible configs](docs/upstream-sync-validation.md). These smoke tests establish execution and gradient flow, not convergence or a recommended quality recipe.
 
 ## Perceptual Anchoring
 
@@ -637,12 +645,86 @@ This extension is based on [AI Toolkit](https://github.com/ostris/ai-toolkit), a
 
 
 
+## Supported Models
+
+### Image
+- [black-forest-labs/FLUX.1-dev](https://huggingface.co/black-forest-labs/FLUX.1-dev) (FLUX.1)
+- [black-forest-labs/FLUX.2-dev](https://huggingface.co/black-forest-labs/FLUX.2-dev) (FLUX.2)
+- [black-forest-labs/FLUX.2-klein-base-4B](https://huggingface.co/black-forest-labs/FLUX.2-klein-base-4B) (FLUX.2-klein-base-4B)
+- [black-forest-labs/FLUX.2-klein-base-9B](https://huggingface.co/black-forest-labs/FLUX.2-klein-base-9B) (FLUX.2-klein-base-9B)
+- [ostris/Flex.1-alpha](https://huggingface.co/ostris/Flex.1-alpha) (Flex.1)
+- [ostris/Flex.2-preview](https://huggingface.co/ostris/Flex.2-preview) (Flex.2)
+- [lodestones/Chroma1-Base](https://huggingface.co/lodestones/Chroma1-Base) (Chroma)
+- [Alpha-VLLM/Lumina-Image-2.0](https://huggingface.co/Alpha-VLLM/Lumina-Image-2.0) (Lumina2)
+- [Qwen/Qwen-Image](https://huggingface.co/Qwen/Qwen-Image) (Qwen-Image)
+- [Qwen/Qwen-Image-2512](https://huggingface.co/Qwen/Qwen-Image-2512) (Qwen-Image-2512)
+- [Qwen/Qwen-Image-2.1](https://huggingface.co/Qwen/Qwen-Image-2.1) (Qwen-Image-2.1)
+- [HiDream-ai/HiDream-I1-Full](https://huggingface.co/HiDream-ai/HiDream-I1-Full) (HiDream I1)
+- [OmniGen2/OmniGen2](https://huggingface.co/OmniGen2/OmniGen2) (OmniGen2)
+- [Tongyi-MAI/Z-Image-Turbo](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo) (Z-Image Turbo)
+- [Tongyi-MAI/Z-Image](https://huggingface.co/Tongyi-MAI/Z-Image) (Z-Image)
+- [ostris/Z-Image-De-Turbo](https://huggingface.co/ostris/Z-Image-De-Turbo) (Z-Image De-Turbo)
+- [zhen-nan/L2P](https://huggingface.co/zhen-nan/L2P) (Z-Image L2P)
+- [stabilityai/stable-diffusion-xl-base-1.0](https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0) (SDXL)
+- [stable-diffusion-v1-5/stable-diffusion-v1-5](https://huggingface.co/stable-diffusion-v1-5/stable-diffusion-v1-5) (SD 1.5)
+- [baidu/ERNIE-Image](https://huggingface.co/baidu/ERNIE-Image) (ERNIE-Image)
+- [NucleusAI/Nucleus-Image](https://huggingface.co/NucleusAI/Nucleus-Image) (Nucleus-Image)
+- [Boogu/Boogu-Image-0.1-Base](https://huggingface.co/Boogu/Boogu-Image-0.1-Base) (Boogu Image 0.1)
+- [HiDream-ai/HiDream-O1-Image](https://huggingface.co/HiDream-ai/HiDream-O1-Image) (HiDream O1)
+- [ideogram-ai/ideogram-4-fp8](https://huggingface.co/ideogram-ai/ideogram-4-fp8) (Ideogram 4 FP8)
+- [Photoroom/prxpixel-t2i](https://huggingface.co/Photoroom/prxpixel-t2i) (PRXPixel)
+- [circlestone-labs/Anima-Base-v1.0-Diffusers](https://huggingface.co/circlestone-labs/Anima-Base-v1.0-Diffusers) (Anima)
+- [krea/Krea-2-Raw](https://huggingface.co/krea/Krea-2-Raw) (Krea 2)
+- [krea/Krea-2-Turbo](https://huggingface.co/krea/Krea-2-Turbo) (Krea 2 Turbo)
+- [inclusionAI/Ming-Image-0.1-Design](https://huggingface.co/inclusionAI/Ming-Image-0.1-Design) (Ming-Image 0.1 Design)
+- [microsoft/Mage-Flow-Base](https://huggingface.co/microsoft/Mage-Flow-Base) (Mage-Flow)
+
+### Instruction / Edit
+- [black-forest-labs/FLUX.1-Kontext-dev](https://huggingface.co/black-forest-labs/FLUX.1-Kontext-dev) (FLUX.1-Kontext-dev)
+- [Qwen/Qwen-Image-Edit](https://huggingface.co/Qwen/Qwen-Image-Edit) (Qwen-Image-Edit)
+- [Qwen/Qwen-Image-Edit-2509](https://huggingface.co/Qwen/Qwen-Image-Edit-2509) (Qwen-Image-Edit-2509)
+- [Qwen/Qwen-Image-Edit-2511](https://huggingface.co/Qwen/Qwen-Image-Edit-2511) (Qwen-Image-Edit-2511)
+- [Qwen/Qwen-Image-2.1](https://huggingface.co/Qwen/Qwen-Image-2.1) (Qwen-Image-2.1) - one model for both; it edits when your dataset has control images
+- [HiDream-ai/HiDream-E1-1](https://huggingface.co/HiDream-ai/HiDream-E1-1) (HiDream E1)
+- [Boogu/Boogu-Image-0.1-Edit](https://huggingface.co/Boogu/Boogu-Image-0.1-Edit) (Boogu Image Edit)
+- [krea/Krea-2-Raw](https://huggingface.co/krea/Krea-2-Raw) (Krea 2 Edit Training)
+- [krea/Krea-2-Turbo](https://huggingface.co/krea/Krea-2-Turbo) (Krea 2 Turbo Edit Training)
+- [microsoft/Mage-Flow-Edit-Base](https://huggingface.co/microsoft/Mage-Flow-Edit-Base) (Mage-Flow Edit)
+
+### Video
+- [Wan-AI/Wan2.1-T2V-1.3B-Diffusers](https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B-Diffusers) (Wan 2.1 1.3B)
+- [Wan-AI/Wan2.1-I2V-14B-480P-Diffusers](https://huggingface.co/Wan-AI/Wan2.1-I2V-14B-480P-Diffusers) (Wan 2.1 I2V 14B-480P)
+- [Wan-AI/Wan2.1-I2V-14B-720P-Diffusers](https://huggingface.co/Wan-AI/Wan2.1-I2V-14B-720P-Diffusers) (Wan 2.1 I2V 14B-720P)
+- [Wan-AI/Wan2.1-T2V-14B-Diffusers](https://huggingface.co/Wan-AI/Wan2.1-T2V-14B-Diffusers) (Wan 2.1 14B)
+- [Wan-AI/Wan2.2-T2V-A14B-Diffusers](https://huggingface.co/Wan-AI/Wan2.2-T2V-A14B-Diffusers) (Wan 2.2 14B)
+- [Wan-AI/Wan2.2-I2V-A14B-Diffusers](https://huggingface.co/Wan-AI/Wan2.2-I2V-A14B-Diffusers) (Wan 2.2 I2V 14B)
+- [Wan-AI/Wan2.2-TI2V-5B-Diffusers](https://huggingface.co/Wan-AI/Wan2.2-TI2V-5B-Diffusers) (Wan 2.2 TI2V 5B)
+- [Lightricks/LTX-2](https://huggingface.co/Lightricks/LTX-2) (LTX-2)
+- [Lightricks/LTX-2.3](https://huggingface.co/Lightricks/LTX-2.3) (LTX-2.3)
+- [Lightricks/LTX-2.5](https://huggingface.co/Lightricks/LTX-2.5) (LTX-2.5)
+- [MiniMaxAI/MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3) (MiniMaxAI/MiniMax-H3)
+- [MiniMaxAI/MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3) (MiniMax-H3 Ref2V) - reference image to video
+
+### Audio
+- [ACE-Step/Ace-Step1.5](https://huggingface.co/ACE-Step/Ace-Step1.5) (Ace Step 1.5)
+- [ACE-Step/acestep-v15-xl-base](https://huggingface.co/ACE-Step/acestep-v15-xl-base) (Ace Step 1.5 XL)
+- [m-a-p/YuE2-3B](https://huggingface.co/m-a-p/YuE2-3B) (YuE2) - the official audio-to-token encoder is unreleased; training uses the community tokenizer by Kytra ([@sin_ceriously](https://x.com/sin_ceriously)), [Mothersuperior/yue2-mothersuperior-realaudio-tokenizer-v4](https://huggingface.co/Mothersuperior/yue2-mothersuperior-realaudio-tokenizer-v4).
+
+### LLM
+- [Qwen/Qwen2.5-Omni-7B](https://huggingface.co/Qwen/Qwen2.5-Omni-7B) (Qwen2.5-Omni)
+
+### Experimental
+- [lodestones/Zeta-Chroma](https://huggingface.co/lodestones/Zeta-Chroma) (Zeta Chroma)
 
 ## Installation
 
 ### Run on RunPod
 
 No local GPU? [**Deploy the prebuilt RunPod template →**](https://console.runpod.io/deploy?template=bn89xhug15&ref=hfo6q4j3). It runs the same Docker image this repo builds, with the web UI already up on port 8675.
+
+### Environment manager (experimental)
+
+The upstream [AI Toolkit Manager](manager/README.md) can select the hardware-specific PyTorch build and install a repo-local environment, Node.js, and FFmpeg. After cloning this fork, use `./run_linux.sh`, `./run_mac.zsh`, or `run_windows.bat`; headless users can run `python3 -m manager install`, then `python3 -m manager launch`. Updates follow the current branch's configured tracking branch, use fast-forward-only pulls, and skip tracked local modifications. Keep your custom branch tracking the fork, not upstream main.
 
 ### Local install
 
@@ -668,9 +750,12 @@ cd ai-toolkit-perceptual
 python3 -m venv venv
 source venv/bin/activate
 # install torch first
-pip3 install --no-cache-dir torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 --index-url https://download.pytorch.org/whl/cu126
+pip3 install --no-cache-dir torch==2.13.0 torchvision==0.28.0 torchaudio==2.11.0 --index-url https://download.pytorch.org/whl/cu130
 pip3 install -r requirements.txt
 ```
+
+These steps also work on ARM64 Linux, including DGX Spark / DGX OS.
+
 
 Windows:
 ```bash
@@ -678,16 +763,11 @@ git clone https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual.
 cd ai-toolkit-perceptual
 python -m venv venv
 .\venv\Scripts\activate
-pip install --no-cache-dir torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 --index-url https://download.pytorch.org/whl/cu126
+pip install --no-cache-dir torch==2.13.0 torchvision==0.28.0 torchaudio==2.11.0 --index-url https://download.pytorch.org/whl/cu130
 pip install -r requirements.txt
 ```
 
-**RTX 50-series (Blackwell) GPUs:** the `cu126` build pinned above has no kernels for your card, so training dies with `CUDA error: no kernel image is available for execution on the device`. Install torch from the `cu128` channel instead (run this in place of the torch line above):
-```bash
-pip install torch==2.11.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
-```
-
-For devices running **DGX OS** (including DGX Spark), follow [these](dgx_instructions.md) instructions.
+For **RTX 50-series / Blackwell** and **DGX Spark / DGX OS**, prefer the manager's hardware-specific setup. Do not reuse an older CUDA 12.6 environment that lacks kernels for your GPU. See [manager platform support](manager/README.md) for the maintained installation path.
 
 ## Running the Web UI
 
@@ -703,4 +783,3 @@ npm run build_and_start
 This installs the UI's Node dependencies, initializes its database, builds, and serves the app at **http://localhost:8675** (requires Node.js 18+). The first run does the full build; afterwards `npm run start` restarts it without rebuilding.
 
 > Using the RunPod template? The UI is already running, so just open port **8675** from the pod's **Connect** menu.
-

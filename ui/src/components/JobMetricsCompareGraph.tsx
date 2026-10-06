@@ -136,7 +136,7 @@ function pickDefaultMetric(candidates: string[]): string | null {
 }
 
 export default function JobMetricsCompareGraph({ job }: Props) {
-  const { jobs: allJobs, status: jobsStatus } = useJobsList(false, 30000);
+  const { jobs: allJobs, status: jobsStatus } = useJobsList({ reloadInterval: 30000, job_type: 'train' });
 
   // Per-job prefs persist in localStorage. Anchor job (`job`) is always at
   // index 0 of `selectedJobIDs`; user-toggled additions are after it.

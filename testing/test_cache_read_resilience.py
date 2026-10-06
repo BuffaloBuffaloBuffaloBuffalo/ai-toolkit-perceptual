@@ -181,7 +181,9 @@ def test_get_latent_recovers_when_file_repaired_mid_retry():
 # ---------------------------------------------------------------------------
 
 def _make_text_embed_item(path):
+    from toolkit.config_modules import DatasetConfig
     item = dm.TextEmbeddingFileItemDTOMixin()
+    item.dataset_config = DatasetConfig()
     item.is_text_embedding_cached = True
     item._text_embedding_path = path
     return item

@@ -11,6 +11,8 @@ export interface GpuMemory {
   total: number;
   free: number;
   used: number;
+  // unified memory (e.g. GB10): figures are the system RAM pool the GPU shares
+  shared?: boolean;
 }
 
 export interface GpuPower {
@@ -51,8 +53,32 @@ export interface CpuInfo {
 
 export interface GPUApiResponse {
   hasNvidiaSmi: boolean;
+  isMac: boolean;
   gpus: GpuInfo[];
   error?: string;
+}
+
+/**
+ * System monitor stream (SSE at /api/monitor)
+ */
+
+// Rolling history only logs load + memory; everything else (temps, fans,
+// power, clocks) is instantaneous-only via MonitorSample.
+export interface MonitorHistoryPoint {
+  t: number; // epoch ms
+  cpu: { load: number; memUsedMb: number };
+  // one entry per GPU, same order as MonitorSample.gpu.gpus (sorted by index)
+  gpus: { load: number; memUsedMb: number }[];
+}
+
+export interface MonitorSample {
+  t: number;
+  cpu: CpuInfo | null;
+  gpu: GPUApiResponse;
+}
+
+export interface MonitorInit extends MonitorSample {
+  history: MonitorHistoryPoint[];
 }
 
 /**
@@ -70,6 +96,7 @@ export interface NetworkConfig {
   network_kwargs: {
     ignore_if_contains: string[];
   };
+  transformer_only?: boolean;
 }
 
 export interface SaveConfig {
@@ -87,6 +114,7 @@ export interface SaveConfig {
 }
 
 export interface DatasetConfig {
+  batch_size?: number;
   folder_path: string;
   mask_path: string | null;
   mask_min_value: number;
@@ -116,6 +144,10 @@ export interface DatasetConfig {
   control_path_3?: string | null;
   // Per-dataset loss overrides (undefined = inherit global face_id config)
   identity_loss_weight?: number;
+  depth_loss_weight?: number;
+  depth_loss_min_t?: number;
+  depth_loss_max_t?: number;
+  loss_split?: 'diffusion_depth' | 'sum' | null;
   identity_loss_min_t?: number;
   identity_loss_max_t?: number;
   identity_loss_min_cos?: number;
@@ -148,6 +180,7 @@ export interface DatasetConfig {
   clothing_loss_weight?: number;
   body_loss_weight?: number;
   perceptual_restrict_to_body?: boolean;
+  auto_frame_count?: boolean;
 }
 
 export interface EMAConfig {
@@ -166,7 +199,22 @@ export interface WeightNoiseConfig {
   log_every: number;
 }
 
+export interface ValidationItem {
+  image_path: string;
+  prompt: string;
+}
+
+export interface ValidationConfig {
+  validation_items: ValidationItem[];
+  resolution: number;
+  validate_every_n_steps: number;
+  validation_sigmas?: number[];
+}
+
 export interface TrainConfig {
+  min_denoising_steps?: number;
+  max_denoising_steps?: number;
+  loss_split?: 'diffusion_depth' | null;
   batch_size: number;
   bypass_guidance_embedding?: boolean;
   steps: number;
@@ -216,10 +264,20 @@ export interface TrainConfig {
   do_differential_guidance?: boolean;
   differential_guidance_scale?: number;
   audio_loss_multiplier?: number;
+  max_loss?: number | null;
+  validation_config?: ValidationConfig;
+  do_guidance_loss?: boolean;
+  guidance_loss_target?: number;
 }
 
 export interface QuantizeKwargsConfig {
   exclude: string[];
+}
+
+export interface MergeLoraConfig {
+  path: string;
+  weight: number;
+  lokr_factor?: number | null;
 }
 
 export interface ModelConfig {
@@ -236,6 +294,14 @@ export interface ModelConfig {
   layer_offloading_transformer_percent?: number;
   layer_offloading_text_encoder_percent?: number;
   assistant_lora_path?: string;
+  merge_loras?: MergeLoraConfig[];
+  unconditional_lora_path?: string;
+  compile?: boolean;
+  block_compile?: boolean;
+  compile_mode?: 'default' | 'max-autotune' | 'fastest';
+  compile_fullgraph?: boolean;
+  compile_dynamic?: boolean;
+  cache_size_limit?: number;
 }
 
 export interface SampleItem {
@@ -248,6 +314,7 @@ export interface SampleItem {
   sample_steps?: number;
   fps?: number;
   num_frames?: number;
+  duration?: number;
   ctrl_img?: string | null;
   ctrl_idx?: number;
   network_multiplier?: number;
@@ -259,6 +326,7 @@ export interface SampleItem {
 export interface SampleConfig {
   sampler: string;
   sample_every: number;
+  sample_start_step: number;
   width: number;
   height: number;
   prompts?: string[];
@@ -270,6 +338,7 @@ export interface SampleConfig {
   sample_steps: number;
   num_frames: number;
   fps: number;
+  duration?: number;
 }
 
 export interface LoggingConfig {
@@ -338,6 +407,7 @@ export interface BodyIDConfig {
 }
 
 export interface SubjectMaskConfig {
+  body_close_radius?: number;
   enabled: boolean;
   yolo_ckpt?: string;
   yolo_conf?: number;
@@ -413,6 +483,62 @@ export interface JobConfig {
   job: string;
   config: ConfigObject;
   meta: MetaConfig;
+}
+
+// A LoRA published on the hub, offered for a specific model option. `path` is a
+// 'org/repo/path_to/file.safetensors' reference; the backend looks for it under
+// the models folder first and downloads it into MODELS_PATH/loras if missing.
+export interface CloudLora {
+  path: string;
+  name: string;
+  description?: string;
+}
+
+export interface CaptionLora {
+  path: string;
+  name: string;
+  strength: number;
+}
+
+export interface CaptionProcessConfig {
+  type: string;
+  sqlite_db_path?: string;
+  device: string;
+  caption: {
+    model_name_or_path: string;
+    model_name_or_path2?: string;
+    dtype: string;
+    quantize: boolean;
+    qtype: string;
+    low_vram: boolean;
+    extensions: string[];
+    path_to_caption: string;
+    recaption: boolean;
+    compile?: boolean;
+    caption_prompt?: string;
+    max_res?: number;
+    max_new_tokens?: number;
+    fixed_caption?: string;
+    caption_format?: string;
+    extract_vocals_before_transcribe?: boolean;
+    keep_timestamps?: boolean;
+    caption_extension?: string;
+    thinking?: boolean;
+    batch_size?: number;
+    layer_offloading?: boolean;
+    layer_offloading_percent?: number;
+    loras?: CaptionLora[];
+  }
+}
+
+export interface CaptionConfigObject {
+  name: string;
+  process: CaptionProcessConfig[];
+}
+
+export interface CaptionJobConfig {
+  job: string;
+  config: CaptionConfigObject;
 }
 
 export interface ConfigDoc {

@@ -53,7 +53,7 @@ function parseFilename(name: string): Omit<DepthPreview, 'path'> | null {
   return null;
 }
 
-export async function GET(_request: NextRequest, { params }: { params: { jobID: string } }) {
+export async function GET(_request: NextRequest, { params }: { params: Promise<{ jobID: string }> }) {
   const { jobID } = await (params as any);
 
   const job = await prisma.job.findUnique({ where: { id: jobID } });

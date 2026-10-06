@@ -5,7 +5,6 @@ from typing import TYPE_CHECKING, List, Optional
 import huggingface_hub
 import torch
 from toolkit.config_modules import GenerateImageConfig, ModelConfig
-from toolkit.memory_management.manager import MemoryManager
 from toolkit.metadata import get_meta_for_safetensors
 from toolkit.models.base_model import BaseModel
 from toolkit.basic import flush
@@ -13,16 +12,19 @@ from toolkit.prompt_utils import PromptEmbeds
 from toolkit.samplers.custom_flowmatch_sampler import (
     CustomFlowMatchEulerDiscreteScheduler,
 )
-from toolkit.dequantize import patch_dequantization_on_save
 from toolkit.accelerator import unwrap_model
-from optimum.quanto import freeze, QTensor
-from toolkit.util.quantize import quantize, get_qtype, quantize_model
+from optimum.quanto import QTensor
 
 from transformers import AutoProcessor, Mistral3ForConditionalGeneration
+from toolkit.models.v2.text_encoders.mistral3 import Mistral3TextEncoder
 from .src.model import Flux2, Flux2Params
-from .src.pipeline import Flux2Pipeline
-from .src.autoencoder import AutoEncoder, AutoEncoderParams
 from .comfy_compat import normalize_transformer_state_dict
+from .src.pipeline import Flux2Pipeline
+from toolkit.models.v2.vae.flux2_kl import (
+    AutoEncoder,
+    AutoEncoderParams,
+    AutoEncoderSmallDecoderParams,
+)
 from safetensors.torch import load_file, save_file
 from PIL import Image
 import torch.nn.functional as F
@@ -95,36 +97,24 @@ class Flux2Model(BaseModel):
     def load_te(self):
         dtype = self.torch_dtype
         self.print_and_status_update("Loading Mistral")
+        mistral_path = self.model_config.te_name_or_path or MISTRAL_PATH
 
-        mistral_path = self.model_config.te_name_or_path if self.model_config.te_name_or_path is not None else MISTRAL_PATH
-
-        text_encoder: Mistral3ForConditionalGeneration = (
-            Mistral3ForConditionalGeneration.from_pretrained(
-                mistral_path,
-                torch_dtype=dtype,
-            )
+        # load + quantize + offload + placement, all driven by model_config
+        # tie_word_embeddings=False: the checkpoint carries both embed_tokens
+        # and lm_head with different values; the config's tie claim is wrong
+        text_encoder = Mistral3TextEncoder.load(
+            mistral_path,
+            subfolder="",
+            tie_word_embeddings=False,
+            **self.component_load_kwargs("te"),
         )
-        text_encoder.to(self.device_torch, dtype=dtype)
-
         flush()
 
-        if self.model_config.quantize_te:
-            self.print_and_status_update("Quantizing Mistral")
-            quantize(text_encoder, weights=get_qtype(self.model_config.qtype))
-            freeze(text_encoder)
-            flush()
-
-        if (
-            self.model_config.layer_offloading
-            and self.model_config.layer_offloading_text_encoder_percent > 0
-        ):
-            MemoryManager.attach(
-                text_encoder,
-                self.device_torch,
-                offload_percent=self.model_config.layer_offloading_text_encoder_percent,
-            )
-
-        tokenizer = AutoProcessor.from_pretrained(mistral_path)
+        # fix_mistral_regex=False: keep the exact tokenization flux2 has always
+        # used (True would change the pre-tokenizer and shift conditioning)
+        tokenizer = AutoProcessor.from_pretrained(
+            mistral_path, fix_mistral_regex=False
+        )
         return text_encoder, tokenizer
 
     def load_model(self):
@@ -135,9 +125,6 @@ class Flux2Model(BaseModel):
         transformer_path = model_path
 
         self.print_and_status_update("Loading transformer")
-        with torch.device("meta"):
-            transformer = Flux2(self.get_flux2_params())
-
         # Resolve the transformer checkpoint. These all load with no manual
         # conversion (see normalize_transformer_state_dict for the key handling):
         #  - a local single .safetensors file (e.g. a ComfyUI diffusion_models export)
@@ -171,46 +158,17 @@ class Flux2Model(BaseModel):
             )
 
         transformer_state_dict = load_file(transformer_path, device="cpu")
-        # ComfyUI / original-format checkpoints may namespace the DiT under
-        # "model.diffusion_model." and bundle the vae/text encoders alongside it.
-        # Normalize onto the native module keys so they load without conversion.
         transformer_state_dict = normalize_transformer_state_dict(
             transformer_state_dict, log=self.print_and_status_update
         )
+        transformer = Flux2.load_from_state_dict(
+            transformer_state_dict, dtype, config=self.get_flux2_params()
+        )
+        del transformer_state_dict
 
-        # cast to dtype
-        for key in transformer_state_dict:
-            transformer_state_dict[key] = transformer_state_dict[key].to(dtype)
-
-        transformer.load_state_dict(transformer_state_dict, assign=True)
-
-        if self.model_config.quantize:
-            # patch the state dict method
-            patch_dequantization_on_save(transformer)
-            # Avoid full-model peak VRAM allocation before quantization.
-            # quantize_model() moves blocks to GPU one at a time, so the
-            # transformer must stay on CPU here (do not move to quantize_device).
-            self.print_and_status_update("Keeping transformer on CPU for quantization")
-            self.print_and_status_update("Quantizing Transformer")
-            quantize_model(self, transformer)
-            flush()
-        else:
-            transformer.to(self.device_torch, dtype=dtype)
+        # quantize + offload + placement, all driven by model_config
+        transformer.aitk_post_load(**self.component_load_kwargs("transformer"))
         flush()
-
-        if (
-            self.model_config.layer_offloading
-            and self.model_config.layer_offloading_transformer_percent > 0
-        ):
-            MemoryManager.attach(
-                transformer,
-                self.device_torch,
-                offload_percent=self.model_config.layer_offloading_transformer_percent,
-            )
-
-        if self.model_config.low_vram:
-            self.print_and_status_update("Moving transformer to CPU")
-            transformer.to("cpu")
 
         text_encoder, tokenizer = self.load_te()
 
@@ -224,23 +182,22 @@ class Flux2Model(BaseModel):
             vae_path = self.flux2_vae_path
 
         if vae_path is None or not os.path.exists(vae_path):
+            vae_filename = FLUX2_VAE_FILENAME
+            if vae_path is not None:
+                # see if it is a filename for huggingface hub
+                if len(vae_path.split("/")) == 3 and vae_path.endswith(".safetensors"):
+                    vae_filename = vae_path.split("/")[-1]
+                    vae_path = "/".join(vae_path.split("/")[:-1])
             p = vae_path if vae_path is not None else model_path
             # assume it is from the hub
             vae_path = huggingface_hub.hf_hub_download(
                 repo_id=p,
-                filename=FLUX2_VAE_FILENAME,
+                filename=vae_filename,
                 token=HF_TOKEN,
             )
-        with torch.device("meta"):
-            vae = AutoEncoder(AutoEncoderParams())
-
-        vae_state_dict = load_file(vae_path, device="cpu")
-
-        # cast to dtype
-        for key in vae_state_dict:
-            vae_state_dict[key] = vae_state_dict[key].to(dtype)
-
-        vae.load_state_dict(vae_state_dict, assign=True)
+        
+        # config sniffed from the checkpoint (small-decoder detection)
+        vae = AutoEncoder.load_model(vae_path, dtype=dtype)
 
         self.noise_scheduler = Flux2Model.get_train_scheduler()
 
@@ -424,8 +381,8 @@ class Flux2Model(BaseModel):
                             "match_target_res", False
                         ):
                             ratio = control_img.shape[2] / control_img.shape[3]
-                            c_width = math.sqrt(control_image_res * ratio)
-                            c_height = c_width / ratio
+                            c_height = math.sqrt(control_image_res * ratio)
+                            c_width = c_height / ratio
 
                             c_width = round(c_width / 32) * 32
                             c_height = round(c_height / 32) * 32
@@ -438,6 +395,8 @@ class Flux2Model(BaseModel):
                         control_img = control_img * 2 - 1
                         controls.append(control_img)
 
+                    if self.vae.device == torch.device("cpu"):
+                        self.vae.to(self.device_torch)
                     img_cond_seq_item, img_cond_seq_ids_item = encode_image_refs(
                         self.vae, controls, limit_pixels=control_image_max_res
                     )
@@ -459,10 +418,8 @@ class Flux2Model(BaseModel):
                 assert img_cond_seq_ids is not None, (
                     "You need to provide either both or neither of the sequence conditioning"
                 )
-                img_cond_seq = img_cond_seq.to(img_input.device)
-                img_cond_seq_ids = img_cond_seq_ids.to(img_input_ids.device)
-                img_input = torch.cat((img_input, img_cond_seq), dim=1)
-                img_input_ids = torch.cat((img_input_ids, img_cond_seq_ids), dim=1)
+                img_input = torch.cat((img_input, img_cond_seq.to(img_input.device, img_input.dtype)), dim=1)
+                img_input_ids = torch.cat((img_input_ids, img_cond_seq_ids.to(img_input_ids.device)), dim=1)
 
             guidance_vec = torch.full(
                 (img_input.shape[0],),
@@ -540,19 +497,7 @@ class Flux2Model(BaseModel):
     def get_transformer_block_names(self) -> Optional[List[str]]:
         return ["double_blocks", "single_blocks"]
 
-    def convert_lora_weights_before_save(self, state_dict):
-        new_sd = {}
-        for key, value in state_dict.items():
-            new_key = key.replace("transformer.", "diffusion_model.")
-            new_sd[new_key] = value
-        return new_sd
-
-    def convert_lora_weights_before_load(self, state_dict):
-        new_sd = {}
-        for key, value in state_dict.items():
-            new_key = key.replace("diffusion_model.", "transformer.")
-            new_sd[new_key] = value
-        return new_sd
+    lora_keys_use_comfy_prefix = True
 
     def encode_images(self, image_list: List[torch.Tensor], device=None, dtype=None):
         if device is None:
@@ -570,3 +515,18 @@ class Flux2Model(BaseModel):
         latents = self.vae.encode(images)
 
         return latents
+    
+    def decode_latents(self, latents, device=None, dtype=None):
+        if device is None:
+            device = self.vae_device_torch
+        if dtype is None:
+            dtype = self.vae_torch_dtype
+
+        # Move to vae to device if on cpu
+        if self.vae.device == torch.device("cpu"):
+            self.vae.to(device)
+        latents = latents.to(device, dtype=dtype)
+
+        images = self.vae.decode(latents)
+
+        return images

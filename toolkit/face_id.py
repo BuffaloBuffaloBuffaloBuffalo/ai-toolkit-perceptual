@@ -730,6 +730,8 @@ def cache_video_identity_embeddings(
     num_frames: Optional[int] = None,
     arch: str = "ltx2.3",
     include_images: bool = False,
+    decode_file_fn=None,
+    cache_namespace: str = "",
 ):
     """Cache per-frame GT ArcFace identity embeddings from the DECODED clip.
 
@@ -759,6 +761,10 @@ def cache_video_identity_embeddings(
         device: CUDA device for extraction.
         num_frames: uniformly subsample to this many frames (round-trip fallback).
         arch: model arch, selects the tiny decoder (LTX vs Wan).
+        decode_file_fn: optional native-codec callback returning TCHW [0,1].
+            Required for models whose latents have no compatible tiny decoder.
+        cache_namespace: codec version for isolating native targets by model,
+            bucket, flip, clip selection and detector settings.
         include_images: also process non-video items (LTX/Wan still images, where
             num_frames=1). Each image's cached 5D latent decodes as a T=1 clip via
             ``_decode_clip``, so the identity loss can run through the 5D video
@@ -794,7 +800,13 @@ def cache_video_identity_embeddings(
     )
     extractor = FaceIDExtractor(model_name=face_id_config.face_model)
     identity_encoder = DifferentiableFaceEncoder().to(device)
-    if str(arch).startswith("ltx"):
+    if decode_file_fn is not None:
+        if not cache_namespace:
+            raise ValueError('Native identity decoding requires a cache_namespace')
+        decoder = None
+    elif str(arch).startswith("minimax"):
+        raise ValueError('Minimax H3 identity caching requires its native VAE decoder')
+    elif str(arch).startswith("ltx"):
         decoder = load_taehv_ltx2(device=str(device), dtype=torch.bfloat16,
                                   version=_ltx_taehv_version(arch))
     else:
@@ -814,6 +826,8 @@ def cache_video_identity_embeddings(
         Prefers the cached real-VAE latent (exact match to what the loss decodes);
         falls back to a TAEHV round-trip of the read frames.
         """
+        if decode_file_fn is not None:
+            return decode_file_fn(file_item)
         latent = None
         try:
             _l = file_item.get_latent()
@@ -844,13 +858,20 @@ def cache_video_identity_embeddings(
         vid_dir = os.path.dirname(file_item.path)
         cache_dir = os.path.join(vid_dir, "_face_id_cache")
         stem = os.path.splitext(os.path.basename(file_item.path))[0]
+        if cache_namespace:
+            from toolkit.perceptor_utils import perceptor_cache_suffix
+            suffix = perceptor_cache_suffix(
+                file_item, cache_namespace, detector=face_id_config.face_model,
+                det_thresh=det_thresh, num_frames=num_frames,
+            )
+            stem = f'{stem}.identity-{suffix}'
         cache_path = os.path.join(cache_dir, f"{stem}.safetensors")
 
         if os.path.exists(cache_path):
             data = load_file(cache_path)
             if ('identity_gt_video' in data
                     and CACHE_VERSION_IDENTITY_VIDEO_KEY in data
-                    and (num_frames is None
+                    and (decode_file_fn is not None or num_frames is None
                          or data['identity_gt_video'].shape[0] == num_frames)):
                 file_item.identity_gt_video = data['identity_gt_video'].clone()
                 file_item.identity_gt_video_bbox = data['identity_gt_video_bbox'].clone()

@@ -6,8 +6,79 @@ export const wait = (ms: number) => new Promise(resolve => setTimeout(resolve, m
 
 export const imgExtensions = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg', '.bmp'];
 export const videoExtensions = ['.mp4', '.avi', '.mov', '.mkv', '.wmv', '.m4v', '.flv'];
-export const audioExtensions = ['.mp3', '.wav'];
+export const audioExtensions = ['.mp3', '.wav', '.flac', '.ogg'];
 
-export const isVideo = (filePath: string) => videoExtensions.includes(filePath.toLowerCase().slice(-4));
-export const isImage = (filePath: string) => imgExtensions.includes(filePath.toLowerCase().slice(-4));
-export const isAudio = (filePath: string) => audioExtensions.includes(filePath.toLowerCase().slice(-4));
+// suffix match: slice(-4) missed 5-char extensions like .flac/.jpeg/.webp
+const hasExt = (filePath: string, exts: string[]) => exts.some(ext => filePath.toLowerCase().endsWith(ext));
+export const isVideo = (filePath: string) => hasExt(filePath, videoExtensions);
+export const isImage = (filePath: string) => hasExt(filePath, imgExtensions);
+export const isAudio = (filePath: string) => hasExt(filePath, audioExtensions);
+// text-generating models write their samples as .txt
+export const isText = (filePath: string) => filePath.toLowerCase().endsWith('.txt');
+
+export const tagsToObj = (tagStr: string): Record<string, any> => {
+  const result: Record<string, any> = {};
+  const regex = /<([A-Z_][A-Z0-9_]*)>([\s\S]*?)<\/\1>/g;
+  let match;
+  while ((match = regex.exec(tagStr)) !== null) {
+    const value = match[2].trim();
+    try {
+      result[match[1]] = JSON.parse(value);
+    } catch {
+      result[match[1]] = value;
+    }
+  }
+  return result;
+};
+
+export const objToTags = (obj: Record<string, any>): string => {
+  return Object.entries(obj)
+    .map(([key, value]) => {
+      const content = typeof value === 'string' ? value : JSON.stringify(value);
+      return `<${key}>${content}</${key}>`;
+    })
+    .join('\n');
+};
+
+export const getFilename = (filePath: string) => {
+  const idx = Math.max(filePath.lastIndexOf('/'), filePath.lastIndexOf('\\'));
+  return idx === -1 ? filePath : filePath.slice(idx + 1);
+};
+
+export const getFoldername = (filePath: string) => {
+  const idx = Math.max(filePath.lastIndexOf('/'), filePath.lastIndexOf('\\'));
+  return idx === -1 ? '' : filePath.slice(0, idx);
+};
+
+/**
+ * Encode an absolute file path for /api/files/ and /api/img/ URLs as
+ * `<encoded folder>/<encoded filename>` — two URL segments, so the last one is
+ * the real filename and downloaders (wget, curl -O, browsers) save it under
+ * that name instead of the fully-escaped path. Works for posix and Windows
+ * paths (`C:\foo\bar.safetensors` -> `C%3A%5Cfoo/bar.safetensors`). The
+ * servers accept both this and the legacy single-segment
+ * `encodeURIComponent(fullPath)` form.
+ */
+export const encodeFilePathForUrl = (filePath: string) => {
+  const idx = Math.max(filePath.lastIndexOf('/'), filePath.lastIndexOf('\\'));
+  if (idx === -1) return encodeURIComponent(filePath);
+  // keep a root-only folder ("/" or "C:\") as a non-empty segment
+  const folder = idx === 0 ? filePath[0] : filePath.slice(0, idx);
+  return `${encodeURIComponent(folder)}/${encodeURIComponent(filePath.slice(idx + 1))}`;
+};
+
+export const pathJoin = (...parts: string[]) => {
+  const sep = parts.length > 0 && parts[0].includes('\\') ? '\\' : '/';
+  const leadingTrailing = sep === '\\' ? /^\\+|\\+$/g : /^\/+|\/+$/g;
+  const trailing = sep === '\\' ? /\\+$/ : /\/+$/;
+  return parts
+    .map((part, index) => {
+      if (index === 0) {
+        return part.replace(trailing, '');
+      } else {
+        return part.replace(leadingTrailing, '');
+      }
+    })
+    .filter(part => part.length > 0)
+    .join(sep);
+}

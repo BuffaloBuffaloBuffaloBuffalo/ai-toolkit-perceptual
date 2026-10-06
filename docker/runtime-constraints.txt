@@ -1,0 +1,5 @@
+# Match manager/spec.py and docker/Dockerfile. Never let optional dependencies
+# silently replace the Blackwell-capable CUDA runtime during a container build.
+torch==2.13.0
+torchvision==0.28.0
+torchaudio==2.11.0
